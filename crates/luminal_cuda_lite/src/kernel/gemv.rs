@@ -9,6 +9,9 @@
 //! output row with vectorized 16-byte loads and F32 accumulation has ~1µs of
 //! fixed cost and no splitK reduction pass.
 
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -18,15 +21,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 #[allow(unused_imports)]
 use luminal::dtype::DType;
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, EXPRESSION, OP_KIND},
-        extract_dtype, extract_expr,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 const TPB: usize = 256;
 const WARPS_PER_BLOCK: usize = TPB / 32;
@@ -38,112 +33,111 @@ pub struct KernelGemv {
     dtype: DType,
 }
 
-impl EgglogOp for KernelGemv {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelGemv",
-            &[("n", EXPRESSION), ("k", EXPRESSION), ("dtype", DTYPE)],
-        )
-    }
+pub(crate) mod kernel_gemv {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
+    // Row-major activation [1,k], column-major [k,n] weights stored as [n,k].
+    // Each 16-bit dtype has literal-m=1 and interval-pinned dynamic variants:
+    // lower/upper have no rows for literals.
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Same structural anchors as "cublaslt row-major × column-major",
-        // restricted to m == 1 (decode GEMV) and 16-bit dtypes.
-        // Two m-shape variants per dtype: a literal (MNum 1) for static
-        // graphs, and an interval-pinned dyn dim (the decode bucket proves
-        // s in [1,1]; `lower`/`upper` have no rows for literals).
-        let m_variants: [(&str, &str); 2] = [
+    #[ruleset]
+    pub(crate) fn matmul_backend(
+        a: &Ir,
+        b: &Ir,
+        sum: &Ir,
+        n: &DimExpr,
+        a_m_stride: &DimExpr,
+        a_n_stride: &DimExpr,
+        a_k_stride: &DimExpr,
+        b_m_stride: &DimExpr,
+        b_n_stride: &DimExpr,
+        b_k_stride: &DimExpr,
+        dt: &DType,
+        m: &DimExpr,
+        m_lower: &egg::I64,
+        m_upper: &egg::I64,
+    ) -> Vec<Rule> {
+        let generic_args = GenericMatmulArgs::fresh();
+        let variants = [
             (
                 "static",
-                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+                vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
             ),
             (
                 "dyn",
-                "(= ?out_shape (ECons ?m (ECons ?n (ENil))))
-                            (= ?m_lower (lower ?m))
-                            (= ?m_upper (upper ?m))
-                            (> ?m_lower 0)
-                            (< ?m_upper 2)",
+                vec![
+                    eq(&generic_args.out_shape, [m, n]),
+                    eq(m_lower, m.lower()),
+                    eq(m_upper, m.upper()),
+                    m_lower.gt(0_i64),
+                    m_upper.lt(2_i64),
+                ],
             ),
         ];
-        m_variants
-            .into_iter()
-            .flat_map(|(variant, m_cond)| ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt)))
-            .map(|(variant, m_cond, dt)| {
-                raw_rules(parser, format!(
-                    "(rule
+        let mut rules = Vec::new();
+        for (variant, shape_conditions) in variants {
+            for (name, dtype) in [("Bf16", DType::Bf16()), ("F16", DType::F16())] {
+                let gemv = &Ir::Op(kernel_gemv(n, &generic_args.k, &dtype), [a, b]);
+                rules.push(
+                    rule(
                         (
-                            (= ?sum (Op (GenericMatmul
-                                ?out_shape ?mul_shape ?k
-                                ?a_stride ?b_stride
-                                ?sum_in_stride ?k_stride ?sum_out_stride
-                                ?matmul_dtype)
-                                (ICons ?a (ICons ?b (INil)))))
-
-                            {m_cond}
-                            (!= ?n (MNum 0))
-                            (!= ?k (MNum 1))
-
-                            (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
-                            (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
-                            (= ?k_stride (MIter))
-
-                            ; A (the activation row) is row-major [1, k]
-                            (= ?a_m_stride (MMul (MIter) ?k))
-                            (= ?a_n_stride (MNum 0))
-                            (= ?a_k_stride (MIter))
-
-                            ; B is column-major [k, n] — i.e. the weight stored
-                            ; row-major [n, k], read row by row.
-                            (= ?b_m_stride (MNum 0))
-                            (= ?b_n_stride (MMul (MIter) ?k))
-                            (= ?b_k_stride (MIter))
-
-                            (= ?dt (dtype ?a))
-                            (= ?dt (dtype ?b))
-                            (= ?dt ({dt}))
-                        )
-                        (
-                            (let ?gemv (Op (KernelGemv ?n ?k ({dt})) (ICons ?a (ICons ?b (INil)))))
-                            (union ?sum ?gemv)
-                            (set (dtype ?gemv) ({dt}))
-                        )
-                        :ruleset matmul_backend
-                        :name \"kernel gemv m1 {dt} {variant}\"
-                    )"
-                ))
-            })
-            .collect()
-    };
-        __rules.into_iter().flatten().collect()
+                            eq(sum, Ir::Op(generic_args.clone(), [a, b])),
+                            &shape_conditions,
+                            ne(n, 0),
+                            ne(&generic_args.k, 1),
+                            eq(
+                                &generic_args.lhs_strides,
+                                [a_m_stride, a_n_stride, a_k_stride],
+                            ),
+                            eq(
+                                &generic_args.rhs_strides,
+                                [b_m_stride, b_n_stride, b_k_stride],
+                            ),
+                            eq(&generic_args.sum_iter_stride, DimExpr::MIter()),
+                            eq(a_m_stride, DimExpr::MIter() * &generic_args.k),
+                            eq(a_n_stride, 0),
+                            eq(a_k_stride, DimExpr::MIter()),
+                            eq(b_m_stride, 0),
+                            eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
+                            eq(b_k_stride, DimExpr::MIter()),
+                            eq(dt, a.dtype()),
+                            eq(dt, b.dtype()),
+                            eq(dt, &dtype),
+                        ),
+                        (gemv, union(sum, gemv), set(gemv.dtype(), &dtype)),
+                    )
+                    .label(format!("kernel gemv m1 {name} {variant}")),
+                );
+            }
+        }
+        rules
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                n: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                k: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                dtype: extract_dtype(egraph, kind_children[2]),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelGemv {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_n, field_k, field_dtype)) = typed::get_args(
+            kind,
+            |n: &DimExpr, k: &DimExpr, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_gemv(n, k, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            n: context.expression(&field_n)?,
+            k: context.expression(&field_k)?,
+            dtype: context.dtype(&field_dtype)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 
@@ -311,133 +305,168 @@ pub struct KernelGemvF8 {
     k: Expression,
 }
 
-impl EgglogOp for KernelGemvF8 {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelGemvF8",
-            &[("n", EXPRESSION), ("k", EXPRESSION)],
-        )
-    }
+pub(crate) mod kernel_gemv_f8 {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        4
-    }
+    // F8 custom ops place their quantization input scale LAST. The standalone
+    // quant and fused norm/SiLU quant patterns recover it by producer arity.
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let m_variants: [(&str, &str); 2] = [
+    #[ruleset]
+    pub(crate) fn matmul_backend(
+        q_size: &DimExpr,
+        x: &Ir,
+        in_scale: &Ir,
+        a: &Ir,
+        b: &Ir,
+        sum: &Ir,
+        n: &DimExpr,
+        a_m_stride: &DimExpr,
+        a_n_stride: &DimExpr,
+        a_k_stride: &DimExpr,
+        b_m_stride: &DimExpr,
+        b_n_stride: &DimExpr,
+        b_k_stride: &DimExpr,
+        c_size: &DimExpr,
+        cast: &Ir,
+        in_scale2: &Ir,
+        w_scale: &Ir,
+        scale_product: &Ir,
+        scaled: &Ir,
+        o_size: &DimExpr,
+        out_bf16: &Ir,
+        cid: &egg::I64,
+        cx: &Ir,
+        cw: &Ir,
+        m: &DimExpr,
+        m_lower: &egg::I64,
+        m_upper: &egg::I64,
+    ) -> Vec<Rule> {
+        let generic_args = GenericMatmulArgs::fresh();
+        let gemv = &Ir::Op(
+            kernel_gemv_f8(n, &generic_args.k),
+            [a, b, in_scale, w_scale],
+        );
+        let variants = [
             (
                 "static",
-                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+                vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
             ),
             (
                 "dyn",
-                "(= ?out_shape (ECons ?m (ECons ?n (ENil))))
-                        (= ?m_lower (lower ?m))
-                        (= ?m_upper (upper ?m))
-                        (> ?m_lower 0)
-                        (< ?m_upper 2)",
+                vec![
+                    eq(&generic_args.out_shape, [m, n]),
+                    eq(m_lower, m.lower()),
+                    eq(m_upper, m.upper()),
+                    m_lower.gt(0_i64),
+                    m_upper.lt(2_i64),
+                ],
             ),
         ];
-        // A-operand variants: the standalone fused quant kernel, plus the
-        // fused norm+quant / swiglu+quant F8 custom ops. CONVENTION: f8
-        // custom ops put the quantization input scale as their LAST input —
-        // these patterns match by arity and read the scale from that slot.
-        let a_variants: [(&str, &str); 3] = [
-            (
-                "quant",
-                "(= ?a (Op (KernelQuantF8 ?q_size) (ICons ?x (ICons ?in_scale (INil)))))",
-            ),
-            (
-                "custom3",
-                "(= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?in_scale (INil))))))",
-            ),
-            (
-                "custom2",
-                "(= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?in_scale (INil)))))",
-            ),
-        ];
-        m_variants
-            .into_iter()
-            .flat_map(|m| a_variants.into_iter().map(move |a| (m, a)))
-            .map(|((variant, m_cond), (a_variant, a_cond))| {
-                raw_rules(parser, format!(
-                    "(rule
-                    (
-                        ; A is a pre-quantized f8 activation with its input
-                        ; scale recoverable from the producing op.
-                        {a_cond}
-
-                        (= ?sum (Op (GenericMatmul
-                            ?out_shape ?mul_shape ?k
-                            ?a_stride ?b_stride
-                            ?sum_in_stride ?k_stride ?sum_out_stride
-                            ?matmul_dtype)
-                            (ICons ?a (ICons ?b (INil)))))
-
-                        {m_cond}
-                        (!= ?n (MNum 0))
-                        (!= ?k (MNum 1))
-
-                        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
-                        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
-                        (= ?k_stride (MIter))
-                        (= ?a_m_stride (MMul (MIter) ?k))
-                        (= ?a_n_stride (MNum 0))
-                        (= ?a_k_stride (MIter))
-                        (= ?b_m_stride (MNum 0))
-                        (= ?b_n_stride (MMul (MIter) ?k))
-                        (= ?b_k_stride (MIter))
-                        (= (F8E4M3) (dtype ?b))
-
-                        ; dequant: Cast(F32) → × (in_scale · w_scale) → Cast(Bf16)
-                        (= ?cast (Op (Cast ?c_size (F32)) (ICons ?sum (INil))))
-                        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
-                            (ICons ?in_scale2 (ICons ?w_scale (INil)))))
-                        (= ?in_scale ?in_scale2)
-                        (= ?scaled (Op (Mul
-                            ?s_shape ?s_a_strides
-                            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
-                            ?s_out_strides)
-                            (ICons ?cast (ICons ?scale_product (INil)))))
-                        (= ?out_bf16 (Op (Cast ?o_size (Bf16)) (ICons ?scaled (INil))))
+        let mut rules = Vec::new();
+        for (variant, shape_conditions) in variants {
+            for (producer, source) in [
+                ("quant", Ir::Op(kernel_quant_f8(q_size), [x, in_scale])),
+                (
+                    "custom3",
+                    Ir::Op(
+                        OpKind::CustomOpKind(cid, DType::F8E4M3()),
+                        [cx, cw, in_scale],
+                    ),
+                ),
+                (
+                    "custom2",
+                    Ir::Op(OpKind::CustomOpKind(cid, DType::F8E4M3()), [cx, in_scale]),
+                ),
+            ] {
+                rules.push(
+                    rule(
+                        (
+                            eq(a, source),
+                            eq(sum, Ir::Op(generic_args.clone(), [a, b])),
+                            &shape_conditions,
+                            ne(n, 0),
+                            ne(&generic_args.k, 1),
+                            eq(
+                                &generic_args.lhs_strides,
+                                [a_m_stride, a_n_stride, a_k_stride],
+                            ),
+                            eq(
+                                &generic_args.rhs_strides,
+                                [b_m_stride, b_n_stride, b_k_stride],
+                            ),
+                            eq(&generic_args.sum_iter_stride, DimExpr::MIter()),
+                            eq(a_m_stride, DimExpr::MIter() * &generic_args.k),
+                            eq(a_n_stride, 0),
+                            eq(a_k_stride, DimExpr::MIter()),
+                            eq(b_m_stride, 0),
+                            eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
+                            eq(b_k_stride, DimExpr::MIter()),
+                            eq(DType::F8E4M3(), b.dtype()),
+                            eq(cast, Ir::Op(OpKind::Cast(c_size, DType::F32()), [sum])),
+                            eq(
+                                scale_product,
+                                Ir::Op(
+                                    OpKind::Mul(
+                                        EList::ENil(),
+                                        EList::ENil(),
+                                        EList::ENil(),
+                                        EList::ENil(),
+                                    ),
+                                    [in_scale2, w_scale],
+                                ),
+                            ),
+                            eq(in_scale, in_scale2),
+                            eq(
+                                scaled,
+                                Ir::Op(
+                                    MulArgs {
+                                        b_strides: ([0, 0]).into(),
+                                        ..MulArgs::fresh()
+                                    },
+                                    [cast, scale_product],
+                                ),
+                            ),
+                            eq(
+                                out_bf16,
+                                Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [scaled]),
+                            ),
+                        ),
+                        (
+                            gemv,
+                            union(out_bf16, gemv),
+                            set(gemv.dtype(), DType::Bf16()),
+                        ),
                     )
-                    (
-                        (let ?gemv (Op (KernelGemvF8 ?n ?k)
-                            (ICons ?a (ICons ?b (ICons ?in_scale (ICons ?w_scale (INil)))))))
-                        (union ?out_bf16 ?gemv)
-                        (set (dtype ?gemv) (Bf16))
-                    )
-                    :ruleset matmul_backend
-                    :name \"kernel gemv f8 tensor core m1 {variant} {a_variant}\"
-                )"
-                ))
-            })
-            .collect()
-    };
-        __rules.into_iter().flatten().collect()
+                    .label(format!(
+                        "kernel gemv f8 tensor core m1 {variant} {producer}"
+                    )),
+                );
+            }
+        }
+        rules
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                n: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                k: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelGemvF8 {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_n, field_k)) = typed::get_args(kind, |n: &DimExpr, k: &DimExpr| {
+            crate::typed_rules::kernel_gemv_f8(n, k)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            n: context.expression(&field_n)?,
+            k: context.expression(&field_k)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

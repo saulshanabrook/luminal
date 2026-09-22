@@ -6,6 +6,7 @@ pub mod graph;
 pub mod hlir;
 pub mod op;
 pub mod shape;
+pub mod typed_reference;
 pub mod visualization;
 
 #[cfg(test)]
@@ -13,9 +14,7 @@ pub mod tests;
 
 pub mod prelude {
     pub use crate::dtype::DType;
-    pub use crate::egglog_utils::SerializedEGraph;
-    pub use crate::egglog_utils::raw_rules;
-    pub use ::egglog::ast::{Command, Parser};
+    pub use crate::egglog_utils::{DecodeContext, RewritePhase, SearchSpace};
     pub use crate::frontend::binary::F32Pow;
     pub use crate::frontend::*;
     pub use crate::graph::*;
@@ -24,9 +23,7 @@ pub mod prelude {
     pub use crate::shape::*;
     pub use crate::visualization::{display_graph, display_graph_to_file};
     pub use anyhow;
-    pub use egglog;
-    pub use egglog::ast as egglog_ast;
-    pub use egraph_serialize::NodeId as ENodeId;
+    pub use egglog_experimental::typed;
     pub use half::{bf16, f16};
     pub use petgraph;
     pub use petgraph::stable_graph::NodeIndex;

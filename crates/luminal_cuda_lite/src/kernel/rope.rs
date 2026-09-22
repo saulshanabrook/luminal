@@ -12,7 +12,9 @@
 //!
 //! Layout: x `(S, H, D)`, cos/sin `(S, D)` (broadcast across H).
 
-use luminal::prelude::{Command, Parser, raw_rules};
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -840,255 +842,296 @@ pub struct KernelRoPE {
     inv_hd: f64,
 }
 
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{ELIST, EXPRESSION, F64, OP_KIND},
-        extract_expr, extract_expr_list,
-    },
-    op::EgglogOp,
-    prelude::{ENodeId, SerializedEGraph},
-};
+pub(crate) mod kernel_ro_p_e {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-impl EgglogOp for KernelRoPE {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelRoPE",
-            &[
-                ("out_shape", ELIST),
-                ("width", EXPRESSION),
-                ("ln_theta", F64),
-                ("inv_hd", F64),
-            ],
+    // A monolithic ~45-atom join took 4m56s on a 279-node mini layer.
+    // Stage the angle chain at its Constant anchors, then bind cos/sin from
+    // rope_angles before matching rotation so each Mul remains selective.
+    #[relation]
+    pub(crate) fn rope_invf(a0: Ir, a1: egg::F64, a2: egg::F64);
+
+    #[relation]
+    pub(crate) fn rope_angles(a0: Ir, a1: Ir, a2: Ir, a3: egg::F64, a4: egg::F64);
+
+    #[relation]
+    #[allow(clippy::too_many_arguments)] // Positional fields of the native kernel constructor.
+    pub(crate) fn rope_rotated(
+        a0: Ir,
+        a1: Ir,
+        a2: Ir,
+        a3: Ir,
+        a4: DimExpr,
+        a5: DimExpr,
+        a6: DimExpr,
+        a7: DimExpr,
+        a8: egg::F64,
+        a9: egg::F64,
+    );
+
+    #[allow(
+        clippy::approx_constant,
+        reason = "Exact pattern literals must match the authored graph."
+    )]
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late_pre(
+        if_range: &DimExpr,
+        ic_size: &DimExpr,
+        inv_hd: &egg::F64,
+        ln_theta: &egg::F64,
+        invf: &Ir,
+    ) -> Rule {
+        let iot2 = &Ir::Op(OpKind::Iota(DimExpr::MIter() * 2, if_range), IList::INil());
+        let invhd_c = &Ir::Op(OpKind::Constant(inv_hd), IList::INil());
+        let lnt_c = &Ir::Op(OpKind::Constant(ln_theta), IList::INil());
+        let l2e = &Ir::Op(OpKind::Constant(1.442695), IList::INil());
+        let iotf = &Ir::Op(OpKind::Cast(ic_size, DType::F32()), [iot2]);
+        let fr1 = &Ir::Op(MulArgs::fresh(), [iotf, invhd_c]);
+        let fr2 = &Ir::Op(MulArgs::fresh(), [fr1, lnt_c]);
+        let fr3 = &Ir::Op(MulArgs::fresh(), [fr2, l2e]);
+        let ex = &Ir::Op(Exp2Args::fresh(), [fr3]);
+        rule(
+            (eq(invf, Ir::Op(RecipArgs::fresh(), [ex])),),
+            (rope_invf(invf, ln_theta, inv_hd),),
         )
+        .label("kernel rope invf stage")
     }
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Two-stage match via an intermediate relation. A single ~45-atom
-        // join blew up egglog's query planner on real graphs (4m56s on the
-        // 279-node mini layer); splitting at the angle chain keeps each join
-        // anchored: stage 1 is pinned by the Constant atoms (log2e, pi/2,
-        // ln theta chain) and emits one `rope_angles` fact per rope site,
-        // stage 2 joins the rotation/concat with ?cosb/?sinb already bound,
-        // which makes every Mul atom selective.
-        let angle_stage: &str = "
-            (relation rope_invf (IR f64 f64))
-            (relation rope_angles (IR IR IR f64 f64))
-            (relation rope_rotated (IR IR IR IR Expression Expression Expression Expression f64 f64))
-            (rule
-                (
-                    ; inv_freq = recip(exp2(((2i x 1/hd) x ln theta) x log2 e))
-                    ; anchored at the Iota(z*2) only rope inv-freq chains have;
-                    ; every atom keys off the previous one.
-                    (= ?iot2 (Op (Iota (MMul (MIter) (MNum 2)) ?if_range) (INil)))
-                    (= ?iotf (Op (Cast ?ic_size (F32)) (ICons ?iot2 (INil))))
-                    (= ?fr1 (Op (Mul ?f1_sh ?f1_a ?f1_b ?f1_o)
-                        (ICons ?iotf (ICons ?invhd_c (INil)))))
-                    (= ?invhd_c (Op (Constant ?inv_hd) (INil)))
-                    (= ?fr2 (Op (Mul ?f2_sh ?f2_a ?f2_b ?f2_o)
-                        (ICons ?fr1 (ICons ?lnt_c (INil)))))
-                    (= ?lnt_c (Op (Constant ?ln_theta) (INil)))
-                    (= ?fr3 (Op (Mul ?f3_sh ?f3_a ?f3_b ?f3_o)
-                        (ICons ?fr2 (ICons ?l2e (INil)))))
-                    (= ?l2e (Op (Constant 1.442695) (INil)))
-                    (= ?ex (Op (Exp2 ?ex_sh ?ex_in ?ex_out) (ICons ?fr3 (INil))))
-                    (= ?invf (Op (Recip ?rc_sh ?rc_in ?rc_out) (ICons ?ex (INil))))
-                )
-                (
-                    (rope_invf ?invf ?ln_theta ?inv_hd)
-                )
-                :ruleset kernel_fuse_late_pre
-                :name \"kernel rope invf stage\"
-            )
-            (rule
-                (
-                    (rope_invf ?invf ?ln_theta ?inv_hd)
-
-                    ; emb = cast(pos) x inv_freq (1xk matmul as mul+sum),
-                    ; keyed by the bound ?invf
-                    (= ?embm (Op (Mul ?em_sh ?em_a ?em_b ?em_o)
-                        (ICons ?posf (ICons ?invf (INil)))))
-                    (= ?posf (Op (Cast ?pc_size (F32)) (ICons ?pos (INil))))
-                    (= (Int) (dtype ?pos))
-                    (= ?emb (Op (Sum ?es_sh ?es_dim ?es_in ?es_k ?es_out)
-                        (ICons ?embm (INil))))
-
-                    ; cos = sin(-emb + pi/2), sin = sin(emb), both cast bf16
-                    (= ?sinv (Op (Sin ?s1_sh ?s1_in ?s1_out) (ICons ?emb (INil))))
-                    (= ?sinb (Op (Cast ?sb_size (Bf16)) (ICons ?sinv (INil))))
-                    (= ?neg (Op (Mul ?ng_sh ?ng_a ?ng_b ?ng_o)
-                        (ICons ?emb2 (ICons ?m1c (INil)))))
-                    (= ?emb ?emb2)
-                    (= ?m1c (Op (Constant -1.000000) (INil)))
-                    (= ?shift (Op (Add ?sh_sh ?sh_a ?sh_b ?sh_o)
-                        (ICons ?neg (ICons ?hpi (INil)))))
-                    (= ?hpi (Op (Constant 1.570796) (INil)))
-                    (= ?cosv (Op (Sin ?s2_sh ?s2_in ?s2_out) (ICons ?shift (INil))))
-                    (= ?cosb (Op (Cast ?cb_size (Bf16)) (ICons ?cosv (INil))))
-                )
-                (
-                    (rope_angles ?cosb ?sinb ?pos ?ln_theta ?inv_hd)
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel rope angles stage\"
-            )";
-        let rotation_stage: &str = "
-            (rule
-                (
-                    (rope_angles ?cosb ?sinb ?pos ?ln_theta ?inv_hd)
-
-                    ; rotation: x0_out = x0*cos - x1*sin ; x1_out = x1*cos + x0*sin
-                    ; (every Mul keyed by the bound ?cosb / ?sinb second input)
-                    (= ?x0c (Op (Mul ?m1_sh
-                        (ECons (MMul (MIter) ?e_hd) (ECons (MMul (MIter) ?e_w) (ECons (MIter) (ENil))))
-                        (ECons (MNum 0) (ECons (MMul (MIter) ?e_hd2) (ECons (MIter) (ENil))))
-                        ?m1_o)
-                        (ICons ?x (ICons ?cosb (INil)))))
-                    (= ?x0out (Op (Add ?a1_sh ?a1_a ?a1_b ?a1_o)
-                        (ICons ?x0c (ICons ?x1sn (INil)))))
-                    (= ?x1sn (Op (Mul ?m3_sh ?m3_a ?m3_b ?m3_o)
-                        (ICons ?x1s (ICons ?negb (INil)))))
-                    (= ?x1s (Op (Mul ?m2_sh ?m2_a ?m2_b ?m2_o)
-                        (ICons ?x1 (ICons ?sinb (INil)))))
-                    (= ?negb (Op (Cast ?nb_size (Bf16)) (ICons ?m1c (INil))))
-                    (= ?m1c (Op (Constant -1.000000) (INil)))
-                    (= ?x1out (Op (Add ?a2_sh ?a2_a ?a2_b ?a2_o)
-                        (ICons ?x1c (ICons ?x0s (INil)))))
-                    (= ?x1c (Op (Mul ?m4_sh ?m4_a ?m4_b ?m4_o)
-                        (ICons ?x1 (ICons ?cosb (INil)))))
-                    (= ?x0s (Op (Mul ?m5_sh
-                        (ECons (MMul (MIter) ?e_hd) (ECons (MMul (MIter) ?e_w) (ECons (MIter) (ENil))))
-                        ?m5_b ?m5_o)
-                        (ICons ?x2 (ICons ?sinb (INil)))))
-                    (= ?x ?x2)
-
-                    ; x1 = offset-slice gather of the (heads, seq, hd) view of x
-                    (= ?x1 (Op (Gather ?g1_osh ?g1_ostr ?g1_dsh
-                        (ECons (MMul (MIter) ?e_hd) (ECons (MMul (MIter) ?e_w) (ECons (MIter) (ENil)))))
-                        (ICons ?x1idx (ICons ?x3 (INil)))))
-                    (= ?x ?x3)
-                    (= ?x1idx (Op (Iota
-                        (MAdd (MAdd (MAdd (MMod (MIter) ?e_hd2) ?e_hd2)
-                                    (MMul (MMod (MDiv (MIter) ?e_hd2) ?e_seq) ?e_hd))
-                              (MMul (MDiv (MIter) ?e_ch) ?e_hs2))
-                        ?x1_range) (INil)))
-
-                    (= (Bf16) (dtype ?x))
-                )
-                (
-                    (rope_rotated ?x0out ?x1out ?x ?pos ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel rope rotation stage\"
-            )";
-
-        // Stage-2 conditions in dependency order, segmented for readability.
-        let segments: Vec<&str> = vec![
-            "
-                    (rope_rotated ?x0out ?x1out ?x ?pos ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)",
-            "
-                    ; root: the concat Add - (heads, seq, hd) contiguous
-                    (= ?x0g (Op (Gather ?g2_osh ?g2_ostr ?g2_dsh ?g2_dstr)
-                        (ICons ?c0idx (ICons ?x0out (INil)))))
-                    (= ?x0m (Op (Mul ?m6_sh ?m6_a ?m6_b ?m6_o)
-                        (ICons ?x0g (ICons ?mk0b (INil)))))
-                    (= ?cat (Op (Add ?a3_sh ?a3_a ?a3_b ?a3_o)
-                        (ICons ?x0m (ICons ?x1m (INil)))))
-                    (= ?a3_sh (ECons ?heads (ECons ?seqd (ECons ?hdd (ENil)))))",
-            "
-                    ; concat half 0 pins
-                    (= ?c0idx (Op (Iota
-                        (MAdd (MAdd (MMin (MMod (MIter) ?e_hd) ?e_hdm1)
-                                    (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
-                              (MMul (MDiv (MIter) ?e_hs) ?e_ch))
-                        ?c0_range) (INil)))
-                    (= ?mk0b (Op (Cast ?k0_size (Bf16)) (ICons ?mk0 (INil))))
-                    (= ?mk0 (Op (Iota (MLt (MMod (MIter) ?e_hd) ?e_hd2) ?mk0_range) (INil)))",
-            "
-                    ; concat half 1
-                    (= ?x1g (Op (Gather ?g3_osh ?g3_ostr ?g3_dsh ?g3_dstr)
-                        (ICons ?c1idx (ICons ?x1out (INil)))))
-                    (= ?x1m (Op (Mul ?m7_sh ?m7_a ?m7_b ?m7_o)
-                        (ICons ?x1g (ICons ?mk1b (INil)))))
-                    (= ?c1idx (Op (Iota
-                        (MAdd (MAdd (MMax (MSub (MMod (MIter) ?e_hd) ?e_hd2) (MNum 0))
-                                    (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
-                              (MMul (MDiv (MIter) ?e_hs) ?e_ch))
-                        ?c1_range) (INil)))
-                    (= ?mk1b (Op (Cast ?k1_size (Bf16)) (ICons ?mk1 (INil))))
-                    (= ?mk1 (Op (Iota (MGte (MMod (MIter) ?e_hd) ?e_hd2) ?mk1_range) (INil)))",
-            "
-                    ; layout consistency
-                    (= ?hdd ?e_hd)
-                    (= ?seqd ?e_seq)",
-        ];
-
-        let concat_rule = format!(
-            "(rule
-                (
-                    {}
-                )
-                (
-                    (let ?kr (Op (KernelRoPE ?a3_sh ?e_w ?ln_theta ?inv_hd)
-                        (ICons ?x (ICons ?pos (INil)))))
-                    (union ?cat ?kr)
-                    (set (dtype ?kr) (Bf16))
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel rope half bf16\"
-            )",
-            segments.join("\n")
+    #[allow(
+        clippy::approx_constant,
+        reason = "Exact pattern literals must match the authored graph."
+    )]
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        invf: &Ir,
+        ln_theta: &egg::F64,
+        inv_hd: &egg::F64,
+        pc_size: &DimExpr,
+        pos: &Ir,
+        emb: &Ir,
+        s1_sh: &EList,
+        s1_in: &EList,
+        s1_out: &EList,
+        sb_size: &DimExpr,
+        sinb: &Ir,
+        emb2: &Ir,
+        s2_sh: &EList,
+        s2_in: &EList,
+        s2_out: &EList,
+        cb_size: &DimExpr,
+        cosb: &Ir,
+        e_hd: &DimExpr,
+        e_w: &DimExpr,
+        e_hd2: &DimExpr,
+        x: &Ir,
+        a1_sh: &EList,
+        x0out: &Ir,
+        nb_size: &DimExpr,
+        x1out: &Ir,
+        x3: &Ir,
+        x4: &Ir,
+        e_seq: &DimExpr,
+        e_ch: &DimExpr,
+        e_hs: &DimExpr,
+        x1_range: &DimExpr,
+        cat: &Ir,
+        heads: &DimExpr,
+        seqd: &DimExpr,
+        hdd: &DimExpr,
+        e_hdm: &DimExpr,
+        c0_range: &DimExpr,
+        k0_size: &DimExpr,
+        mk0_range: &DimExpr,
+        c1_range: &DimExpr,
+        k1_size: &DimExpr,
+        mk1_range: &DimExpr,
+    ) -> Vec<Rule> {
+        let rotated = &Ir::Op(kernel_ro_pe(a1_sh, e_w, ln_theta, inv_hd), [x, pos]);
+        let posf = &Ir::Op(OpKind::Cast(pc_size, DType::F32()), [pos]);
+        let sinv = &Ir::Op(OpKind::Sin(s1_sh, s1_in, s1_out), [emb]);
+        let m1c = &Ir::Op(OpKind::Constant(-1.0), IList::INil());
+        let hpi = &Ir::Op(OpKind::Constant(1.570796), IList::INil());
+        let x0c = &Ir::Op(
+            MulArgs {
+                a_strides: ([
+                    &(DimExpr::MIter() * e_hd),
+                    &(DimExpr::MIter() * e_w),
+                    &(DimExpr::MIter()),
+                ])
+                .into(),
+                b_strides: ([
+                    &(DimExpr::MNum(0)),
+                    &(DimExpr::MIter() * e_hd2),
+                    &(DimExpr::MIter()),
+                ])
+                .into(),
+                ..MulArgs::fresh()
+            },
+            [x, cosb],
         );
-        vec![raw_rules(parser, format!(
-            "{angle_stage}\n{rotation_stage}\n{concat_rule}"
-        ))]
-    };
-        __rules.into_iter().flatten().collect()
+        let x0s = &Ir::Op(
+            MulArgs {
+                a_strides: ([
+                    &(DimExpr::MIter() * e_hd),
+                    &(DimExpr::MIter() * e_w),
+                    &(DimExpr::MIter()),
+                ])
+                .into(),
+                ..MulArgs::fresh()
+            },
+            [x3, sinb],
+        );
+        let x1idx = &Ir::Op(
+            OpKind::Iota(
+                (((DimExpr::MIter() % e_hd2) + e_hd2)
+                    + (((DimExpr::MIter() / e_hd2) % e_seq) * e_hd))
+                    + ((DimExpr::MIter() / e_ch) * e_hs),
+                x1_range,
+            ),
+            IList::INil(),
+        );
+        let c0idx = &Ir::Op(
+            OpKind::Iota(
+                (DimExpr::MMin(DimExpr::MIter() % e_hd, e_hdm)
+                    + (((DimExpr::MIter() / e_hd) % e_seq) * e_hd2))
+                    + ((DimExpr::MIter() / e_hs) * e_ch),
+                c0_range,
+            ),
+            IList::INil(),
+        );
+        let mk = &Ir::Op(
+            OpKind::Iota(DimExpr::MLt(DimExpr::MIter() % e_hd, e_hd2), mk0_range),
+            IList::INil(),
+        );
+        let c1idx = &Ir::Op(
+            OpKind::Iota(
+                (DimExpr::MMax((DimExpr::MIter() % e_hd) - e_hd2, 0)
+                    + (((DimExpr::MIter() / e_hd) % e_seq) * e_hd2))
+                    + ((DimExpr::MIter() / e_hs) * e_ch),
+                c1_range,
+            ),
+            IList::INil(),
+        );
+        let mk2 = &Ir::Op(
+            OpKind::Iota(DimExpr::MGte(DimExpr::MIter() % e_hd, e_hd2), mk1_range),
+            IList::INil(),
+        );
+        let embm = &Ir::Op(MulArgs::fresh(), [posf, invf]);
+        let neg = &Ir::Op(MulArgs::fresh(), [emb2, m1c]);
+        let negb = &Ir::Op(OpKind::Cast(nb_size, DType::Bf16()), [m1c]);
+        let x2 = &Ir::Op(
+            GatherArgs {
+                data_strides: ([
+                    &(DimExpr::MIter() * e_hd),
+                    &(DimExpr::MIter() * e_w),
+                    &(DimExpr::MIter()),
+                ])
+                .into(),
+                ..GatherArgs::fresh()
+            },
+            [x1idx, x4],
+        );
+        let x0g = &Ir::Op(GatherArgs::fresh(), [c0idx, x0out]);
+        let mk0b = &Ir::Op(OpKind::Cast(k0_size, DType::Bf16()), [mk]);
+        let x1g = &Ir::Op(GatherArgs::fresh(), [c1idx, x1out]);
+        let mk1b = &Ir::Op(OpKind::Cast(k1_size, DType::Bf16()), [mk2]);
+        let shift = &Ir::Op(AddArgs::fresh(), [neg, hpi]);
+        let x1s = &Ir::Op(MulArgs::fresh(), [x2, sinb]);
+        let x1c = &Ir::Op(MulArgs::fresh(), [x2, cosb]);
+        let x0m = &Ir::Op(MulArgs::fresh(), [x0g, mk0b]);
+        let x1m = &Ir::Op(MulArgs::fresh(), [x1g, mk1b]);
+        let cosv = &Ir::Op(OpKind::Sin(s2_sh, s2_in, s2_out), [shift]);
+        let x1sn = &Ir::Op(MulArgs::fresh(), [x1s, negb]);
+        vec![
+            rule(
+                (
+                    Fact::from(rope_invf(invf, ln_theta, inv_hd)),
+                    eq(DType::Int(), pos.dtype()),
+                    eq(emb, Ir::Op(SumArgs::fresh(), [embm])),
+                    eq(sinb, Ir::Op(OpKind::Cast(sb_size, DType::Bf16()), [sinv])),
+                    eq(emb, emb2),
+                    eq(cosb, Ir::Op(OpKind::Cast(cb_size, DType::Bf16()), [cosv])),
+                ),
+                (rope_angles(cosb, sinb, pos, ln_theta, inv_hd),),
+            )
+            .label("kernel rope angles stage"),
+            rule(
+                (
+                    Fact::from(rope_angles(cosb, sinb, pos, ln_theta, inv_hd)),
+                    eq(x0out, Ir::Op(AddArgs::fresh(), [x0c, x1sn])),
+                    eq(x1out, Ir::Op(AddArgs::fresh(), [x1c, x0s])),
+                    eq(x, x3),
+                    eq(x, x4),
+                    eq(DType::Bf16(), x.dtype()),
+                ),
+                (rope_rotated(
+                    x0out, x1out, x, pos, e_hd, e_hd2, e_w, e_seq, ln_theta, inv_hd,
+                ),),
+            )
+            .label("kernel rope rotation stage"),
+            rule(
+                (
+                    Fact::from(rope_rotated(
+                        x0out, x1out, x, pos, e_hd, e_hd2, e_w, e_seq, ln_theta, inv_hd,
+                    )),
+                    eq(
+                        cat,
+                        Ir::Op(
+                            AddArgs {
+                                shape: a1_sh.into(),
+                                ..AddArgs::fresh()
+                            },
+                            [x0m, x1m],
+                        ),
+                    ),
+                    eq(a1_sh, [heads, seqd, hdd]),
+                    eq(hdd, e_hd),
+                    eq(seqd, e_seq),
+                ),
+                (
+                    rotated,
+                    union(cat, rotated),
+                    set(rotated.dtype(), DType::Bf16()),
+                ),
+            )
+            .label("kernel rope half bf16"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let width = extract_expr(egraph, kind_children[1], expr_cache)
-            .unwrap()
+impl KernelRoPE {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape, field_width, field_ln_theta, field_inv_hd)) = typed::get_args(
+            kind,
+            |out_shape: &EList, width: &DimExpr, ln_theta: &egg::F64, inv_hd: &egg::F64| {
+                crate::typed_rules::kernel_ro_pe(out_shape, width, ln_theta, inv_hd)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let out_shape = decoded_out_shape;
+        let width = context
+            .expression(&field_width)?
             .to_usize()
-            .expect("RoPE width must be static");
-        let ln_theta: f64 = egraph.enodes[kind_children[2]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
-        let inv_hd: f64 = egraph.enodes[kind_children[3]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape,
-                width,
-                ln_theta,
-                inv_hd,
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+            .ok_or_else(|| TypedError::Decode("RoPE width must be static".into()))?;
+        let ln_theta: f64 = f64::try_from(&field_ln_theta)?;
+        let inv_hd: f64 = f64::try_from(&field_inv_hd)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape,
+            width,
+            ln_theta,
+            inv_hd,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

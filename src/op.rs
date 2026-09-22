@@ -3,8 +3,11 @@ use std::{
     sync::Arc,
 };
 
+use crate::egglog_utils::{DecodeContext, PhaseRules};
 use crate::prelude::*;
+use crate::typed_reference::schema::{Ir, OpKind};
 use as_any::{AsAny, Downcast};
+use egglog_experimental::typed::{Action, TypedError};
 use rustc_hash::FxHashMap;
 
 #[derive(Clone, Copy)]
@@ -58,36 +61,23 @@ impl CandidateFilterResult {
 }
 
 pub trait Runtime {
-    type Ops: IntoEgglogOp;
+    /// Match and prepare selected backend expressions, before core fallbacks.
+    const DECODERS: &'static [DecodeFn] = &[];
+
+    /// Normalized kinds that were direct IR nodes in the previous schema.
+    /// They must not become new survivor evidence for conditional HLIR cleanup.
+    fn cleanup_ignored(_kind: &OpKind) -> Result<bool, TypedError> {
+        Ok(false)
+    }
+
+    /// Complete default recipe: phase rules and ordered initialization actions.
+    /// Customize these ordinary values before building a search space.
+    fn rules() -> (PhaseRules, Vec<Action>) {
+        (crate::egglog_utils::base_phase_rules(), Vec::new())
+    }
     type CompileArg;
     type ExecReturn;
     type ProfileMetric: PartialOrd + Clone + Debug;
-    /// Backend-provided egglog layers that run after the normal full-egraph
-    /// cleanup schedule. Core keeps this empty; runtimes can use it for
-    /// backend-specific analyses and cleanup passes without adding those rules
-    /// to Luminal core.
-    fn late_egglog_passes(
-        _ops: &[Arc<Box<dyn EgglogOp>>],
-        _options: &crate::graph::CompileOptions,
-        _dyn_map: &FxHashMap<char, usize>,
-    ) -> Vec<crate::egglog_utils::LateEgglogPass>
-    where
-        Self: Sized,
-    {
-        vec![]
-    }
-    /// Backend-provided egglog text spliced in immediately after the op
-    /// constructor definitions and before the rewrite rules. Core keeps this
-    /// empty; runtimes can use it to declare shared egglog relations/functions
-    /// that their rewrite rules read and write across multiple ops — declarations
-    /// that the per-op rewrite hook cannot emit exactly-once — without adding
-    /// those declarations to Luminal core.
-    fn extra_egglog() -> String
-    where
-        Self: Sized,
-    {
-        String::new()
-    }
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;
@@ -267,47 +257,16 @@ impl std::fmt::Display for ExecutionStats {
     }
 }
 
-pub trait EgglogOp: Debug {
-    fn sort(&self) -> crate::egglog_utils::api::SortDef;
-    /// Op rewrite rules as parsed egglog `Command`s, built with the `egglog!`
-    /// quasiquote against a schema-aware `parser` (see [`schema_parser`]). This
-    /// is what the pipeline consumes; ops with no rewrites keep the default.
-    ///
-    /// [`schema_parser`]: crate::egglog_utils::schema_parser
-    fn rewrites_commands(&self, _parser: &mut egglog::ast::Parser) -> Vec<egglog::ast::Command> {
-        vec![]
-    }
-    fn cleanup(&self) -> bool;
-
-    /// Additional IR datatype variants this op needs (e.g. `"(ConsumedBuffer IR)"`).
-    /// These are injected into the IR datatype definition.
-    fn ir_defs(&self) -> Vec<String> {
-        vec![]
-    }
-
-    /// Number of IR inputs this op takes (from IList).
-    /// Used by generic IList walking during extraction.
-    fn n_inputs(&self) -> usize {
-        0
-    }
-
-    /// Extract this op from the egraph.
-    /// - `kind_children`: metadata fields from OpKind enode (shapes, strides, dtypes, etc.)
-    /// - `input_enodes`: IR inputs from IList, already walked and resolved
-    #[allow(unused_variables)]
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        panic!("Extraction not implemented for {self:?}!");
-    }
-}
-
-crate::impl_into_ops!(EgglogOp);
+/// Prepare one selected constructor and its ordered, selected input producers.
+/// A decoder may replace dependencies, but cannot add reachable producers.
+/// Match with `get_args` before decoding, mutation, or preparation: `Ok(None)`
+/// must leave inputs and context unchanged. Dispatch stops at the first `Some`
+/// or error; an error is never a request to try another decoder.
+pub type DecodeFn = for<'a, 'b> fn(
+    &OpKind,
+    &mut Vec<Ir>,
+    &mut DecodeContext<'a, 'b>,
+) -> Result<Option<LLIROp>, TypedError>;
 
 pub trait CustomOp: Debug {
     fn to_llir_op(&self) -> LLIROp;
@@ -317,12 +276,12 @@ pub trait CustomOp: Debug {
 ///
 /// Defines an HLIROp that implements a logical operation.
 pub trait HLIROp: Debug + Display + as_any::AsAny {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String;
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir;
 }
 
 impl<T: HLIROp> HLIROp for Box<T> {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        <T as HLIROp>::to_egglog(self, inputs)
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        <T as HLIROp>::to_ir(self, inputs)
     }
 }
 
@@ -345,7 +304,7 @@ impl LLIROp {
                 || op.type_name().contains("LoopOutput"),
             "op types must be erased into dialect traits for dialect casting to work!"
         );
-        Self(Arc::new(Box::new(DialectOp::new(op))))
+        Self(Arc::new(Box::new(DialectOp(Arc::new(op)))))
     }
 
     pub fn to_dialect<T: ?Sized + 'static>(&self) -> Option<&Arc<Box<T>>> {
@@ -368,116 +327,6 @@ impl std::fmt::Display for LLIROp {
 #[derive(Debug)]
 struct DialectOp<T>(pub Arc<T>);
 
-impl<T> DialectOp<T> {
-    pub fn new(op: T) -> Self {
-        Self(Arc::new(op))
-    }
-}
-
 impl<T: Debug + 'static> DialectOpTrait for DialectOp<T> {}
 
 pub trait DialectOpTrait: AsAny + Debug {}
-
-#[macro_export]
-macro_rules! __impl_tuple_into_dyn_arcbox_concat_arity {
-    ($tr:ident; $($T:ident),+ $(,)?) => {
-        $crate::paste!{
-        impl<$($T),+> [<Into $tr>] for ($($T,)+)
-        where
-            $(
-                $T: [<Into $tr>],
-            )+
-        {
-            #[inline]
-            fn append_into(
-                out: &mut ::std::vec::Vec<
-                    ::std::sync::Arc<::std::boxed::Box<dyn $tr + 'static>>
-                >
-            ) {
-                $(
-                    <$T as [<Into $tr>]>::append_into(out);
-                )+
-            }
-        }
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! impl_into_ops {
-    ($tr:ident) => {
-        $crate::paste!{
-        pub trait [<Into $tr>] {
-            fn append_into(
-                out: &mut ::std::vec::Vec<
-                    ::std::sync::Arc<::std::boxed::Box<dyn $tr + 'static>>
-                >
-            );
-
-            #[inline]
-            fn into_vec() -> ::std::vec::Vec<
-                ::std::sync::Arc<::std::boxed::Box<dyn $tr + 'static>>
-            > {
-                let mut out = ::std::vec::Vec::new();
-                Self::append_into(&mut out);
-                out
-            }
-        }
-
-        // base
-        impl [<Into $tr>] for () {
-            #[inline]
-            fn append_into(
-                _out: &mut ::std::vec::Vec<
-                    ::std::sync::Arc<::std::boxed::Box<dyn $tr + 'static>>
-                >
-            ) {}
-        }
-
-        // leaf: any concrete op type
-        impl<T> [<Into $tr>] for T
-        where
-            T: $tr + ::std::default::Default + 'static,
-        {
-            #[inline]
-            fn append_into(
-                out: &mut ::std::vec::Vec<
-                    ::std::sync::Arc<::std::boxed::Box<dyn $tr + 'static>>
-                >
-            ) {
-                out.push(::std::sync::Arc::new(::std::boxed::Box::new(
-                    <T as ::std::default::Default>::default(),
-                )));
-            }
-        }
-        }
-
-        // tuple concatenation impls (extend arity list as needed)
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y);
-        $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
-    };
-}

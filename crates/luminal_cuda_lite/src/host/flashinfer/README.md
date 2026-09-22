@@ -5,7 +5,7 @@ FlashInfer replaces the multi-op attention pattern (Q×K^T → scale → mask �
 ## Current State
 
 **Working:**
-- Egglog rewrite rule matches any GQA paged attention pattern (model-agnostic shapes)
+- Typed Egglog rules match supported GQA paged attention patterns with explicit cache, mask, gather-layout and capability guards
 - GA search selects FlashInfer when it wins profiling — verified on Llama 3 8B (32 layers) and Qwen 3 4B (36 layers)
 - **BatchDecode** (s=1): fp32 natively — FlashInfer's decode kernel uses scalar vectorized dot products, no tensor cores
 - **BatchPrefill**: template-instantiated for fp16 but **not callable from fp32** — FlashInfer's prefill kernel requires tensor core MMA (`mma.sync.aligned.m16n8k16`) and `ldmatrix` which physically only operate on 16-bit types; the C API stubs return -1 for fp32; will be enabled when native fp16/bf16 pipeline is added
@@ -22,10 +22,10 @@ FlashInfer replaces the multi-op attention pattern (Q×K^T → scale → mask �
 
 ```
 src/host/flashinfer/
-  flashinfer_attention.egg  — egglog rewrite rule (pattern match → FlashInferAttention)
-  mod.rs                    — FlashInferAttention op (EgglogOp + HostOp impl)
+  flashinfer_attention.rs    — typed attention rules and mask proofs
+  mod.rs                    — typed-call preparation and FlashInferAttention HostOp
+  find_indptrs.rs            — selected-operation compact-index dependency recovery
   jit.rs                    — JIT compilation: nvcc wrapper.cu → .so, dlopen, fn pointers
-  find_indptrs.rs           — recovers compact gather indices from lowered gather_rows indices
   wrapper.cu                — CUDA: FlashInfer template instantiation + helper kernels
   wrapper.h                 — C API header for wrapper.cu
   README.md                 — this file
@@ -35,7 +35,7 @@ src/host/flashinfer/
 
 ### 1. Egglog Pattern Matching
 
-The rule in `flashinfer_attention.egg` matches the structural pattern of paged GQA attention:
+The rules in `flashinfer_attention.rs` match the structural pattern of paged GQA attention:
 
 ```
 Gather(K_cache, idx) → GQA broadcast (Mul×1.0) → Q×K^T → Sum → scale → mask Add → softmax → attn×V → Sum → output
@@ -54,9 +54,15 @@ When the rule fires, it unions `FlashInferAttention` with the original attention
 
 ### 2. Extraction: Dropping Proof-Only Inputs
 
-During `extract()` (called when egglog selects the FlashInferAttention e-node), the mask remains a structural proof that the original attention is causal, but it is not kept as a runtime input. `find_indptrs.rs` walks the lowered `gather_rows` index expression and recovers the compact slot index tensor from `indices * KV_DIM + arange(KV_DIM)`.
+The decoder inspects the selected operation with `get_args`. `find_indptrs.rs`
+recovers the compact gather index from structured frozen expressions, preferring
+an HLIR producer and otherwise using the selected lowered or fused producer.
+It returns the first recoverable Input in operand order; no witness is an error.
+The recovered producer must already be reachable in the selected graph.
 
-The runtime FlashInfer inputs are only `Q`, `K_cache`, `V_cache`, and compact `gather_idx` for the causal decode path. Optional explicit `qo_indptr` and `kv_indptr` inputs are still accepted for direct host-op tests and multi-sequence callers.
+The decoder replaces the flat index and drops the proof-only mask. Runtime inputs
+are `Q`, `K_cache`, `V_cache`, and compact `gather_idx`. The host API also accepts
+optional `qo_indptr` and `kv_indptr` for multi-sequence callers and direct tests.
 
 ### 3. JIT Compilation
 
@@ -95,7 +101,9 @@ let allowed = same_request * causal;
 allowed * 1e10 - 1e10    // → 0.0 for allowed, -1e10 for blocked
 ```
 
-The `Mul(allowed, Constant(1e10))` pattern is the anchor that `find_indptrs.rs` uses to walk backward and locate the indptr inputs.
+Typed mask rules recognize the supported structures and establish proof facts
+used by the attention rewrites. Mask recognition and compact gather-index
+recognition are separate; neither substitutes for the other.
 
 ## Roadmap
 

@@ -3,7 +3,7 @@ use luminal::prelude::*;
 use luminal_nn::{gather_rows, scatter_rows};
 use rand::SeedableRng;
 
-use luminal::egglog_utils::{egglog_to_llir, random_initial_choice, validate_choice_set};
+use luminal::egglog_utils::{random_initial_choice, reconstruct, validate_choice_set};
 
 use crate::kernel::KernelOp;
 use crate::runtime::CudaRuntime;
@@ -12,24 +12,20 @@ use crate::runtime::CudaRuntime;
 fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
+    let ops = cx.decoders.as_ref().expect("ops not built");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let custom_ops = &cx.custom_ops;
 
     let mut all_names = Vec::new();
+    let mut valid = 0;
     // Try many random extractions to cover both alternatives
     for _ in 0..20 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rand::rng());
+        let (llir, _) = reconstruct(egraph, &choices, ops, custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
+        valid += 1;
         for op in llir.node_weights() {
             if let Some(k) = op.to_dialect::<dyn KernelOp>() {
                 let name = k.kernel_name().to_string();
@@ -39,6 +35,7 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
             }
         }
     }
+    assert!(valid > 0, "no valid scatter candidate reconstructed");
     all_names
 }
 
@@ -201,7 +198,10 @@ fn test_scatter_execution_correctness() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
+    let ops = cx.decoders.as_ref().expect("ops not built");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
 
     // Expected: [0.0, 10.0, 2.0, 20.0, 30.0]
     let expected = vec![0.0f32, 10.0, 2.0, 20.0, 30.0];
@@ -211,22 +211,12 @@ fn test_scatter_execution_correctness() {
     let mut tested_nocopy = false;
 
     for _ in 0..50 {
-        let choices = random_initial_choice(egraph, &mut rng);
-        if validate_choice_set(egraph, &choices, ops).is_err() {
+        let choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        if validate_choice_set(egraph, &alternatives, &choices).is_err() {
             continue;
         }
-
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
 
         // Check which scatter variant was selected
         let mut has_nocopy = false;

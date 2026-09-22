@@ -1,3 +1,6 @@
+use egglog_experimental::typed::EgglogValue;
+use egglog_experimental::typed::builtins as egg;
+use luminal::typed_reference::schema::{DType as IrDType, DimExpr, EList, OpKind};
 // =========================================================================
 // Dtype-contract tests: dtypes only change at explicit HLIR Casts, and
 // rewrite rules absorb those casts without changing any eclass's dtype.
@@ -19,25 +22,30 @@ use crate::tests::utilities::{
     random_f32_vec, random_i32_vec,
 };
 
-/// True if the built e-graph contains an enode with head `label` one of
-/// whose children's eclasses contains an enode with head `child_label`.
-/// With `child_label = None`, only the head is checked.
-fn egraph_has_enode(cx: &Graph, label: &str, child_label: Option<&str>) -> bool {
-    let egraph = cx.egraph().expect("search space should be built");
-    egraph.enodes.values().any(|(head, children)| {
-        if !head.contains(label) {
-            return false;
-        }
-        let Some(child_label) = child_label else {
-            return true;
-        };
-        children.iter().any(|class| {
-            egraph.eclasses[class]
-                .1
-                .iter()
-                .any(|n| egraph.enodes[n].0.contains(child_label))
+/// Inspect typed operation patterns, optionally requiring an immediate
+/// equality-valued field to contain the requested constructor (e.g. a dtype).
+fn egraph_has_enode(
+    cx: &Graph,
+    matches: impl Fn(&OpKind) -> bool,
+    child: Option<fn(&IrDType) -> bool>,
+) -> bool {
+    let frozen = &cx.egraph().expect("search space should be built").frozen;
+    frozen
+        .eclasses()
+        .filter(|class| class.sort() == OpKind::sort_ref())
+        .flat_map(|class| class.nodes())
+        .any(|node| {
+            matches(&frozen.typed_node::<OpKind>(node).unwrap())
+                && child.is_none_or(|child| {
+                    node.eclass_children()
+                        .filter(|class| class.sort() == IrDType::sort_ref())
+                        .any(|class| {
+                            class
+                                .nodes()
+                                .any(|node| child(&frozen.typed_node(node).unwrap()))
+                        })
+                })
         })
-    })
 }
 
 #[test]
@@ -51,7 +59,22 @@ fn test_bf16_constant_folds_into_kernel_constant() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelConstant", Some("Bf16")),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(
+                kind,
+                |value: &egg::F64, dtype: &IrDType| {
+                    crate::typed_rules::kernel_constant(value, dtype)
+                }
+            )
+            .unwrap()
+            .is_some(),
+            Some(|kind| {
+                egglog_experimental::typed::get_args(kind, IrDType::Bf16)
+                    .unwrap()
+                    .is_some()
+            })
+        ),
         "Cast(Bf16)(Constant) should fold into a Bf16 KernelConstant"
     );
 
@@ -106,7 +129,32 @@ fn test_embed_bf16_table() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelEmbed", Some("Bf16")),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(
+                kind,
+                |batch_shape: &EList,
+                 token_stride: &EList,
+                 out_stride: &EList,
+                 embed_dim: &DimExpr,
+                 dtype: &IrDType| {
+                    crate::typed_rules::kernel_embed(
+                        batch_shape,
+                        token_stride,
+                        out_stride,
+                        embed_dim,
+                        dtype,
+                    )
+                }
+            )
+            .unwrap()
+            .is_some(),
+            Some(|kind| {
+                egglog_experimental::typed::get_args(kind, IrDType::Bf16)
+                    .unwrap()
+                    .is_some()
+            })
+        ),
         "embed rewrite should propagate the bf16 table dtype"
     );
 
@@ -162,7 +210,34 @@ fn test_bf16_cast_sum_cast_fuses_with_f32_accumulator() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelCastSum", Some("Bf16")),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(
+                kind,
+                |shape: &EList,
+                 iters: &DimExpr,
+                 strides: &EList,
+                 iter_stride: &DimExpr,
+                 out_strides: &EList,
+                 dtype: &IrDType| {
+                    crate::typed_rules::kernel_cast_sum(
+                        shape,
+                        iters,
+                        strides,
+                        iter_stride,
+                        out_strides,
+                        dtype,
+                    )
+                }
+            )
+            .unwrap()
+            .is_some(),
+            Some(|kind| {
+                egglog_experimental::typed::get_args(kind, IrDType::Bf16)
+                    .unwrap()
+                    .is_some()
+            })
+        ),
         "Cast(F32) → Sum → Cast(Bf16) should offer the fused f32-accumulator kernel"
     );
 
@@ -312,7 +387,7 @@ fn test_bf16_reciprocal_region_compiles() {
 /// extraction selected the 2-node cycle ~75% of the time.
 #[test]
 fn bf16_cast_sandwich_extraction_is_acyclic() {
-    use luminal::egglog_utils::{egglog_to_llir, random_initial_choice};
+    use luminal::egglog_utils::{random_initial_choice, reconstruct};
     use luminal::prelude::petgraph::algo::toposort;
     use rand::SeedableRng;
     let mut cx = Graph::default();
@@ -325,22 +400,16 @@ fn bf16_cast_sandwich_extraction_is_acyclic() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
-    let ops = cx.egglog_ops().unwrap();
+    let ops = cx.decoders.as_ref().unwrap();
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     let mut cycles = 0;
     for _ in 0..300 {
-        let choices = random_initial_choice(egraph, &mut rng);
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
         if toposort(&llir, None).is_err() {
             cycles += 1;
         }
@@ -662,7 +731,7 @@ fn bench_cuda_graph_node_overhead() {
 #[test]
 fn pure_matmul_chain_cuda_graph_materializes() {
     use luminal::egglog_utils::{
-        egglog_to_llir, hash_choice_set, random_initial_choice, validate_choice_set,
+        hash_choice_set, random_initial_choice, reconstruct, validate_choice_set,
     };
     use rand::SeedableRng;
     const N: usize = 4096;
@@ -701,29 +770,23 @@ fn pure_matmul_chain_cuda_graph_materializes() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
-    let ops = cx.egglog_ops().unwrap();
+    let ops = cx.decoders.as_ref().unwrap();
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     let mut seen = FxHashSet::default();
     let mut tested = 0;
     for _ in 0..200 {
-        let choices = random_initial_choice(egraph, &mut rng);
+        let choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
         if !seen.insert(hash_choice_set(&choices)) {
             continue;
         }
-        if validate_choice_set(egraph, &choices, ops).is_err() {
+        if validate_choice_set(egraph, &alternatives, &choices).is_err() {
             continue;
         }
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let mut llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (mut llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
         unroll_loops_in_llir(&mut llir);
         let mut rt = CudaRuntime::initialize(stream.clone());
         rt.load_llir(&llir);
@@ -817,7 +880,18 @@ fn fused_argmax_matches_decomposed() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelArgmax", None),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(
+                kind,
+                |shape: &EList, cols: &DimExpr, dtype: &IrDType| {
+                    crate::typed_rules::kernel_argmax(shape, cols, dtype)
+                }
+            )
+            .unwrap()
+            .is_some(),
+            None
+        ),
         "argmax decomposition should offer the fused kernel"
     );
 
@@ -934,7 +1008,22 @@ fn gemv_m1_case(n: usize, k: usize, seed: u64) {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelGemv", Some("Bf16")),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(
+                kind,
+                |n: &DimExpr, k: &DimExpr, dtype: &IrDType| {
+                    crate::typed_rules::kernel_gemv(n, k, dtype)
+                }
+            )
+            .unwrap()
+            .is_some(),
+            Some(|kind| {
+                egglog_experimental::typed::get_args(kind, IrDType::Bf16)
+                    .unwrap()
+                    .is_some()
+            })
+        ),
         "m=1 bf16 matmul should offer the warp GEMV candidate"
     );
 
@@ -1018,11 +1107,25 @@ fn quant_f8_linear_chain_matches_reference() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelQuantF8", None),
+        egraph_has_enode(
+            &cx,
+            |kind| egglog_experimental::typed::get_args(kind, |size: &DimExpr| {
+                crate::typed_rules::kernel_quant_f8(size)
+            })
+            .unwrap()
+            .is_some(),
+            None
+        ),
         "fp8 quant chain should offer the fused quant candidate"
     );
     assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
+        egraph_has_enode(
+            &cx,
+            |kind| crate::typed_rules::KernelGemvF8Args::get_args(kind)
+                .unwrap()
+                .is_some(),
+            None
+        ),
         "m=1 fp8 matmul + dequant chain should offer the tensor-core GEMV candidate"
     );
 
@@ -1111,7 +1214,13 @@ fn gemv_f8_unaligned_shape_matches_reference() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
+        egraph_has_enode(
+            &cx,
+            |kind| crate::typed_rules::KernelGemvF8Args::get_args(kind)
+                .unwrap()
+                .is_some(),
+            None
+        ),
         "unaligned m=1 fp8 chain should still offer the tensor-core GEMV"
     );
 
@@ -1310,11 +1419,23 @@ fn fused_norm_quant_linear_chain_matches_reference() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "cublaslt_scaled", None),
+        egraph_has_enode(
+            &cx,
+            |kind| crate::typed_rules::CuBlasLtScaledArgs::get_args(kind)
+                .unwrap()
+                .is_some(),
+            None
+        ),
         "custom f8 op should match the scaled cuBLASLt rule variant"
     );
     assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
+        egraph_has_enode(
+            &cx,
+            |kind| crate::typed_rules::KernelGemvF8Args::get_args(kind)
+                .unwrap()
+                .is_some(),
+            None
+        ),
         "custom f8 op should match the tensor-core GEMV rule variant"
     );
 
@@ -1423,7 +1544,30 @@ fn moe_gemv_matches_hlir_reference() {
 
         cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         assert!(
-            egraph_has_enode(&cx, "KernelMoEGemv", None),
+            egraph_has_enode(
+                &cx,
+                |kind| {
+                    egglog_experimental::typed::get_args(
+                        kind,
+                        |out_shape: &EList,
+                         k_dim: &DimExpr,
+                         w_shape: &EList,
+                         x_strides: &EList,
+                         topk_strides: &EList| {
+                            crate::typed_rules::kernel_mo_e_gemv(
+                                out_shape,
+                                k_dim,
+                                w_shape,
+                                x_strides,
+                                topk_strides,
+                            )
+                        },
+                    )
+                    .unwrap()
+                    .is_some()
+                },
+                None
+            ),
             "expert-gather matmul (per_expert={per_expert}, dyn_s={dyn_s}) should offer the fused MoE GEMV"
         );
 

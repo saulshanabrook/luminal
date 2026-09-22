@@ -1,5 +1,5 @@
 use as_any::Downcast;
-use luminal::egglog_utils::{egglog_to_llir, random_initial_choice};
+use luminal::egglog_utils::{random_initial_choice, reconstruct};
 use luminal::prelude::*;
 
 use crate::kernel::KernelOp;
@@ -295,8 +295,12 @@ struct FusedRegion {
 fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
+    let ops = cx.decoders.as_ref().expect("ops not built");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let custom_ops = &cx.custom_ops;
+    let mut valid = 0;
 
     let mut seen: Vec<FusedRegion> = Vec::new();
     // 200 samples: the random extractor picks one e-node per e-class per
@@ -304,19 +308,11 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
     // many equivalent forms. 50 was flaky; 200 is reliably stable and
     // each sample is cheap (~100 µs).
     for _ in 0..200 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rand::rng());
+        let (llir, _) = reconstruct(egraph, &choices, ops, custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
 
+        valid += 1;
         let name_of = |idx: NodeIndex| -> Option<String> {
             llir.node_weight(idx).and_then(|op| {
                 op.to_dialect::<dyn KernelOp>().map(|k| {
@@ -435,6 +431,7 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
             }
         }
     }
+    assert!(valid > 0, "no valid fusion candidate reconstructed");
     seen
 }
 

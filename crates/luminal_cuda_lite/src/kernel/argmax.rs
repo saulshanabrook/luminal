@@ -16,6 +16,9 @@
 //! `index * one_hot`). Used for GPU-side greedy sampling: the host reads one
 //! i32 per row instead of a vocab-sized logit row.
 
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -23,15 +26,7 @@ use crate::{
     kernel::{KernelOp, hlir::dtype_includes},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
-        extract_dtype, extract_expr, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 // Wide blocks: one block scans a whole vocab row (≈128K elements), so
 // maximize per-block parallelism.
@@ -44,96 +39,106 @@ pub struct KernelArgmax {
     dtype: DType,
 }
 
-impl EgglogOp for KernelArgmax {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelArgmax",
-            &[("shape", ELIST), ("cols", EXPRESSION), ("dtype", DTYPE)],
-        )
-    }
+pub(crate) mod kernel_argmax {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // The scalar constants (-1, +1) sit behind frontend-emitted identity
-        // casts; the kernel_lower fold unions a KernelConstant into each
-        // Cast(Constant) eclass (F32 included), which is matched directly
-        // here (const_like lives in the flashinfer host-op file, which loads
-        // after kernel ops).
-        vec![raw_rules(parser, 
-            "(rule
+    #[ruleset]
+    pub(crate) fn kernel_specialize(
+        out_shape: &EList,
+        cols: &DimExpr,
+        out: &Ir,
+        cols2: &DimExpr,
+        oh_size: &DimExpr,
+        eq_size: &DimExpr,
+        lt1_size: &DimExpr,
+        lt2_size: &DimExpr,
+        lt_shape: &EList,
+        x_strides1: &EList,
+        mx_strides1: &EList,
+        lt1_out_strides: &EList,
+        x: &Ir,
+        lt_shape2: &EList,
+        mx_strides2: &EList,
+        x_strides2: &EList,
+        lt2_out_strides: &EList,
+        dt: &DType,
+    ) -> Vec<Rule> {
+        let am = &Ir::Op(kernel_argmax(out_shape, cols, dt), [x]);
+        let iota = &Ir::Op(OpKind::Iota(DimExpr::MIter(), cols2), IList::INil());
+        let one = &Ir::Op(kernel_constant(1.0, DType::F32()), IList::INil());
+        let negone = &Ir::Op(kernel_constant(-1.0, DType::F32()), IList::INil());
+        let mx = &Ir::Op(
+            MaxArgs {
+                iter_stride: DimExpr::MIter(),
+                ..MaxArgs::fresh()
+            },
+            [x],
+        );
+        let lt1 = &Ir::Op(
+            OpKind::LessThan(lt_shape, x_strides1, mx_strides1, lt1_out_strides),
+            [x, mx],
+        );
+        let lt2 = &Ir::Op(
+            OpKind::LessThan(lt_shape2, mx_strides2, x_strides2, lt2_out_strides),
+            [mx, x],
+        );
+        let lt1f = &Ir::Op(OpKind::Cast(lt1_size, DType::F32()), [lt1]);
+        let lt2f = &Ir::Op(OpKind::Cast(lt2_size, DType::F32()), [lt2]);
+        let ne = &Ir::Op(AddArgs::fresh(), [lt1f, lt2f]);
+        let neg = &Ir::Op(MulArgs::fresh(), [ne, negone]);
+        let plus1 = &Ir::Op(AddArgs::fresh(), [neg, one]);
+        let equal_mask = &Ir::Op(OpKind::Cast(eq_size, DType::Bool()), [plus1]);
+        let one_hot = &Ir::Op(OpKind::Cast(oh_size, DType::Int()), [equal_mask]);
+        let prod = &Ir::Op(MulArgs::fresh(), [one_hot, iota]);
+        vec![
+            rule(
                 (
-                    ; final Max over cols of (one_hot * iota)
-                    (= ?out (Op (Max ?out_shape ?cols ?out_in_strides (MIter) ?out_out_strides)
-                        (ICons ?prod (INil))))
-                    (= ?prod (Op (Mul ?prod_shape ?onehot_strides ?iota_strides ?prod_out_strides)
-                        (ICons ?one_hot (ICons ?iota (INil)))))
-                    (= ?iota (Op (Iota (MIter) ?cols2) (INil)))
-
-                    ; one_hot = Cast(Int)(Cast(Bool)(ne * -1 + 1))
-                    (= ?one_hot (Op (Cast ?oh_size (Int)) (ICons ?eq (INil))))
-                    (= ?eq (Op (Cast ?eq_size (Bool)) (ICons ?plus1 (INil))))
-                    (= ?plus1 (Op (Add ?p1_shape ?neg_strides ?one_strides ?p1_out_strides)
-                        (ICons ?neg (ICons ?one (INil)))))
-                    (= ?one (Op (KernelConstant 1.000000 (F32)) (INil)))
-                    (= ?neg (Op (Mul ?neg_shape ?ne_strides ?negone_strides ?neg_out_strides)
-                        (ICons ?ne (ICons ?negone (INil)))))
-                    (= ?negone (Op (KernelConstant -1.000000 (F32)) (INil)))
-
-                    ; ne = Cast(F32)(x < mx) + Cast(F32)(mx < x)
-                    (= ?ne (Op (Add ?ne_shape ?lt1_strides ?lt2_strides ?ne_out_strides)
-                        (ICons ?lt1f (ICons ?lt2f (INil)))))
-                    (= ?lt1f (Op (Cast ?lt1_size (F32)) (ICons ?lt1 (INil))))
-                    (= ?lt2f (Op (Cast ?lt2_size (F32)) (ICons ?lt2 (INil))))
-                    (= ?lt1 (Op (LessThan ?lt_shape ?x_strides1 ?mx_strides1 ?lt1_out_strides)
-                        (ICons ?x (ICons ?mx (INil)))))
-                    (= ?lt2 (Op (LessThan ?lt_shape2 ?mx_strides2 ?x_strides2 ?lt2_out_strides)
-                        (ICons ?mx (ICons ?x (INil)))))
-
-                    ; mx = Max(x) over the same axis (broadcast back via strides)
-                    (= ?mx (Op (Max ?mx_shape ?cols3 ?mx_in_strides (MIter) ?mx_out_strides)
-                        (ICons ?x (INil))))
-
-                    (= ?dt (dtype ?x))
-                )
-                (
-                    (let ?am (Op (KernelArgmax ?out_shape ?cols ?dt) (ICons ?x (INil))))
-                    (union ?out ?am)
-                    (set (dtype ?am) (Int))
-                )
-                :ruleset kernel_specialize
-                :name \"kernel argmax last axis\"
-            )",
-        )]
-    };
-        __rules.into_iter().flatten().collect()
+                    eq(
+                        out,
+                        Ir::Op(
+                            MaxArgs {
+                                shape: out_shape.into(),
+                                iters: cols.into(),
+                                iter_stride: DimExpr::MIter(),
+                                ..MaxArgs::fresh()
+                            },
+                            [prod],
+                        ),
+                    ),
+                    eq(dt, x.dtype()),
+                ),
+                (am, union(out, am), set(am.dtype(), DType::Int())),
+            )
+            .label("kernel argmax last axis"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                cols: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                dtype: extract_dtype(egraph, kind_children[2]),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelArgmax {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_cols, field_dtype)) = typed::get_args(
+            kind,
+            |shape: &EList, cols: &DimExpr, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_argmax(shape, cols, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            cols: context.expression(&field_cols)?,
+            dtype: context.dtype(&field_dtype)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

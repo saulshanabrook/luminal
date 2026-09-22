@@ -1,3 +1,6 @@
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 // =========================================================================
 // Generic CUDA elementwise ops used inside FusionStart/FusionEnd regions.
 //
@@ -9,19 +12,60 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, ELIST, OP_KIND, STRING},
-        extract_dtype, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 use crate::kernel::KernelOp;
 
-pub type Ops = (CudaUnaryElementwise, CudaBinaryElementwise);
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::DType as IrDType;
+
+    #[test]
+    fn unknown_opcodes_are_rejected_before_codegen() -> Result<(), TypedError> {
+        let empty = EList::ENil();
+        let cases: [(OpKind, DecodeFn, usize); 2] = [
+            (
+                crate::typed_rules::cuda_unary_elementwise(
+                    "unknown",
+                    &empty,
+                    &empty,
+                    &empty,
+                    IrDType::F32(),
+                ),
+                CudaUnaryElementwise::decode,
+                1,
+            ),
+            (
+                crate::typed_rules::cuda_binary_elementwise(
+                    "unknown",
+                    &empty,
+                    &empty,
+                    &empty,
+                    &empty,
+                    IrDType::F32(),
+                ),
+                CudaBinaryElementwise::decode,
+                2,
+            ),
+        ];
+        for (kind, decoder, arity) in cases {
+            let mut graph = EGraph::new(EGraphOptions::default());
+            let capture = let_("kind", kind);
+            graph.register(&capture)?;
+            let frozen = graph.freeze()?;
+            let observed = frozen.lookup(&capture)?;
+            let selected = frozen.nodes(&observed)?.into_iter().next().unwrap();
+            let choices = Default::default();
+            let mut context = DecodeContext::new(&frozen, &choices);
+            let inputs = vec![Ir::Input(0, "input", IrDType::F32()); arity];
+            let error = decoder(&selected, &mut inputs.clone(), &mut context).unwrap_err();
+            assert!(matches!(error, TypedError::Decode(message) if message.contains("opcode")));
+        }
+        Ok(())
+    }
+}
 
 type CompileOut = (
     CudaFunction,
@@ -33,10 +77,6 @@ type CompileOut = (
     FxHashMap<char, CudaSlice<u8>>,
 );
 
-fn extract_string_label(egraph: &SerializedEGraph, node: &ENodeId) -> String {
-    egraph.enodes[node].0.trim_matches('"').to_string()
-}
-
 #[derive(Default, Debug, Clone)]
 pub struct CudaUnaryElementwise {
     pub(crate) op: String,
@@ -46,170 +86,314 @@ pub struct CudaUnaryElementwise {
     pub(crate) dtype: DType,
 }
 
-impl EgglogOp for CudaUnaryElementwise {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "CudaUnaryElementwise",
-            &[
-                ("op", STRING),
-                ("shape", ELIST),
-                ("strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
+pub(crate) mod cuda_unary_elementwise {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
+    #[sort]
+    pub(crate) struct CudaSigmoidScaledState;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let mut rules = Vec::new();
-        for (hlir, opcode) in [
-            ("Sin", "Sin"),
-            ("Sqrt", "Sqrt"),
-            ("Exp2", "Exp2"),
-            ("Log2", "Log2"),
-            ("Recip", "Recip"),
-        ] {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?u (Op ({hlir} ?shape ?s ?out_s) (ICons ?x (INil))))
-                    (= ?dt (dtype ?u))
-                 ) (
-                    (let ?fs (Op (FusionStart ?shape ?s ?dt) (ICons ?x (INil))))
-                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?out_s ?dt)
-                                   (ICons ?fs (INil))))
-                    (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?u ?fe)
-                    (set (dtype ?fe) ?dt)
-                 ) :ruleset kernel_lower :name \"cuda-elem-singleton-{hlir}\")"
-            )));
-        }
+    #[constructor]
+    pub(crate) fn mk_cuda_sigmoid_scaled_state(
+        a0: Ir,
+        a1: EList,
+        a2: EList,
+        a3: DType,
+    ) -> CudaSigmoidScaledState;
 
-        rules.push(raw_rules(parser, 
-            "(rule (
-                    (= ?sqrt (Op (Sqrt ?shape ?x_stride ?sqrt_stride) (ICons ?x (INil))))
-                    (= ?recip (Op (Recip ?shape ?sqrt_stride ?out_stride) (ICons ?sqrt (INil))))
-                    (= ?dt (dtype ?recip))
-                 ) (
-                    (let ?fs (Op (FusionStart ?shape ?x_stride ?dt) (ICons ?x (INil))))
-                    (let ?elem (Op (CudaUnaryElementwise \"Rsqrt\" ?shape ?x_stride ?out_stride ?dt)
-                                   (ICons ?fs (INil))))
-                    (let ?fe (Op (FusionEnd ?shape ?out_stride ?dt) (ICons ?elem (INil))))
-                    (union ?recip ?fe)
-                    (set (dtype ?fe) ?dt)
-                 ) :ruleset kernel_lower :name \"cuda-elem-rsqrt-from-sqrt-recip\")",
-        ));
+    #[function(merge = |_old: CudaSigmoidScaledState, new: CudaSigmoidScaledState| new)]
+    pub(crate) fn cuda_sigmoid_scaled(a0: Ir) -> CudaSigmoidScaledState;
 
-        rules.push(raw_rules(parser, 
-            "(rule
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        s: &EList,
+        out_s: &EList,
+        x: &Ir,
+        u: &Ir,
+        dt: &DType,
+        x_stride: &EList,
+        sqrt_stride: &EList,
+        out_stride: &EList,
+        recip: &Ir,
+    ) -> Vec<Rule> {
+        let fs = &Ir::Op(fusion_start(shape, s, dt), [x]);
+        let sin = &Ir::Op(cuda_unary_elementwise("Sin", shape, s, out_s, dt), [fs]);
+        let fused_sin = &Ir::Op(fusion_end(shape, out_s, dt), [sin]);
+        let sqrt_op = &Ir::Op(cuda_unary_elementwise("Sqrt", shape, s, out_s, dt), [fs]);
+        let fused_sqrt = &Ir::Op(fusion_end(shape, out_s, dt), [sqrt_op]);
+        let exp2 = &Ir::Op(cuda_unary_elementwise("Exp2", shape, s, out_s, dt), [fs]);
+        let fused_exp2 = &Ir::Op(fusion_end(shape, out_s, dt), [exp2]);
+        let log2 = &Ir::Op(cuda_unary_elementwise("Log2", shape, s, out_s, dt), [fs]);
+        let fused_log2 = &Ir::Op(fusion_end(shape, out_s, dt), [log2]);
+        let recip_op = &Ir::Op(cuda_unary_elementwise("Recip", shape, s, out_s, dt), [fs]);
+        let fused_recip = &Ir::Op(fusion_end(shape, out_s, dt), [recip_op]);
+        let rsqrt_start = &Ir::Op(fusion_start(shape, x_stride, dt), [x]);
+        let rsqrt = &Ir::Op(
+            cuda_unary_elementwise("Rsqrt", shape, x_stride, out_stride, dt),
+            [rsqrt_start],
+        );
+        let fused_rsqrt = &Ir::Op(fusion_end(shape, out_stride, dt), [rsqrt]);
+        let sqrt = &Ir::Op(OpKind::Sqrt(shape, x_stride, sqrt_stride), [x]);
+        vec![
+            rule(
                 (
-                    (= ?mul (Op (Mul ?shape ?x_stride ?const_stride ?inter_stride) (ICons ?x (ICons ?exp_const (INil)))))
-                    (= ?exp2 (Op (Exp2 ?shape ?inter_stride ?out_stride) (ICons ?mul (INil))))
-                    (= ?dt (dtype ?x))
-                    (= ?cv (Op (Constant ?val) (INil)))
-                    (= ?exp_const ?cv)
-                    (> ?val 1.44)
-                    (< ?val 1.45)
-                )
+                    eq(u, Ir::Op(OpKind::Sin(shape, s, out_s), [x])),
+                    eq(dt, u.dtype()),
+                ),
                 (
-                    (let ?fs (Op (FusionStart ?shape ?x_stride ?dt) (ICons ?x (INil))))
-                    (let ?elem (Op (CudaUnaryElementwise \"Exp\" ?shape ?x_stride ?out_stride ?dt)
-                                   (ICons ?fs (INil))))
-                    (let ?fe (Op (FusionEnd ?shape ?out_stride ?dt) (ICons ?elem (INil))))
-                    (union ?exp2 ?fe)
-                    (set (dtype ?fe) ?dt)
-                )
-                :ruleset direct_kernel
-                :name \"direct-exp-region\"
-            )",
-        ));
-
-        rules.push(raw_rules(parser, 
-            "(datatype*
-                (CudaSigmoidScaledState
-                    (MkCudaSigmoidScaledState IR EList EList DType)
-                )
+                    fs,
+                    sin,
+                    fused_sin,
+                    union(u, fused_sin),
+                    set(fused_sin.dtype(), dt),
+                ),
             )
-            (function cuda_sigmoid_scaled (IR) CudaSigmoidScaledState :merge new)
-
-            (rule
-            (
-                (= ?neg1 (Op (Constant ?nv) (INil)))
-                (< ?nv -0.99)
-                (> ?nv -1.01)
-                (= ?neg_x (Op (Mul ?shape ?x_stride ?neg_stride ?neg_out_stride) (ICons ?x (ICons ?neg1 (INil)))))
-                (= ?log2e (Op (Constant ?lv) (INil)))
-                (> ?lv 1.44)
-                (< ?lv 1.45)
-                (= ?scaled (Op (Mul ?shape ?neg_out_stride ?log2e_stride ?scaled_stride) (ICons ?neg_x (ICons ?log2e (INil)))))
-                (= ?dt (dtype ?x))
+            .label("cuda-elem-singleton-Sin"),
+            rule(
+                (
+                    eq(u, Ir::Op(OpKind::Sqrt(shape, s, out_s), [x])),
+                    eq(dt, u.dtype()),
+                ),
+                (
+                    fs,
+                    sqrt_op,
+                    fused_sqrt,
+                    union(u, fused_sqrt),
+                    set(fused_sqrt.dtype(), dt),
+                ),
             )
-            (
-                (set (cuda_sigmoid_scaled ?scaled)
-                    (MkCudaSigmoidScaledState ?x ?shape ?x_stride ?dt))
+            .label("cuda-elem-singleton-Sqrt"),
+            rule(
+                (
+                    eq(u, Ir::Op(OpKind::Exp2(shape, s, out_s), [x])),
+                    eq(dt, u.dtype()),
+                ),
+                (
+                    fs,
+                    exp2,
+                    fused_exp2,
+                    union(u, fused_exp2),
+                    set(fused_exp2.dtype(), dt),
+                ),
             )
-            :ruleset direct_kernel
-            :name \"direct-sigmoid-scaled-region-marker\"
+            .label("cuda-elem-singleton-Exp2"),
+            rule(
+                (
+                    eq(u, Ir::Op(OpKind::Log2(shape, s, out_s), [x])),
+                    eq(dt, u.dtype()),
+                ),
+                (
+                    fs,
+                    log2,
+                    fused_log2,
+                    union(u, fused_log2),
+                    set(fused_log2.dtype(), dt),
+                ),
             )
-
-            (rule
-            (
-                (= ?scaled_state (cuda_sigmoid_scaled ?scaled))
-                (= ?scaled_state (MkCudaSigmoidScaledState ?x ?shape ?x_stride ?dt))
-                (= ?exp2 (Op (Exp2 ?shape ?scaled_stride ?exp_stride) (ICons ?scaled (INil))))
-                (= ?one (Op (Constant ?ov) (INil)))
-                (> ?ov 0.99)
-                (< ?ov 1.01)
-                (= ?plus_one (Op (Add ?shape ?exp_stride ?one_stride ?add_stride) (ICons ?exp2 (ICons ?one (INil)))))
-                (= ?sig_out (Op (Recip ?shape ?add_stride ?out_stride) (ICons ?plus_one (INil))))
+            .label("cuda-elem-singleton-Log2"),
+            rule(
+                (
+                    eq(u, Ir::Op(OpKind::Recip(shape, s, out_s), [x])),
+                    eq(dt, u.dtype()),
+                ),
+                (
+                    fs,
+                    recip_op,
+                    fused_recip,
+                    union(u, fused_recip),
+                    set(fused_recip.dtype(), dt),
+                ),
             )
-            (
-                (let ?fs (Op (FusionStart ?shape ?x_stride ?dt) (ICons ?x (INil))))
-                (let ?elem (Op (CudaUnaryElementwise \"Sigmoid\" ?shape ?x_stride ?out_stride ?dt)
-                               (ICons ?fs (INil))))
-                (let ?fe (Op (FusionEnd ?shape ?out_stride ?dt) (ICons ?elem (INil))))
-                (union ?sig_out ?fe)
-                (set (dtype ?fe) ?dt)
+            .label("cuda-elem-singleton-Recip"),
+            rule(
+                (
+                    eq(
+                        recip,
+                        Ir::Op(OpKind::Recip(shape, sqrt_stride, out_stride), [sqrt]),
+                    ),
+                    eq(dt, recip.dtype()),
+                ),
+                (
+                    rsqrt_start,
+                    rsqrt,
+                    fused_rsqrt,
+                    union(recip, fused_rsqrt),
+                    set(fused_rsqrt.dtype(), dt),
+                ),
             )
-            :ruleset direct_kernel
-            :name \"direct-sigmoid-region\"
-            )",
-        ));
-
-        rules
-    };
-        __rules.into_iter().flatten().collect()
+            .label("cuda-elem-rsqrt-from-sqrt-recip"),
+        ]
     }
 
-    fn cleanup(&self) -> bool {
-        false
+    #[ruleset]
+    pub(crate) fn direct_kernel(
+        shape: &EList,
+        x_stride: &EList,
+        const_stride: &EList,
+        inter_stride: &EList,
+        x: &Ir,
+        exp_const: &Ir,
+        out_stride: &EList,
+        exp2: &Ir,
+        dt: &DType,
+        val: &egg::F64,
+        nv: &egg::F64,
+        neg_stride: &EList,
+        neg_out_stride: &EList,
+        lv: &egg::F64,
+        scaled_stride: &EList,
+        scaled: &Ir,
+        scaled_state: &CudaSigmoidScaledState,
+        exp_stride: &EList,
+        ov: &egg::F64,
+        one_stride: &EList,
+        add_stride: &EList,
+        sig_out: &Ir,
+    ) -> Vec<Rule> {
+        let fs = &Ir::Op(fusion_start(shape, x_stride, dt), [x]);
+        let exp = &Ir::Op(
+            cuda_unary_elementwise("Exp", shape, x_stride, out_stride, dt),
+            [fs],
+        );
+        let fused_exp = &Ir::Op(fusion_end(shape, out_stride, dt), [exp]);
+        let sigmoid = &Ir::Op(
+            cuda_unary_elementwise("Sigmoid", shape, x_stride, out_stride, dt),
+            [fs],
+        );
+        let fused_sigmoid = &Ir::Op(fusion_end(shape, out_stride, dt), [sigmoid]);
+        let mul = &Ir::Op(
+            OpKind::Mul(shape, x_stride, const_stride, inter_stride),
+            [x, exp_const],
+        );
+        let cv = &Ir::Op(OpKind::Constant(val), IList::INil());
+        let neg1 = &Ir::Op(OpKind::Constant(nv), IList::INil());
+        let log2e = &Ir::Op(OpKind::Constant(lv), IList::INil());
+        let one = &Ir::Op(OpKind::Constant(ov), IList::INil());
+        let neg_x = &Ir::Op(
+            OpKind::Mul(shape, x_stride, neg_stride, neg_out_stride),
+            [x, neg1],
+        );
+        let plus_one = &Ir::Op(
+            OpKind::Add(shape, exp_stride, one_stride, add_stride),
+            [exp2, one],
+        );
+        vec![
+            rule(
+                (
+                    eq(
+                        exp2,
+                        Ir::Op(OpKind::Exp2(shape, inter_stride, out_stride), [mul]),
+                    ),
+                    eq(dt, x.dtype()),
+                    eq(exp_const, cv),
+                    val.gt(1.44),
+                    val.lt(1.45),
+                ),
+                (
+                    fs,
+                    exp,
+                    fused_exp,
+                    union(exp2, fused_exp),
+                    set(fused_exp.dtype(), dt),
+                ),
+            )
+            .label("direct-exp-region"),
+            rule(
+                (
+                    nv.lt(-0.99),
+                    nv.gt(-1.01),
+                    lv.gt(1.44),
+                    lv.lt(1.45),
+                    eq(
+                        scaled,
+                        Ir::Op(
+                            MulArgs {
+                                shape: shape.into(),
+                                a_strides: neg_out_stride.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [neg_x, log2e],
+                        ),
+                    ),
+                    eq(dt, x.dtype()),
+                ),
+                (set(
+                    cuda_sigmoid_scaled(scaled),
+                    mk_cuda_sigmoid_scaled_state(x, shape, x_stride, dt),
+                ),),
+            )
+            .label("direct-sigmoid-scaled-region-marker"),
+            rule(
+                (
+                    eq(scaled_state, cuda_sigmoid_scaled(scaled)),
+                    eq(
+                        scaled_state,
+                        mk_cuda_sigmoid_scaled_state(x, shape, x_stride, dt),
+                    ),
+                    eq(
+                        exp2,
+                        Ir::Op(OpKind::Exp2(shape, scaled_stride, exp_stride), [scaled]),
+                    ),
+                    ov.gt(0.99),
+                    ov.lt(1.01),
+                    eq(
+                        sig_out,
+                        Ir::Op(OpKind::Recip(shape, add_stride, out_stride), [plus_one]),
+                    ),
+                ),
+                (
+                    fs,
+                    sigmoid,
+                    fused_sigmoid,
+                    union(sig_out, fused_sigmoid),
+                    set(fused_sigmoid.dtype(), dt),
+                ),
+            )
+            .label("direct-sigmoid-region"),
+        ]
     }
+}
 
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                op: extract_string_label(egraph, kind_children[0]),
-                shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
-                in_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
-            })),
-            input_enodes,
-        )
+impl CudaUnaryElementwise {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_op, field_shape, field_strides, field_out_strides, field_dtype)) =
+            typed::get_args(
+                kind,
+                |op: &egg::String,
+                 shape: &EList,
+                 strides: &EList,
+                 out_strides: &EList,
+                 dtype: &luminal::typed_reference::schema::DType| {
+                    crate::typed_rules::cuda_unary_elementwise(
+                        op,
+                        shape,
+                        strides,
+                        out_strides,
+                        dtype,
+                    )
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        let op = String::try_from(&field_op)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            op,
+            shape: decoded_shape,
+            in_strides: decoded_strides,
+            out_strides: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -261,102 +445,117 @@ pub struct CudaBinaryElementwise {
     pub(crate) dtype: DType,
 }
 
-impl EgglogOp for CudaBinaryElementwise {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "CudaBinaryElementwise",
-            &[
-                ("op", STRING),
-                ("shape", ELIST),
-                ("a_strides", ELIST),
-                ("b_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
+pub(crate) mod cuda_binary_elementwise {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_s: &EList,
+        b_s: &EList,
+        out_s: &EList,
+        a: &Ir,
+        b: &Ir,
+        bin: &Ir,
+        dt: &DType,
+    ) -> Vec<Rule> {
+        let fs_a = &Ir::Op(fusion_start(shape, a_s, dt), [a]);
+        let fs_b = &Ir::Op(fusion_start(shape, b_s, dt), [b]);
+        let add_element = &Ir::Op(
+            cuda_binary_elementwise("Add", shape, a_s, b_s, out_s, dt),
+            [fs_a, fs_b],
+        );
+        let fused_add = &Ir::Op(fusion_end(shape, out_s, dt), [add_element]);
+        let mul_element = &Ir::Op(
+            cuda_binary_elementwise("Mul", shape, a_s, b_s, out_s, dt),
+            [fs_a, fs_b],
+        );
+        let fused_mul = &Ir::Op(fusion_end(shape, out_s, dt), [mul_element]);
         vec![
-            raw_rules(parser, 
-                "(rule (
-                    (= ?bin (Op (Add ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
-                    (= ?dt (dtype ?bin))
-                 ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"Add\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?fs_a (ICons ?fs_b (INil)))))
-                    (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?bin ?fe)
-                    (set (dtype ?fe) ?dt)
-                 ) :ruleset kernel_lower :name \"cuda-elem-singleton-Add\")",
-            ),
-            raw_rules(parser, 
-                "(rule (
-                    (= ?bin (Op (Mul ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
-                    (= ?dt (dtype ?a))
-                 ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"Mul\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?fs_a (ICons ?fs_b (INil)))))
-                    (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?bin ?fe)
-                    (set (dtype ?fe) ?dt)
-                 ) :ruleset kernel_lower :name \"cuda-elem-singleton-Mul\")",
-            ),
+            rule(
+                (
+                    eq(bin, Ir::Op(OpKind::Add(shape, a_s, b_s, out_s), [a, b])),
+                    eq(dt, bin.dtype()),
+                ),
+                (
+                    fs_a,
+                    fs_b,
+                    add_element,
+                    fused_add,
+                    union(bin, fused_add),
+                    set(fused_add.dtype(), dt),
+                ),
+            )
+            .label("cuda-elem-singleton-Add"),
+            rule(
+                (
+                    eq(bin, Ir::Op(OpKind::Mul(shape, a_s, b_s, out_s), [a, b])),
+                    eq(dt, a.dtype()),
+                ),
+                (
+                    fs_a,
+                    fs_b,
+                    mul_element,
+                    fused_mul,
+                    union(bin, fused_mul),
+                    set(fused_mul.dtype(), dt),
+                ),
+            )
+            .label("cuda-elem-singleton-Mul"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let mut out_shape =
-            extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
-        let mut a_stride =
-            extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
-        let mut b_stride =
-            extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap();
-        let mut out_stride =
-            extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
-        let n = out_shape
-            .len()
-            .min(a_stride.len())
-            .min(b_stride.len())
-            .min(out_stride.len());
-        out_shape.truncate(n);
-        a_stride.truncate(n);
-        b_stride.truncate(n);
-        out_stride.truncate(n);
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                op: extract_string_label(egraph, kind_children[0]),
-                out_shape,
-                a_stride,
-                b_stride,
-                out_stride,
-                dtype: extract_dtype(egraph, kind_children[5]),
-            })),
-            input_enodes,
-        )
+impl CudaBinaryElementwise {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_op,
+            field_shape,
+            field_a_strides,
+            field_b_strides,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |op: &egg::String,
+             shape: &EList,
+             a_strides: &EList,
+             b_strides: &EList,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::cuda_binary_elementwise(
+                    op,
+                    shape,
+                    a_strides,
+                    b_strides,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        let op = String::try_from(&field_op)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            op,
+            out_shape: decoded_shape,
+            a_stride: decoded_a_strides,
+            b_stride: decoded_b_strides,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

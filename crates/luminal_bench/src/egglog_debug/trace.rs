@@ -1,8 +1,14 @@
 //! Dependency chain tracing for dtype propagation analysis.
 
 use super::{DTypeStatus, FactStatus};
+use egglog_experimental::typed::{EgglogValue, TypedError, let_};
+use luminal::{prelude::*, typed_reference::schema::Ir};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+};
 
 /// A node in the dependency graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,80 +19,105 @@ pub struct DepNode {
     pub dtype: Option<DTypeStatus>,
 }
 
-/// Dependency graph built from egglog program.
+/// Source dependencies and typed captures used only by the diagnostic tool.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DependencyGraph {
     pub nodes: HashMap<String, DepNode>,
     pub roots: Vec<String>,
+    #[serde(skip)]
+    pub(crate) captures: BTreeMap<String, Ir>,
+    #[serde(skip)]
+    pub(crate) lines: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub order: Vec<String>,
 }
 
 impl DependencyGraph {
-    /// Build dependency graph from egglog program.
-    pub fn from_program(program: &str) -> Self {
-        let mut graph = DependencyGraph::default();
-
-        for line in program.lines() {
-            let line = line.trim();
-            if !line.starts_with("(let ") {
-                continue;
+    /// Keep the original topological tN aliases without executable source text.
+    /// Per-node captures belong to this diagnostic graph, not production lowering.
+    pub fn from_hlir(cx: &Graph) -> Result<Self, TypedError> {
+        use petgraph::Direction;
+        let mut graph = Self::default();
+        let mut indegrees: HashMap<_, _> = cx
+            .graph
+            .node_indices()
+            .map(|node| {
+                (
+                    node,
+                    cx.graph
+                        .neighbors_directed(node, Direction::Incoming)
+                        .count(),
+                )
+            })
+            .collect();
+        let mut ready = BinaryHeap::new();
+        for (&node, &degree) in &indegrees {
+            if degree == 0 {
+                ready.push((Reverse(node.index()), node));
             }
-
-            // Parse: (let t1 (OpName args...))
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() < 3 || tokens[0] != "(let" {
-                continue;
-            }
-
-            let var = tokens[1].to_string();
-            let op_type = tokens[2].trim_start_matches('(').to_string();
-
-            // Extract input variables (t followed by digits)
-            let mut inputs = Vec::new();
-            let bytes = line.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] == b't' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let found_var = String::from_utf8_lossy(&bytes[start..i]).to_string();
-                    // Don't include self
-                    if found_var != var {
-                        inputs.push(found_var);
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-
+        }
+        let mut names: HashMap<NodeIndex, String> = HashMap::new();
+        while let Some((_, node)) = ready.pop() {
+            let inputs: Vec<String> = cx
+                .get_sources(node)
+                .iter()
+                .map(|source| names[source].clone())
+                .collect();
+            let values: Vec<_> = inputs.iter().map(|name| &graph.captures[name]).collect();
+            let expression = cx.graph[node].to_ir(&values);
+            let name = format!("t{}", graph.order.len());
+            let op_type = expression
+                .call_name()
+                .ok_or_else(|| {
+                    TypedError::Invalid("HLIR diagnostic lowering must produce a call".into())
+                })?
+                .to_owned();
+            graph.lines.insert(
+                name.clone(),
+                format!("let {name} = {};", expression.expression()),
+            );
+            graph
+                .captures
+                .insert(name.clone(), let_(name.clone(), expression));
             graph.nodes.insert(
-                var.clone(),
+                name.clone(),
                 DepNode {
-                    var,
+                    var: name.clone(),
                     op_type,
                     inputs,
                     dtype: None,
                 },
             );
+            graph.order.push(name.clone());
+            names.insert(node, name);
+            for target in cx.graph.neighbors_directed(node, Direction::Outgoing) {
+                let degree = indegrees.get_mut(&target).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push((Reverse(target.index()), target));
+                }
+            }
         }
-
-        // Find roots (nodes that are not inputs to any other node)
-        let all_inputs: HashSet<String> = graph
-            .nodes
-            .values()
-            .flat_map(|n| n.inputs.iter().cloned())
+        if names.len() != indegrees.len() {
+            return Err(TypedError::Invalid(
+                "diagnostic HLIR contains a cycle".into(),
+            ));
+        }
+        graph.roots = cx
+            .graph
+            .externals(Direction::Outgoing)
+            .filter_map(|node| names.remove(&node))
             .collect();
+        Ok(graph)
+    }
 
-        graph.roots = graph
-            .nodes
-            .keys()
-            .filter(|k| !all_inputs.contains(*k))
-            .cloned()
-            .collect();
-
-        graph
+    /// A display-only typed listing. It is never parsed or submitted to Egglog.
+    pub fn display_program(&self) -> String {
+        self.order
+            .iter()
+            .map(|name| self.lines[name].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Trace the dependency chain from a target variable back to inputs.

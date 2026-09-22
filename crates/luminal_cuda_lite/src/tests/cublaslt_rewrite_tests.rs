@@ -1,11 +1,7 @@
-use luminal::{
-    dtype::DType,
-    egglog_utils::{
-        ClassId, NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice,
-        validate_choice_set,
-    },
-    prelude::*,
-};
+use super::utilities::op_candidates;
+use egglog_experimental::typed::{FrozenEClass, FrozenENode};
+use luminal::egglog_utils::{SearchSpace, random_initial_choice, reconstruct, validate_choice_set};
+use luminal::{dtype::DType, prelude::*};
 use rand::{SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
@@ -529,7 +525,12 @@ fn cublaslt_cleanup_prunes_flux2_broadcast_mul_fallback() {
         "Flux2 q @ k.t() should have at least one cuBLASLt candidate"
     );
     assert!(
-        op_ir_nodes(egraph, "Mul").is_empty(),
+        op_candidates(egraph, |kind| {
+            luminal::typed_reference::schema::MulArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        })
+        .is_empty(),
         "cuBLASLt cleanup should prune the broadcast Mul fallback once a cuBLASLt candidate exists"
     );
 }
@@ -1465,11 +1466,11 @@ fn cublaslt_fp8_scaled_candidate_reaches_fused_output_scale_consumer() {
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
-        dataflow_reachable_cublaslt_scaled_count(egraph) > 0,
+        dataflow_reachable_cublaslt_count(egraph, true) > 0,
         "scaled cuBLASLt must remain reachable when fusion growth consumes the output-scale multiply internally"
     );
     assert_eq!(
-        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
+        dataflow_reachable_cublaslt_count(egraph, false),
         0,
         "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused output-scale consumer"
     );
@@ -1499,11 +1500,11 @@ fn cublaslt_fp8_scaled_candidates_reach_fused_mlp_consumer() {
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
-        dataflow_reachable_cublaslt_scaled_count(egraph) >= 2,
+        dataflow_reachable_cublaslt_count(egraph, true) >= 2,
         "scaled cuBLASLt candidates must remain reachable through fused MLP gate/up consumers"
     );
     assert_eq!(
-        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
+        dataflow_reachable_cublaslt_count(egraph, false),
         0,
         "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused MLP consumer"
     );
@@ -3353,8 +3354,12 @@ fn extract_forced_cublaslt_llir_where(
 
     let egraph = cx.egraph().expect("search space should have an e-graph");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("search space should have registered egglog ops");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let cublaslt_nodes = cublaslt_ir_nodes(egraph);
     assert!(
         !cublaslt_nodes.is_empty(),
@@ -3364,26 +3369,15 @@ fn extract_forced_cublaslt_llir_where(
     let mut last_error = None;
     for (idx, cublaslt_node) in cublaslt_nodes.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(0x00C0_B1A5 + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let cublaslt_class = &egraph.node_to_class[*cublaslt_node];
-        choices.insert(cublaslt_class, cublaslt_node);
+        let mut choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        choices.extend(*cublaslt_node);
 
-        if let Err(err) = validate_choice_set(egraph, &choices, ops) {
-            last_error = Some(err);
+        if let Err(err) = validate_choice_set(egraph, &alternatives, &choices) {
+            last_error = Some(err.to_string());
             continue;
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
 
         if !cublaslt_type_tuples(&llir).is_empty() && matches(&llir) {
             return llir;
@@ -3408,8 +3402,12 @@ fn assert_no_forced_cublaslt_llir_where(
 
     let egraph = cx.egraph().expect("search space should have an e-graph");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("search space should have registered egglog ops");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let cublaslt_nodes = cublaslt_ir_nodes(egraph);
     assert!(
         !cublaslt_nodes.is_empty(),
@@ -3418,25 +3416,14 @@ fn assert_no_forced_cublaslt_llir_where(
 
     for (idx, cublaslt_node) in cublaslt_nodes.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(0xBAD_C0DE + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let cublaslt_class = &egraph.node_to_class[*cublaslt_node];
-        choices.insert(cublaslt_class, cublaslt_node);
+        let mut choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        choices.extend(*cublaslt_node);
 
-        if validate_choice_set(egraph, &choices, ops).is_err() {
+        if validate_choice_set(egraph, &alternatives, &choices).is_err() {
             continue;
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
 
         assert!(
             !llir_has_cublaslt(&llir) || !matches(&llir),
@@ -3457,30 +3444,23 @@ fn assert_no_cublaslt_llir_where(
 
     let egraph = cx.egraph().expect("search space should have an e-graph");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("search space should have registered egglog ops");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
 
     for (idx, cublaslt_node) in cublaslt_ir_nodes(egraph).iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(0xBAD_C0DE + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let cublaslt_class = &egraph.node_to_class[*cublaslt_node];
-        choices.insert(cublaslt_class, cublaslt_node);
+        let mut choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        choices.extend(*cublaslt_node);
 
-        if validate_choice_set(egraph, &choices, ops).is_err() {
+        if validate_choice_set(egraph, &alternatives, &choices).is_err() {
             continue;
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
 
         assert!(
             !llir_has_cublaslt(&llir) || !matches(&llir),
@@ -3493,113 +3473,37 @@ fn assert_no_cublaslt_llir_where(
     }
 }
 
-fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
-    op_ir_nodes(egraph, "cublaslt")
-        .into_iter()
-        .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
-        .collect()
+fn cublaslt_ir_nodes(egraph: &SearchSpace) -> Vec<[(FrozenEClass<'_>, FrozenENode<'_>); 2]> {
+    op_candidates(egraph, |kind| {
+        crate::typed_rules::CuBlasLtArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    })
+    .into_iter()
+    .chain(op_candidates(egraph, |kind| {
+        crate::typed_rules::CuBlasLtScaledArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    }))
+    .collect()
 }
 
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == kind_label)
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
-        })
-        .collect()
-}
-
-fn dataflow_reachable_cublaslt_scaled_count(egraph: &SerializedEGraph) -> usize {
-    dataflow_reachable_cublaslt_count(egraph, true)
-}
-
-fn dataflow_reachable_cublaslt_raw_fp8_count(egraph: &SerializedEGraph) -> usize {
-    dataflow_reachable_cublaslt_count(egraph, false)
-}
-
-fn dataflow_reachable_cublaslt_count(egraph: &SerializedEGraph, scaled: bool) -> usize {
-    let reachable = dataflow_reachable_ir_classes(egraph);
-    egraph
-        .enodes
-        .iter()
-        .filter(|(node, (label, children))| {
-            label == "Op"
-                && reachable.contains(&egraph.node_to_class[*node])
-                && children.first().is_some_and(|kind_class| {
-                    egraph
-                        .eclasses
-                        .get(kind_class)
-                        .is_some_and(|(_, kind_nodes)| {
-                            kind_nodes.iter().any(|kind_node| {
-                                egraph.enodes.get(kind_node).is_some_and(|(kind_label, _)| {
-                                    if scaled {
-                                        kind_label == "cublaslt_scaled"
-                                    } else {
-                                        kind_label == "cublaslt"
-                                    }
-                                })
-                            })
-                        })
-                })
-        })
-        .count()
-}
-
-fn dataflow_reachable_ir_classes(egraph: &SerializedEGraph) -> FxHashSet<ClassId> {
-    let mut reachable = FxHashSet::default();
-    let mut stack = egraph.roots.clone();
-    while let Some(class) = stack.pop() {
-        if !reachable.insert(class.clone()) {
-            continue;
+fn dataflow_reachable_cublaslt_count(egraph: &SearchSpace, scaled: bool) -> usize {
+    op_candidates(egraph, |kind| {
+        if scaled {
+            crate::typed_rules::CuBlasLtScaledArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        } else {
+            crate::typed_rules::CuBlasLtArgs::get_args(kind)
+                .unwrap()
+                .is_some()
         }
-        let Some((sort, nodes)) = egraph.eclasses.get(&class) else {
-            continue;
-        };
-        for node in nodes {
-            let Some((label, children)) = egraph.enodes.get(node) else {
-                continue;
-            };
-            match (sort.as_str(), label.as_str()) {
-                ("IR", "Output") => {
-                    if let Some(child) = children.first() {
-                        stack.push(child.clone());
-                    }
-                }
-                ("IR", "OutputJoin") => stack.extend(children.iter().cloned()),
-                ("IR", "Op") => {
-                    if let Some(inputs) = children.get(1) {
-                        stack.push(inputs.clone());
-                    }
-                }
-                ("IR", _) => {
-                    for child in children {
-                        if egraph
-                            .eclasses
-                            .get(child)
-                            .is_some_and(|(child_sort, _)| child_sort == "IR")
-                        {
-                            stack.push(child.clone());
-                        }
-                    }
-                }
-                ("IList", "ICons") => stack.extend(children.iter().cloned()),
-                _ => {}
-            }
-        }
-    }
-    reachable
+    })
+    .into_iter()
+    .map(|candidate| candidate[0])
+    .collect::<FxHashSet<_>>()
+    .len()
 }
 
 fn llir_has_cublaslt(llir: &LLIRGraph) -> bool {

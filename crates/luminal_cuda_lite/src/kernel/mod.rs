@@ -35,25 +35,6 @@ pub use matmul2d::{
 pub use rms_norm::{RMSNormCustom, RMSNormKernel, fused_rms_norm};
 pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 
-pub type Ops = (
-    hlir::Ops,
-    argmax::KernelArgmax,
-    gemv::KernelGemv,
-    gemv::KernelGemvF8,
-    moe_gemv::KernelMoEGemv,
-    rms_norm::KernelRMSNorm,
-    rms_norm::KernelRMSNormQuant,
-    rope::KernelRoPE,
-    swiglu::KernelSwiglu,
-    swiglu::KernelSwigluQuant,
-    topk::KernelStableSortIdx,
-    quant_f8::KernelQuantF8,
-    other_ops::Ops,
-    conv2d::KernelConv2D,
-    GenericMatmul,
-    fusion::Ops,
-);
-
 /// Build a mapping from interned string IDs to their string values for a given sequence.
 fn build_interned_strings(trace: &schema::Trace) -> std::collections::HashMap<(u32, u64), String> {
     use luminal_tracing::schema::trace_packet;
@@ -318,8 +299,6 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
         None
     }
 }
-
-luminal::impl_into_ops!(KernelOp);
 
 // Kernel to host op compilation
 mod to_host;

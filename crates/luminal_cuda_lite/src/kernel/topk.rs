@@ -12,6 +12,9 @@
 //! unions into the sorted-indices eclass emitted by
 //! `stable_argsort(descending)` / `topk_indexes`.
 
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -19,15 +22,7 @@ use crate::{
     kernel::{KernelOp, hlir::generate_dyn_dims_defines},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{ELIST, OP_KIND},
-        extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 #[derive(Default, Debug, Clone)]
 pub struct KernelStableSortIdx {
@@ -35,159 +30,217 @@ pub struct KernelStableSortIdx {
     out_shape: Vec<Expression>,
 }
 
-impl EgglogOp for KernelStableSortIdx {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "KernelStableSortIdx", &[("out_shape", ELIST)])
-    }
+pub(crate) mod kernel_stable_sort_idx {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
+    // Stable descending rank = sum(primary + equal_value * earlier_index).
+    // Three stages (pre -> late -> late) walk strongly anchored chains. One
+    // monolithic ~25-atom join multiplies loosely paired binary atoms by the
+    // number of layer instances; later stages instead use relation-bound values.
+    #[relation]
+    pub(crate) fn stable_ranks_part(a0: Ir, a1: Ir, a2: Ir, a3: Ir, a4: Ir, a5: EList);
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Mirrors the exact emission of stable_argsort(axis=1, descending):
-        //   a_val = x·1.0 viewed (rows, E_j, E_i→0)   strides (z·E, z, 0)
-        //   b_val = x·1.0 viewed (rows, 0, E_i)       strides (z·E, 0, z)
-        //   primary = b_val < a_val                   (descending: a > b)
-        //   not_lt  = (a_val < b_val)·(−1) + 1
-        //   not_gt  = (b_val < a_val)·(−1) + 1
-        //   val_eq  = not_lt · not_gt
-        //   idx_cmp = iota_i < iota_j (broadcast casts)
-        //   cmp     = cast(primary) + val_eq·cast(idx_cmp)
-        //   ranks   = Cast(Int)(Sum_axis1(cmp))
-        //
-        // Three relation-staged rules (pre → late → late): one monolithic
-        // ~25-atom join explodes combinatorially on rolled bodies with
-        // several distinct layer instances (every loosely-paired binary atom
-        // multiplies the join by the instance count). Each stage walks a
-        // chain from a strongly-pinned anchor; later stages key every atom
-        // off relation-bound variables.
-        vec![raw_rules(parser, 
-            "(relation stable_ranks_part (IR IR IR IR IR EList))
-            (relation stable_ranks (IR IR EList))
-            (rule
+    #[relation]
+    pub(crate) fn stable_ranks(a0: Ir, a1: Ir, a2: EList);
+
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late_pre(
+        av_row: &DimExpr,
+        x: &Ir,
+        one_a: &Ir,
+        a_val: &Ir,
+        bv_row: &DimExpr,
+        x2: &Ir,
+        one_b: &Ir,
+        b_val: &Ir,
+        p_shape: &EList,
+        p_a: &EList,
+        p_b: &EList,
+        p_o: &EList,
+        pf_size: &DimExpr,
+        eqidx: &Ir,
+        out_shape: &EList,
+        r_size: &DimExpr,
+        ranks: &Ir,
+    ) -> Vec<Rule> {
+        let source = &Ir::Op(OpKind::Constant(1.0), IList::INil());
+        let prim = &Ir::Op(OpKind::LessThan(p_shape, p_a, p_b, p_o), [b_val, a_val]);
+        let prim_f = &Ir::Op(OpKind::Cast(pf_size, DType::F32()), [prim]);
+        let cmp = &Ir::Op(AddArgs::fresh(), [prim_f, eqidx]);
+        let sum = &Ir::Op(
+            SumArgs {
+                shape: out_shape.into(),
+                ..SumArgs::fresh()
+            },
+            [cmp],
+        );
+        vec![
+            rule(
                 (
-                    ; ranks = Cast(Int)(Sum(cast(primary) + tiebreak))
-                    (= ?a_val (Op (Mul ?av_shape
-                        (ECons ?av_row (ECons (MIter) (ECons (MNum 0) (ENil))))
-                        ?av_b ?av_o)
-                        (ICons ?x (ICons ?one_a (INil)))))
-                    (= ?one_a (Op (Constant 1.000000) (INil)))
-                    (= ?b_val (Op (Mul ?bv_shape
-                        (ECons ?bv_row (ECons (MNum 0) (ECons (MIter) (ENil))))
-                        ?bv_b ?bv_o)
-                        (ICons ?x2 (ICons ?one_b (INil)))))
-                    (= ?x ?x2)
-                    (= ?one_b (Op (Constant 1.000000) (INil)))
-                    (= ?prim (Op (LessThan ?p_shape ?p_a ?p_b ?p_o)
-                        (ICons ?b_val (ICons ?a_val (INil)))))
-                    (= ?prim_f (Op (Cast ?pf_size (F32)) (ICons ?prim (INil))))
-                    (= ?cmp (Op (Add ?c_shape ?c_a ?c_b ?c_o)
-                        (ICons ?prim_f (ICons ?eqidx (INil)))))
-                    (= ?sum (Op (Sum ?out_shape ?e_dim ?sum_in ?sum_k ?sum_out)
-                        (ICons ?cmp (INil))))
-                    (= ?ranks (Op (Cast ?r_size (Int)) (ICons ?sum (INil))))
-                    (= (F32) (dtype ?x))
-                )
-                (
-                    (stable_ranks_part ?ranks ?eqidx ?a_val ?b_val ?x ?out_shape)
-                )
-                :ruleset kernel_fuse_late_pre
-                :name \"stable ranks part\"
+                    eq(
+                        a_val,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: ([av_row, &(DimExpr::MIter()), &(DimExpr::MNum(0))])
+                                    .into(),
+                                ..MulArgs::fresh()
+                            },
+                            [x, one_a],
+                        ),
+                    ),
+                    eq(one_a, source),
+                    eq(
+                        b_val,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: ([bv_row, &(DimExpr::MNum(0)), &(DimExpr::MIter())])
+                                    .into(),
+                                ..MulArgs::fresh()
+                            },
+                            [x2, one_b],
+                        ),
+                    ),
+                    eq(x, x2),
+                    eq(one_b, source),
+                    eq(ranks, Ir::Op(OpKind::Cast(r_size, DType::Int()), [sum])),
+                    eq(DType::F32(), x.dtype()),
+                ),
+                (stable_ranks_part(ranks, eqidx, a_val, b_val, x, out_shape),),
             )
-            (rule
-                (
-                    (stable_ranks_part ?ranks ?eqidx ?a_val ?b_val ?x ?out_shape)
+            .label("stable ranks part"),
+        ]
+    }
 
-                    ; tie-break: val_eq · (iota_i < iota_j)
-                    (= ?eqidx (Op (Mul ?ei_shape ?ei_a ?ei_b ?ei_o)
-                        (ICons ?val_eq (ICons ?idx_f (INil)))))
-                    (= ?idx_f (Op (Cast ?if_size (F32)) (ICons ?idx_cmp (INil))))
-                    (= ?idx_cmp (Op (LessThan ?ic_shape
-                        (ECons (MNum 0) (ECons (MIter) (ECons (MNum 0) (ENil))))
-                        (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil))))
-                        ?ic_o)
-                        (ICons ?iota_a (ICons ?iota_b (INil)))))
-
-                    (= ?val_eq (Op (Mul ?ve_shape ?ve_a ?ve_b ?ve_o)
-                        (ICons ?not_lt (ICons ?not_gt (INil)))))
-                    (= ?not_lt (Op (Add ?nl_shape ?nl_a ?nl_b ?nl_o)
-                        (ICons ?nl_neg (ICons ?nl_one (INil)))))
-                    (= ?nl_neg (Op (Mul ?nln_shape ?nln_a ?nln_b ?nln_o)
-                        (ICons ?lt_f (ICons ?nl_negone (INil)))))
-                    (= ?lt_f (Op (Cast ?ltf_size (F32)) (ICons ?lt (INil))))
-                    (= ?lt (Op (LessThan ?lt_shape ?lt_a ?lt_b ?lt_o)
-                        (ICons ?a_val2 (ICons ?b_val2 (INil)))))
-                    (= ?a_val ?a_val2)
-                    (= ?b_val ?b_val2)
-                    (= ?not_gt (Op (Add ?ng_shape ?ng_a ?ng_b ?ng_o)
-                        (ICons ?ng_neg (ICons ?ng_one (INil)))))
-                    (= ?ng_neg (Op (Mul ?ngn_shape ?ngn_a ?ngn_b ?ngn_o)
-                        (ICons ?gt_f (ICons ?ng_negone (INil)))))
-                    (= ?gt_f (Op (Cast ?gtf_size (F32)) (ICons ?gt (INil))))
-                    (= ?gt (Op (LessThan ?gt_shape ?gt_a ?gt_b ?gt_o)
-                        (ICons ?b_val3 (ICons ?a_val3 (INil)))))
-                    (= ?a_val ?a_val3)
-                    (= ?b_val ?b_val3)
-                )
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        ranks: &Ir,
+        a_val: &Ir,
+        b_val: &Ir,
+        x: &Ir,
+        out_shape: &EList,
+        if_size: &DimExpr,
+        ic_shape: &EList,
+        ic_o: &EList,
+        iota_a: &Ir,
+        iota_b: &Ir,
+        nl_one: &Ir,
+        nl_negone: &Ir,
+        ltf_size: &DimExpr,
+        lt_shape: &EList,
+        lt_a: &EList,
+        lt_b: &EList,
+        lt_o: &EList,
+        a_val2: &Ir,
+        b_val2: &Ir,
+        ng_one: &Ir,
+        ng_negone: &Ir,
+        gtf_size: &DimExpr,
+        gt_shape: &EList,
+        gt_a: &EList,
+        gt_b: &EList,
+        gt_o: &EList,
+        b_val3: &Ir,
+        a_val3: &Ir,
+        os_range: &DimExpr,
+        e2: &DimExpr,
+        b_range: &DimExpr,
+        sorted: &Ir,
+        z_range: &DimExpr,
+        v_range: &DimExpr,
+        rows: &DimExpr,
+        e: &DimExpr,
+    ) -> Vec<Rule> {
+        let sorted_indices = &Ir::Op(kernel_stable_sort_idx(out_shape), [x]);
+        let idx_cmp = &Ir::Op(
+            OpKind::LessThan(
+                ic_shape,
+                [
+                    &(DimExpr::MNum(0)),
+                    &(DimExpr::MIter()),
+                    &(DimExpr::MNum(0)),
+                ],
+                [
+                    &(DimExpr::MNum(0)),
+                    &(DimExpr::MNum(0)),
+                    &(DimExpr::MIter()),
+                ],
+                ic_o,
+            ),
+            [iota_a, iota_b],
+        );
+        let lt = &Ir::Op(
+            OpKind::LessThan(lt_shape, lt_a, lt_b, lt_o),
+            [a_val2, b_val2],
+        );
+        let gt = &Ir::Op(
+            OpKind::LessThan(gt_shape, gt_a, gt_b, gt_o),
+            [b_val3, a_val3],
+        );
+        let one_s = &Ir::Op(OpKind::Iota(1, os_range), IList::INil());
+        let base = &Ir::Op(OpKind::Iota(DimExpr::MIter() * e2, b_range), IList::INil());
+        let zeros = &Ir::Op(OpKind::Iota(0, z_range), IList::INil());
+        let vals = &Ir::Op(OpKind::Iota(DimExpr::MIter(), v_range), IList::INil());
+        let idx_f = &Ir::Op(OpKind::Cast(if_size, DType::F32()), [idx_cmp]);
+        let lt_f = &Ir::Op(OpKind::Cast(ltf_size, DType::F32()), [lt]);
+        let gt_f = &Ir::Op(OpKind::Cast(gtf_size, DType::F32()), [gt]);
+        let rsc = &Ir::Op(MulArgs::fresh(), [ranks, one_s]);
+        let nl_neg = &Ir::Op(MulArgs::fresh(), [lt_f, nl_negone]);
+        let ng_neg = &Ir::Op(MulArgs::fresh(), [gt_f, ng_negone]);
+        let adj = &Ir::Op(AddArgs::fresh(), [base, rsc]);
+        let not_lt = &Ir::Op(AddArgs::fresh(), [nl_neg, nl_one]);
+        let not_gt = &Ir::Op(AddArgs::fresh(), [ng_neg, ng_one]);
+        let val_eq = &Ir::Op(MulArgs::fresh(), [not_lt, not_gt]);
+        let eqidx = &Ir::Op(MulArgs::fresh(), [val_eq, idx_f]);
+        vec![
+            rule(
                 (
-                    (stable_ranks ?ranks ?x ?out_shape)
-                )
-                :ruleset kernel_fuse_late
-                :name \"stable ranks tiebreak\"
+                    Fact::from(stable_ranks_part(ranks, eqidx, a_val, b_val, x, out_shape)),
+                    eq(a_val, a_val2),
+                    eq(b_val, b_val2),
+                    eq(a_val, a_val3),
+                    eq(b_val, b_val3),
+                ),
+                (stable_ranks(ranks, x, out_shape),),
             )
-            (rule
+            .label("stable ranks tiebreak"),
+            rule(
                 (
-                    (stable_ranks ?ranks ?x ?out_shape)
-
-                    ; rank → sorted-index scatter tail
-                    (= ?rsc (Op (Mul ?rs_shape ?rs_a ?rs_b ?rs_o)
-                        (ICons ?ranks (ICons ?one_s (INil)))))
-                    (= ?one_s (Op (Iota (MNum 1) ?os_range) (INil)))
-                    (= ?adj (Op (Add ?aj_shape ?aj_a ?aj_b ?aj_o)
-                        (ICons ?base (ICons ?rsc (INil)))))
-                    (= ?base (Op (Iota (MMul (MIter) ?e2) ?b_range) (INil)))
-                    (= ?sorted (Op (Scatter ?sc_ds ?sc_dst ?sc_is ?sc_istr ?sc_ss)
-                        (ICons ?zeros (ICons ?adj (ICons ?vals (INil))))))
-                    (= ?zeros (Op (Iota (MNum 0) ?z_range) (INil)))
-                    (= ?vals (Op (Iota (MIter) ?v_range) (INil)))
-
-                    (= ?out_shape (ECons ?rows (ECons ?e (ENil))))
-                    (= ?e ?e2)
-                )
+                    Fact::from(stable_ranks(ranks, x, out_shape)),
+                    eq(sorted, Ir::Op(ScatterArgs::fresh(), [zeros, adj, vals])),
+                    eq(out_shape, [rows, e]),
+                    eq(e, e2),
+                ),
                 (
-                    (let ?kr (Op (KernelStableSortIdx ?out_shape) (ICons ?x (INil))))
-                    (union ?sorted ?kr)
-                    (set (dtype ?kr) (Int))
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel stable ranks descending\"
-            )",
-        )]
-    };
-        __rules.into_iter().flatten().collect()
+                    sorted_indices,
+                    union(sorted, sorted_indices),
+                    set(sorted_indices.dtype(), DType::Int()),
+                ),
+            )
+            .label("kernel stable ranks descending"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelStableSortIdx {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape,)) = typed::get_args(kind, |out_shape: &EList| {
+            crate::typed_rules::kernel_stable_sort_idx(out_shape)
+        })?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

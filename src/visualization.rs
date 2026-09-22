@@ -1,5 +1,6 @@
 use anyhow::Result;
-use egglog::EGraph;
+use egglog_experimental::typed::{FrozenScalar, FrozenValue, FrozenValueView};
+use egglog_experimental::{EGraph, SerializeConfig};
 use std::fmt::{Debug, Display};
 use std::string::String;
 
@@ -27,21 +28,35 @@ const EGRAPH_VIS_TEMPLATE: &str = r#"
     mounted.render([JSON.stringify(egraph)]);
 </script>"#;
 
+/// A display label, not a value codec or an executable expression.
+pub fn display_frozen_value(value: FrozenValue<'_>) -> String {
+    match value.view() {
+        FrozenValueView::Scalar(value) => match value {
+            FrozenScalar::Unit => "()".into(),
+            FrozenScalar::Bool(value) => value.to_string(),
+            FrozenScalar::I64(value) => value.to_string(),
+            FrozenScalar::F64(bits) => format!("{:?}", f64::from_bits(*bits)),
+            FrozenScalar::String(value) => format!("{value:?}"),
+            FrozenScalar::BigInt(value) => value.to_string(),
+            FrozenScalar::BigRat(value) => value.to_string(),
+            FrozenScalar::Rational(value) => value.to_string(),
+        },
+        _ => value.sort().name().to_owned(),
+    }
+}
+
 impl ToHtml for EGraph {
     fn to_html(&self) -> Result<String> {
-        let egraph_as_json = serde_json::to_string_pretty(
-            &self.serialize(egglog::SerializeConfig::default()).egraph,
-        )?;
+        let egraph_as_json =
+            serde_json::to_string_pretty(&self.serialize(SerializeConfig::default()).egraph)?
+                .replace('<', "\\u003c");
         Ok(EGRAPH_VIS_TEMPLATE.replace("{{JSON_TEMPLATE}}", &egraph_as_json))
     }
 }
 
 impl ToDot for EGraph {
     fn to_dot(&self) -> Result<String> {
-        Ok(self
-            .serialize(egglog::SerializeConfig::default())
-            .egraph
-            .to_dot())
+        Ok(self.serialize(SerializeConfig::default()).egraph.to_dot())
     }
 }
 
@@ -143,4 +158,99 @@ fn graph_to_dot<E>(
 
     dot.push_str("}\n");
     dot
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::typed_reference::schema::DimExpr;
+    use egglog_experimental::typed::{EGraph as TypedEGraph, builtins as egg, prelude::*};
+
+    #[sort]
+    struct DisplayFixture;
+
+    #[declarations]
+    impl DisplayFixture {
+        fn values(items: egg::Vec<DimExpr>) -> Self;
+        #[constructor(cost = 0)]
+        fn free(value: DisplayFixture) -> Self;
+        #[constructor(cost = 37)]
+        fn expensive(value: DisplayFixture) -> Self;
+    }
+
+    #[test]
+    fn rendering_preserves_declared_costs_and_subsumption_across_cycles() {
+        let mut egraph = TypedEGraph::new(EGraphOptions::default());
+        let base = DisplayFixture::values([DimExpr::from(9)]);
+        let free = DisplayFixture::free(&base);
+        let expensive = DisplayFixture::expensive(&base);
+        egraph
+            .register((
+                union(&base, &free),
+                union(&base, &expensive),
+                subsume(&free),
+            ))
+            .unwrap();
+        let egraph = egraph.into_raw();
+        let data = egraph.serialize(SerializeConfig::default()).egraph;
+        let nodes = &data.nodes;
+        for (expression, cost) in [(&base, 1.0), (&free, 0.0), (&expensive, 37.0)] {
+            let name = expression.call_name().unwrap();
+            let node = nodes.values().find(|node| node.op == name).unwrap();
+            assert_eq!(node.cost.into_inner(), cost);
+            assert_eq!(node.subsumed, expression == &free);
+            assert_eq!(
+                data.class_data[&node.eclass].typ.as_deref(),
+                Some(DisplayFixture::sort_ref().name())
+            );
+            if expression != &base {
+                let child = &node.children[0];
+                assert_eq!(nodes[child].eclass, node.eclass);
+            }
+        }
+        for node in nodes.values() {
+            if node.op != free.call_name().unwrap() && node.op != expensive.call_name().unwrap() {
+                assert_eq!(node.cost.into_inner(), 1.0);
+            }
+        }
+        let html = egraph.to_html().unwrap();
+        assert!(html.contains("\"cost\": 0.0"));
+        assert!(html.contains("\"cost\": 37.0"));
+        assert!(
+            egraph
+                .to_dot()
+                .unwrap()
+                .contains(expensive.call_name().unwrap())
+        );
+    }
+
+    #[test]
+    fn rendering_preserves_cycles_literals_containers_and_escaping() {
+        let mut egraph = TypedEGraph::new(EGraphOptions::default());
+        let x = DimExpr::MVar("</script>\"\\\n");
+        let sum = x.clone() + 1;
+        egraph
+            .register((union(&x, &sum), DisplayFixture::values([x.clone(), x])))
+            .unwrap();
+        let egraph = egraph.into_raw();
+        let data = egraph.serialize(SerializeConfig::default()).egraph;
+        let nodes = &data.nodes;
+        assert!(nodes.values().any(|node| node.op == "MAdd"));
+        assert!(nodes.values().any(|node| node.op == "1"));
+        assert!(nodes.values().any(|node| {
+            node.children.len() == 2
+                && nodes[&node.children[0]].eclass == nodes[&node.children[1]].eclass
+        }));
+        for node in nodes.values() {
+            for child in &node.children {
+                assert!(nodes.contains_key(child));
+            }
+        }
+        let html = egraph.to_html().unwrap();
+        assert_eq!(html.matches("</script>").count(), 1);
+        assert!(html.contains("\\u003c/script>"));
+        let dot = egraph.to_dot().unwrap();
+        assert!(dot.contains("MVar"));
+        assert!(dot.contains("MAdd"));
+    }
 }

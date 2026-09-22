@@ -13,9 +13,6 @@ use std::{
     sync::{Mutex, OnceLock, RwLock},
 };
 
-use crate::egglog_utils::{self, SerializedEGraph, extract_expr};
-use egglog::var;
-
 type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
 
 pub static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
@@ -261,22 +258,6 @@ impl Term {
             _ => None,
         }
     }
-    pub fn to_egglog(self) -> String {
-        match self {
-            Term::Add => "MAdd",
-            Term::Sub => "MSub",
-            Term::Mul => "MMul",
-            Term::Div => "MDiv",
-            Term::Mod => "MMod",
-            Term::Max => "MMax",
-            Term::Min => "MMin",
-            Term::CeilDiv => "MCeilDiv",
-            Term::Gte => "MGte",
-            Term::Lt => "MLt",
-            _ => panic!("egglog doesn't implement {self:?}"),
-        }
-        .to_string()
-    }
 }
 
 impl<T> PartialEq<T> for Expression
@@ -333,34 +314,6 @@ impl std::fmt::Display for Expression {
 }
 
 impl Expression {
-    pub fn to_egglog(&self) -> String {
-        let mut symbols = vec![];
-        for term in self.terms.read().iter() {
-            let new_symbol = match term {
-                Term::Num(n) => format!("(MNum {n})"),
-                Term::Var(c) => format!("(MVar \"{c}\")"),
-                Term::Max => format!(
-                    "(MMax {} {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
-                ),
-                Term::Min => format!(
-                    "(MMin {} {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
-                ),
-                _ => format!(
-                    "({} {} {})",
-                    term.to_egglog(),
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
-                ),
-            };
-            symbols.push(new_symbol);
-        }
-        symbols.pop().unwrap_or_default()
-    }
-
     pub fn to_kernel(&self) -> String {
         let mut symbols = vec![];
         for term in self.terms.read().iter() {
@@ -677,41 +630,8 @@ impl Expression {
     /// Run proper equality check inside egglog
     #[tracing::instrument(skip_all)]
     pub fn egglog_equal(self, rhs: impl Into<Expression>) -> bool {
-        let lhs_expr = self.to_egglog();
-        let rhs_expr = rhs.into().to_egglog();
-        let mut program = String::new();
-        program.push_str(&egglog_utils::base::base_expression_egglog());
-        program.push('\n');
-        program.push_str(&egglog_utils::base::base_cleanup_egglog());
-        program.push('\n');
-        program.push_str(&format!("(let expr_lhs {lhs_expr})\n"));
-        program.push_str(&format!("(let expr_rhs {rhs_expr})\n"));
-        program.push_str(
-            "(run-schedule
-                (saturate expr)
-                (saturate base_cleanup)
-                (saturate cleanup)
-            )",
-        );
-        program.push('\n');
-        program.push_str("(check (= expr_lhs expr_rhs))\n");
-
-        let mut egraph = egglog_utils::new_egraph();
-        let commands = egraph
-            .parser
-            .get_program_from_string(None, &program)
-            .expect("failed to parse egglog program");
-        let span = tracing::span!(tracing::Level::INFO, "to_egglog");
-        let _entered = span.enter();
-        match egraph.run_program(commands) {
-            Ok(_) => true,
-            Err(err) => {
-                if matches!(err, egglog::Error::CheckError(_, _)) {
-                    return false;
-                }
-                panic!("failed to run egglog program: {err}");
-            }
-        }
+        crate::typed_reference::dimensions_equal(self, rhs.into())
+            .expect("typed dimension equality failed")
     }
 }
 
@@ -1192,34 +1112,8 @@ fn egglog_simplify(e: Expression) -> Expression {
     if let Some(out) = cache.lock().unwrap().get(&e).copied() {
         return out;
     }
-    let expr = e.to_egglog();
-    let mut program = String::new();
-    program.push_str(&egglog_utils::base::base_expression_egglog());
-    program.push('\n');
-    program.push_str(&egglog_utils::base::base_cleanup_egglog());
-    program.push('\n');
-    program.push_str(&format!("(let expr_root {expr})\n"));
-    program.push_str(
-        "(run-schedule
-            (repeat 5 expr)
-            (saturate base_cleanup)
-            (saturate cleanup)
-        )",
-    );
-    let mut egraph = egglog_utils::new_egraph();
-    let commands = egraph
-        .parser
-        .get_program_from_string(None, &program)
-        .unwrap();
-    egraph.run_program(commands).unwrap();
-    let (sort, value) = egraph.eval_expr(&var!("expr_root")).unwrap();
-    let serialized = SerializedEGraph::new(&egraph, vec![(sort, value)]);
-    let simplified = serialized.eclasses[serialized.roots.first().unwrap()]
-        .1
-        .iter()
-        .map(|root| extract_expr(&serialized, root, &mut FxHashMap::default()).unwrap_or(e))
-        .min_by_key(|e| e.len())
-        .unwrap();
+    let simplified = crate::typed_reference::simplify_dimension(e, None)
+        .expect("typed dimension simplification failed");
     cache.lock().unwrap().push(e, simplified);
     simplified
 }
@@ -1240,38 +1134,8 @@ fn egglog_simplify_with_intervals(e: Expression, intervals: &DynDimIntervals) ->
         return out;
     }
 
-    let expr = e.to_egglog();
-    let interval_facts =
-        egglog_utils::base::interval_facts_egglog(intervals, e.dyn_vars().into_iter());
-    let mut program = String::new();
-    program.push_str(&egglog_utils::base::base_expression_egglog_with_intervals());
-    program.push('\n');
-    program.push_str(&egglog_utils::base::base_cleanup_egglog());
-    program.push('\n');
-    program.push_str(&interval_facts);
-    program.push('\n');
-    program.push_str(&format!("(let expr_root {expr})\n"));
-    program.push_str(
-        "(run-schedule
-            (repeat 5 (seq expr interval_expr))
-            (saturate base_cleanup)
-            (saturate cleanup)
-        )",
-    );
-    let mut egraph = egglog_utils::new_egraph();
-    let commands = egraph
-        .parser
-        .get_program_from_string(None, &program)
-        .unwrap();
-    egraph.run_program(commands).unwrap();
-    let (sort, value) = egraph.eval_expr(&var!("expr_root")).unwrap();
-    let serialized = SerializedEGraph::new(&egraph, vec![(sort, value)]);
-    let simplified = serialized.eclasses[serialized.roots.first().unwrap()]
-        .1
-        .iter()
-        .map(|root| extract_expr(&serialized, root, &mut FxHashMap::default()).unwrap_or(e))
-        .min_by_key(|e| e.len())
-        .unwrap();
+    let simplified = crate::typed_reference::simplify_dimension(e, Some(intervals))
+        .expect("typed dimension simplification failed");
     cache.lock().unwrap().push(key, simplified);
     simplified
 }
@@ -1365,7 +1229,9 @@ mod tests {
         let intervals = [('s', DimInterval::new(1, 1))].into_iter().collect();
 
         assert_eq!((s + 127).simplify_with_intervals(&intervals), expr(128));
-        assert_eq!((s.lt(2)).simplify_with_intervals(&intervals), expr(1));
+        let simplified = (s.lt(2)).simplify_with_intervals(&intervals);
+        assert_eq!(simplified.len(), 1);
+        assert_eq!(simplified.exec(&[('s', 1)].into_iter().collect()), Some(1));
     }
 
     #[test]

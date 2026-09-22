@@ -11,7 +11,7 @@ luminal = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
-egraph-serialize = { version = "0.3.0", default-features = false }
+egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental", rev = "ab9915c1cbf0bbcf013c9548d9ba413f831e7001", default-features = false, features = ["typed"] }
 
 # Backend dependencies - optional, enabled via features
 luminal_metal = { path = "../luminal_metal", optional = true }

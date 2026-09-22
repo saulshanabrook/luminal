@@ -434,12 +434,12 @@ mod tests {
         assert_close(rt.get_f32(output.id), &expected);
     }
 
-    /// Dump the egglog HLIR for a QwenMoE-style GLU-MoE pattern.
+    /// Inspect the typed HLIR for a QwenMoE-style GLU-MoE pattern.
     /// This helps identify the exact pattern for the GLUMoE backend HostOp.
     #[test]
     fn dump_glu_moe_egglog() {
         use luminal::dtype::DType;
-        use luminal::egglog_utils::hlir_to_egglog;
+        use luminal::typed_reference::capture_graph;
 
         let n_experts = 4;
         let hidden = 8;
@@ -498,11 +498,11 @@ mod tests {
         weights_exp.shape.expand(down_out.dims());
         let _output = (down_out * weights_exp).sum(n - 1).output();
 
-        // Dump the HLIR to egglog
-        let (program, root) = hlir_to_egglog(&cx);
-        println!("=== GLU-MoE HLIR Egglog Dump ===");
-        println!("Root: {root}");
-        println!("{program}");
+        // Diagnostic rendering of the actual shared expressions; never input.
+        let outputs = capture_graph(&cx).expect("lower the GLU-MoE output forest");
+        assert_eq!(outputs.len(), 1);
+        println!("=== GLU-MoE typed HLIR roots ===");
+        println!("{outputs:#?}");
     }
 
     /// Helper: gather expert weight matrices using topk indices.

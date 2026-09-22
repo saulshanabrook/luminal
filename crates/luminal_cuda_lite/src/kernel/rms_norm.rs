@@ -11,7 +11,9 @@
 //! Layout: x `(rows, cols)` contiguous in `dtype` with dynamic `rows`;
 //! w `(cols,)` F32. One block per row; F32 warp + block reduction.
 
-use luminal::prelude::{Command, Parser, raw_rules};
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -446,163 +448,162 @@ pub struct KernelRMSNorm {
     eps: f64,
 }
 
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{ELIST, F64, OP_KIND},
-        extract_expr_list,
-    },
-    op::EgglogOp,
-    prelude::{ENodeId, SerializedEGraph},
-};
+pub(crate) mod kernel_r_m_s_norm {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-impl EgglogOp for KernelRMSNorm {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelRMSNorm",
-            &[("out_shape", ELIST), ("eps", F64)],
-        )
-    }
+    // Stage the Sqrt/Recip/epsilon core before the weight-mul tail. The latter
+    // then joins with rin/xf bound, avoiding a monolithic cross-product of
+    // distinct layer instances in rolled bodies.
+    #[relation]
+    pub(crate) fn rms_rinv(a0: Ir, a1: Ir, a2: Ir, a3: egg::F64, a4: DimExpr);
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Two relation-staged parts (pre → late): the rinv core (anchored by
-        // the rare Sqrt→Recip pair and the eps Constant) emits a fact; the
-        // weight-mul tail joins with ?rin/?xf bound, so each variant's pins
-        // are cheap. A monolithic join explodes on rolled bodies with
-        // several distinct layer instances.
-        let core = "(relation rms_rinv (IR IR IR f64 Expression))
-            (rule
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late_pre(
+        xf_size: &DimExpr,
+        xb: &Ir,
+        xf: &Ir,
+        xf2: &Ir,
+        cols: &DimExpr,
+        nc_size: &DimExpr,
+        cols3: &DimExpr,
+        nc_range: &DimExpr,
+        eps: &egg::F64,
+        sq2_shape: &EList,
+        sq2_in: &EList,
+        sq2_out: &EList,
+        rin: &Ir,
+    ) -> Vec<Rule> {
+        let sq = &Ir::Op(MulArgs::fresh(), [xf, xf2]);
+        let ncst = &Ir::Op(OpKind::Iota(cols3, nc_range), IList::INil());
+        let epsc = &Ir::Op(OpKind::Constant(eps), IList::INil());
+        let sum = &Ir::Op(
+            SumArgs {
+                iters: cols.into(),
+                iter_stride: DimExpr::MIter(),
+                ..SumArgs::fresh()
+            },
+            [sq],
+        );
+        let ncast = &Ir::Op(OpKind::Cast(nc_size, DType::F32()), [ncst]);
+        let rcpn = &Ir::Op(RecipArgs::fresh(), [ncast]);
+        let mean = &Ir::Op(MulArgs::fresh(), [sum, rcpn]);
+        let pe = &Ir::Op(AddArgs::fresh(), [mean, epsc]);
+        let sqr = &Ir::Op(OpKind::Sqrt(sq2_shape, sq2_in, sq2_out), [pe]);
+        vec![
+            rule(
                 (
-                    ; bf16 → f32 sandwich entry
-                    (= ?xf (Op (Cast ?xf_size (F32)) (ICons ?xb (INil))))
-                    (= (Bf16) (dtype ?xb))
+                    eq(xf, Ir::Op(OpKind::Cast(xf_size, DType::F32()), [xb])),
+                    eq(DType::Bf16(), xb.dtype()),
+                    eq(xf, xf2),
+                    eq(cols, cols3),
+                    eq(rin, Ir::Op(RecipArgs::fresh(), [sqr])),
+                ),
+                (rms_rinv(rin, xf, xb, eps, cols),),
+            )
+            .label("rms rinv core"),
+        ]
+    }
 
-                    ; sum of squares over the last axis
-                    (= ?sq (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
-                        (ICons ?xf (ICons ?xf2 (INil)))))
-                    (= ?xf ?xf2)
-                    (= ?sum (Op (Sum ?sum_shape ?cols ?sum_in (MIter) ?sum_out)
-                        (ICons ?sq (INil))))
-
-                    ; mean: × recip(cols) — the divisor iota must carry the
-                    ; reduce dim itself
-                    (= ?mean (Op (Mul ?mn_shape ?mn_a ?mn_b ?mn_o)
-                        (ICons ?sum (ICons ?rcpn (INil)))))
-                    (= ?rcpn (Op (Recip ?rn_shape ?rn_in ?rn_out) (ICons ?ncast (INil))))
-                    (= ?ncast (Op (Cast ?nc_size (F32)) (ICons ?ncst (INil))))
-                    (= ?ncst (Op (Iota ?cols3 ?nc_range) (INil)))
-                    (= ?cols ?cols3)
-
-                    ; + eps → sqrt → recip
-                    (= ?pe (Op (Add ?pe_shape ?pe_a ?pe_b ?pe_o)
-                        (ICons ?mean (ICons ?epsc (INil)))))
-                    (= ?epsc (Op (Constant ?eps) (INil)))
-                    (= ?sqr (Op (Sqrt ?sq2_shape ?sq2_in ?sq2_out) (ICons ?pe (INil))))
-                    (= ?rin (Op (Recip ?ri_shape ?ri_in ?ri_out) (ICons ?sqr (INil))))
-                )
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        rin: &Ir,
+        xf: &Ir,
+        xb: &Ir,
+        eps: &egg::F64,
+        cols: &DimExpr,
+        xf3: &Ir,
+        wg_shape: &EList,
+        wg_b: &EList,
+        w: &Ir,
+        o_size: &DimExpr,
+        out: &Ir,
+        rows: &DimExpr,
+        cols2: &DimExpr,
+        d0: &DimExpr,
+        d1: &DimExpr,
+    ) -> Vec<Rule> {
+        let krms = &Ir::Op(kernel_rms_norm(wg_shape, eps), [xb, w]);
+        let nrm = &Ir::Op(MulArgs::fresh(), [rin, xf3]);
+        let wgt = &Ir::Op(
+            MulArgs {
+                shape: wg_shape.into(),
+                b_strides: wg_b.into(),
+                ..MulArgs::fresh()
+            },
+            [nrm, w],
+        );
+        vec![
+            rule(
                 (
-                    (rms_rinv ?rin ?xf ?xb ?eps ?cols)
-                )
-                :ruleset kernel_fuse_late_pre
-                :name \"rms rinv core\"
-            )"
-        .to_string();
-
-        // (variant name, out-shape destructure + w stride pins)
-        let variants: [(&str, &str); 2] = [
-            (
-                "2d",
-                "(= ?wg_shape (ECons ?rows (ECons ?cols2 (ENil))))
-                        (= ?cols ?cols2)
-                        ; w broadcast over rows, contiguous within
-                        (= ?wg_b (ECons (MNum 0) (ECons (MIter) (ENil))))",
-            ),
-            (
-                "3d",
-                "(= ?wg_shape (ECons ?d0 (ECons ?d1 (ECons ?cols2 (ENil)))))
-                        (= ?cols ?cols2)
-                        (= ?wg_b (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil)))))",
-            ),
-        ];
-        let tails = variants
-            .into_iter()
-            .map(|(variant, shape_pins)| {
-                format!(
-                    "(rule
-                    (
-                        (rms_rinv ?rin ?xf ?xb ?eps ?cols)
-
-                        ; × x → × w → bf16
-                        (= ?nrm (Op (Mul ?nr_shape ?nr_a ?nr_b ?nr_o)
-                            (ICons ?rin (ICons ?xf3 (INil)))))
-                        (= ?xf ?xf3)
-                        (= ?wgt (Op (Mul ?wg_shape ?wg_a ?wg_b ?wg_o)
-                            (ICons ?nrm (ICons ?w (INil)))))
-                        (= (F32) (dtype ?w))
-                        (= ?out (Op (Cast ?o_size (Bf16)) (ICons ?wgt (INil))))
-
-                        {shape_pins}
-                    )
-                    (
-                        (let ?krms (Op (KernelRMSNorm ?wg_shape ?eps)
-                            (ICons ?xb (ICons ?w (INil)))))
-                        (union ?out ?krms)
-                        (set (dtype ?krms) (Bf16))
-                    )
-                    :ruleset kernel_fuse_late
-                    :name \"kernel rms norm bf16 {variant}\"
-                )"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        vec![raw_rules(parser, format!("{core}\n{tails}"))]
-    };
-        __rules.into_iter().flatten().collect()
+                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    eq(xf, xf3),
+                    eq(DType::F32(), w.dtype()),
+                    eq(out, Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [wgt])),
+                    eq(wg_shape, [rows, cols2]),
+                    eq(cols, cols2),
+                    eq(wg_b, [&(DimExpr::MNum(0)), &(DimExpr::MIter())]),
+                ),
+                (krms, union(out, krms), set(krms.dtype(), DType::Bf16())),
+            )
+            .label("kernel rms norm bf16 2d"),
+            rule(
+                (
+                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    eq(xf, xf3),
+                    eq(DType::F32(), w.dtype()),
+                    eq(out, Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [wgt])),
+                    eq(wg_shape, [d0, d1, cols2]),
+                    eq(cols, cols2),
+                    eq(
+                        wg_b,
+                        [
+                            &(DimExpr::MNum(0)),
+                            &(DimExpr::MNum(0)),
+                            &(DimExpr::MIter()),
+                        ],
+                    ),
+                ),
+                (krms, union(out, krms), set(krms.dtype(), DType::Bf16())),
+            )
+            .label("kernel rms norm bf16 3d"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let eps: f64 = egraph.enodes[kind_children[1]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
+impl KernelRMSNorm {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape, field_eps)) =
+            typed::get_args(kind, |out_shape: &EList, eps: &egg::F64| {
+                crate::typed_rules::kernel_rms_norm(out_shape, eps)
+            })?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let out_shape = decoded_out_shape;
+        let eps: f64 = f64::try_from(&field_eps)?;
         let cols = out_shape
             .last()
             .and_then(|c| c.to_usize())
-            .expect("RMSNorm cols must be static");
+            .ok_or_else(|| TypedError::Decode("RMSNorm cols must be static".into()))?;
         let rows = out_shape[..out_shape.len() - 1]
             .iter()
             .copied()
             .product::<Expression>();
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(RMSNormKernel {
-                rows,
-                cols,
-                eps: eps as f32,
-                dtype: DType::Bf16,
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(RMSNormKernel {
+            rows,
+            cols,
+            eps: eps as f32,
+            dtype: DType::Bf16,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 
@@ -619,88 +620,90 @@ pub struct KernelRMSNormQuant {
     eps: f64,
 }
 
-impl EgglogOp for KernelRMSNormQuant {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelRMSNormQuant",
-            &[("out_shape", ELIST), ("eps", F64)],
-        )
-    }
+pub(crate) mod kernel_r_m_s_norm_quant {
+    use super::kernel_r_m_s_norm::rms_rinv;
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        3
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![raw_rules(parser, 
-            "(rule
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        rin: &Ir,
+        xf: &Ir,
+        xb: &Ir,
+        eps: &egg::F64,
+        cols: &DimExpr,
+        xf3: &Ir,
+        wg_shape: &EList,
+        wg_b: &EList,
+        w: &Ir,
+        o_size: &DimExpr,
+        rows: &DimExpr,
+        cols2: &DimExpr,
+        qf_size: &DimExpr,
+        scale: &Ir,
+        q_size: &DimExpr,
+        q: &Ir,
+    ) -> Vec<Rule> {
+        let krq = &Ir::Op(kernel_rms_norm_quant(wg_shape, eps), [xb, w, scale]);
+        let nrm = &Ir::Op(MulArgs::fresh(), [rin, xf3]);
+        let qrecip = &Ir::Op(RecipArgs::fresh(), [scale]);
+        let wgt = &Ir::Op(
+            MulArgs {
+                shape: wg_shape.into(),
+                b_strides: wg_b.into(),
+                ..MulArgs::fresh()
+            },
+            [nrm, w],
+        );
+        let out = &Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [wgt]);
+        let qf = &Ir::Op(OpKind::Cast(qf_size, DType::F32()), [out]);
+        let qmul = &Ir::Op(MulArgs::fresh(), [qf, qrecip]);
+        vec![
+            rule(
                 (
-                    (rms_rinv ?rin ?xf ?xb ?eps ?cols)
-
-                    ; × x → × w → bf16 (the 2D norm tail)
-                    (= ?nrm (Op (Mul ?nr_shape ?nr_a ?nr_b ?nr_o)
-                        (ICons ?rin (ICons ?xf3 (INil)))))
-                    (= ?xf ?xf3)
-                    (= ?wgt (Op (Mul ?wg_shape ?wg_a ?wg_b ?wg_o)
-                        (ICons ?nrm (ICons ?w (INil)))))
-                    (= (F32) (dtype ?w))
-                    (= ?out (Op (Cast ?o_size (Bf16)) (ICons ?wgt (INil))))
-                    (= ?wg_shape (ECons ?rows (ECons ?cols2 (ENil))))
-                    (= ?cols ?cols2)
-                    (= ?wg_b (ECons (MNum 0) (ECons (MIter) (ENil))))
-
-                    ; quant tail: cast_f8(out_f32 · recip(scale))
-                    (= ?qf (Op (Cast ?qf_size (F32)) (ICons ?out (INil))))
-                    (= ?qrecip (Op (Recip ?qr_sh ?qr_in ?qr_out)
-                        (ICons ?scale (INil))))
-                    (= ?qmul (Op (Mul ?qm_sh ?qm_a ?qm_b ?qm_o)
-                        (ICons ?qf (ICons ?qrecip (INil)))))
-                    (= ?q (Op (Cast ?q_size (F8E4M3)) (ICons ?qmul (INil))))
-                )
-                (
-                    (let ?krq (Op (KernelRMSNormQuant ?wg_shape ?eps)
-                        (ICons ?xb (ICons ?w (ICons ?scale (INil))))))
-                    (union ?q ?krq)
-                    (set (dtype ?krq) (F8E4M3))
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel rms norm quant f8\"
-            )",
-        )]
-    };
-        __rules.into_iter().flatten().collect()
+                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    eq(xf, xf3),
+                    eq(DType::F32(), w.dtype()),
+                    eq(wg_shape, [rows, cols2]),
+                    eq(cols, cols2),
+                    eq(wg_b, [&(DimExpr::MNum(0)), &(DimExpr::MIter())]),
+                    eq(q, Ir::Op(OpKind::Cast(q_size, DType::F8E4M3()), [qmul])),
+                ),
+                (krq, union(q, krq), set(krq.dtype(), DType::F8E4M3())),
+            )
+            .label("kernel rms norm quant f8"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let eps: f64 = egraph.enodes[kind_children[1]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
+impl KernelRMSNormQuant {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape, field_eps)) =
+            typed::get_args(kind, |out_shape: &EList, eps: &egg::F64| {
+                crate::typed_rules::kernel_rms_norm_quant(out_shape, eps)
+            })?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let out_shape = decoded_out_shape;
+        let eps: f64 = f64::try_from(&field_eps)?;
         let kern = RMSNormQuantKernel {
             rows: out_shape[0],
-            cols: out_shape[1].to_usize().expect("rms cols must be static"),
+            cols: out_shape[1]
+                .to_usize()
+                .ok_or_else(|| TypedError::Decode("rms cols must be static".into()))?,
             eps: eps as f32,
             dtype: DType::Bf16,
         };
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(kern) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+        Ok(Some(LLIROp::new::<dyn KernelOp>(
+            Box::new(kern) as Box<dyn KernelOp>
+        )))
     }
 }

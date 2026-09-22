@@ -10,29 +10,23 @@
 //!
 //! GPU-dependent tests short-circuit when no CUDA device is available.
 
+use egglog_experimental::typed::builtins as egg;
 use std::sync::{Arc, Mutex};
 
+use super::utilities::op_candidates;
 use cudarc::driver::{CudaStream, DevicePtr};
-use luminal::egglog_utils::{
-    hlir_to_egglog, run_egglog, run_egglog_with_late_passes_and_interval_analysis,
+use egglog_experimental::typed::{
+    EGraph, EgglogValue, FrozenEGraph, FrozenValueView, TypedError, get_args, let_, ruleset, set,
+    union,
 };
-use luminal::op::{EgglogOp, IntoEgglogOp};
+use luminal::egglog_utils::{DecodeContext, RewritePhase};
 use luminal::prelude::*;
+use luminal::typed_reference::schema::{DType as IrDType, DimExpr, EList, IList, Ir, OpKind};
 
 use crate::host::flashinfer::FlashInferAttention;
 use crate::host::{DeviceBuffer, HostOp};
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::get_cuda_stream;
-
-/// Look up an op in `CudaRuntime::Ops::into_vec()` by its egglog sort name.
-fn ops_contains_sort(name: &str) -> bool {
-    let ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    ops.iter().any(|op| {
-        // `SortDef` is opaque; its Debug repr starts with the sort name.
-        let sort_dbg = format!("{:?}", op.sort());
-        sort_dbg.contains(name)
-    })
-}
 
 // ─── Test-wide model dimensions ───────────────────────────────────────────
 //
@@ -334,46 +328,846 @@ fn assert_close(a: &[f32], b: &[f32], rtol: f32, atol: f32) {
 // ─── Layer 1: egglog metadata sanity (no GPU) ────────────────────────────
 
 #[test]
-fn flashinfer_op_registers_via_into_egglog() {
-    // Confirm the op is reachable through the Runtime::Ops tuple. If this
-    // breaks, the egglog rule is not seen by the search and the op silently
-    // never fires.
-    assert!(
-        ops_contains_sort("FlashInferAttention"),
-        "FlashInferAttention is not in CudaRuntime::Ops"
+fn flashinfer_compact_indices_follow_real_gather_rows_through_fusion() {
+    use crate::host::flashinfer::flashinfer_attention as fi;
+    use crate::kernel::fusion::{elementwise::cuda_binary_elementwise, markers::fusion_end};
+    use crate::kernel::hlir::kernel_iota;
+
+    let mut graph = Graph::new();
+    let data = graph.named_tensor("data", (16, KV_DIM));
+    let indices = graph.named_tensor("indices", 'c').as_dtype(DType::Int);
+    let gathered = luminal_nn::gather_rows(data, indices, KV_DIM);
+    let flat_id = graph.get_sources(gathered.id)[0];
+    let flat = GraphTensor::from_id(flat_id, gathered.shape, &mut graph, DType::Int);
+    flat.output();
+    // A consumer with the same layout lets the actual fusion-grow rules absorb
+    // the lowered flat-index producer into an elementwise region.
+    (flat * 1).output();
+    gathered.output();
+    let roots = luminal::typed_reference::capture_graph(&graph).unwrap();
+    let compact = let_(
+        "compact",
+        Ir::Input(indices.id.index() as i64, "indices", IrDType::Int()),
     );
+    let phases = luminal::egglog_utils::base_phase_rules();
+    let mut live = EGraph::default();
+    live.register(&roots).unwrap();
+    live.register(&compact).unwrap();
+    live.run(fi::matmul_backend.saturate()).unwrap();
+
+    for stage in 0..3 {
+        if stage == 1 {
+            live.run(
+                ruleset((
+                    &phases[&RewritePhase::Expr],
+                    &phases[&RewritePhase::DtypeProp],
+                    &cuda_binary_elementwise::kernel_lower,
+                    &kernel_iota::kernel_lower,
+                ))
+                .saturate(),
+            )
+            .unwrap();
+        } else if stage == 2 {
+            let report = live
+                .run(ruleset((&fusion_end::fusion_grow, &fusion_end::fusion_merge)).saturate())
+                .unwrap();
+            assert!(
+                report.updated,
+                "the fixture must exercise actual fusion rules"
+            );
+        }
+        let frozen = live.freeze().unwrap();
+        let flat = frozen
+            .table(|input: &Ir, index: &egg::I64| Ir::Output(input, index))
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| i64::try_from(&row.args.1).unwrap() == flat_id.index() as i64)
+            .unwrap()
+            .args
+            .0;
+        let choices = Default::default();
+        let context = DecodeContext::new(&frozen, &choices);
+        let expected = frozen
+            .nodes(&frozen.lookup(&compact).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        for node in context.producers(&flat).unwrap() {
+            let selected = frozen.typed_node::<Ir>(node).unwrap();
+            assert_eq!(
+                crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx(
+                    &context, &selected
+                )
+                .unwrap(),
+                Some(expected.clone()),
+                "stage {stage}"
+            );
+        }
+        if stage > 0 {
+            assert!(
+                frozen.nodes(&flat).unwrap().any(|node| {
+                    let Some((kind, _)) =
+                        get_args(&node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+                            .unwrap()
+                    else {
+                        return false;
+                    };
+                    frozen.nodes(&kind).unwrap().any(|kind| {
+                        get_args(&kind, |shape: &EList, strides: &EList, dtype: &IrDType| {
+                            crate::typed_rules::fusion_end(shape, strides, dtype)
+                        })
+                        .unwrap()
+                        .is_some()
+                    })
+                }),
+                "lowering must create a FusionEnd alternative for the same flat class"
+            );
+        }
+    }
+}
+
+#[test]
+fn flashinfer_compact_indices_preserve_legacy_structural_coverage() {
+    for case in [
+        "valid",
+        "width",
+        "offset",
+        "range",
+        "scalar range",
+        "dtype",
+        "input stride",
+        "broadcast",
+        "output stride",
+        "zero width",
+        "reversed mul",
+        "reversed add",
+    ] {
+        let rows = DimExpr::from('c');
+        let width = DimExpr::from(if case == "zero width" { 0 } else { 128 });
+        let iter = DimExpr::MIter();
+        let compact = let_(
+            "compact",
+            Ir::Input(
+                0,
+                "indices",
+                if case == "dtype" {
+                    IrDType::F32()
+                } else {
+                    IrDType::Int()
+                },
+            ),
+        );
+        let scale = Ir::Op(
+            OpKind::Iota(
+                if case == "width" {
+                    127.into()
+                } else {
+                    width.clone()
+                },
+                if case == "scalar range" { 2 } else { 1 },
+            ),
+            IList::INil(),
+        );
+        let scaled = Ir::Op(
+            OpKind::Mul(
+                [&rows],
+                [if case == "input stride" {
+                    &iter * 2
+                } else {
+                    iter.clone()
+                }],
+                [0],
+                [&iter],
+            ),
+            if case == "reversed mul" {
+                [&scale, &compact]
+            } else {
+                [&compact, &scale]
+            },
+        );
+        let columns = Ir::Op(
+            OpKind::Iota(
+                if case == "offset" {
+                    &iter + 1
+                } else {
+                    iter.clone()
+                },
+                if case == "range" {
+                    127.into()
+                } else {
+                    width.clone()
+                },
+            ),
+            IList::INil(),
+        );
+        let flat = let_(
+            "flat",
+            Ir::Op(
+                OpKind::Add(
+                    [&rows, &width],
+                    [
+                        iter.clone(),
+                        if case == "broadcast" {
+                            iter.clone()
+                        } else {
+                            0.into()
+                        },
+                    ],
+                    [DimExpr::from(0), iter.clone()],
+                    [
+                        if case == "output stride" {
+                            iter.clone()
+                        } else {
+                            &iter * &width
+                        },
+                        iter.clone(),
+                    ],
+                ),
+                if case == "reversed add" {
+                    [&columns, &scaled]
+                } else {
+                    [&scaled, &columns]
+                },
+            ),
+        );
+        let mut live = EGraph::default();
+        live.register((&flat, &compact)).unwrap();
+        let frozen = live.freeze().unwrap();
+        let choices = Default::default();
+        let context = DecodeContext::new(&frozen, &choices);
+        let flat = frozen
+            .nodes(&frozen.lookup(&flat).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        let compact = frozen
+            .nodes(&frozen.lookup(&compact).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx(&context, &flat)
+                .unwrap(),
+            Some(compact),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn flashinfer_compact_indices_match_lowered_only_and_fused_only_graphs() {
+    use crate::typed_rules::{cuda_binary_elementwise, fusion_end, fusion_start};
+
+    for (fused, reversed_mul) in [(false, false), (false, true), (true, false), (true, true)] {
+        let shape = EList::from([DimExpr::from('c')]);
+        let strides = EList::from([DimExpr::MIter()]);
+        let compact = let_("compact", Ir::Input(0, "indices", IrDType::Int()));
+        let other = let_("other", Ir::Input(1, "other", IrDType::Int()));
+        let mut inner = compact.clone();
+        // Build only the old walker's lowered forms. There are no HLIR Add/Mul
+        // alternatives or previously derived compact-index facts to mask gaps.
+        for opcode in ["Mul", "Add"] {
+            let input = if fused {
+                Ir::Op(fusion_start(&shape, &strides, IrDType::Int()), [&inner])
+            } else {
+                inner
+            };
+            let binary = Ir::Op(
+                cuda_binary_elementwise(
+                    opcode,
+                    &shape,
+                    &strides,
+                    &strides,
+                    &strides,
+                    IrDType::Int(),
+                ),
+                if opcode == "Mul" && reversed_mul {
+                    [other.clone(), input]
+                } else {
+                    [input, other.clone()]
+                },
+            );
+            inner = if fused {
+                Ir::Op(fusion_end(&shape, &strides, IrDType::Int()), [binary])
+            } else {
+                binary
+            };
+        }
+        let inner = let_("inner", inner);
+        let mut live = EGraph::default();
+        live.register(&inner).unwrap();
+        let frozen = live.freeze().unwrap();
+        let choices = Default::default();
+        let context = DecodeContext::new(&frozen, &choices);
+        let selected = frozen
+            .nodes(&frozen.lookup(&inner).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        let expected = if reversed_mul { other } else { compact };
+        let expected = frozen
+            .nodes(&frozen.lookup(&expected).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx(&context, &selected)
+                .unwrap(),
+            Some(expected),
+            "fused={fused}, reversed_mul={reversed_mul}"
+        );
+    }
+}
+
+// These standalone recovery fixtures have no cleanup or subsumption, so the
+// active producer view is also their admissible view.
+#[test]
+fn flashinfer_compact_recovery_preserves_hlir_priority_and_missing_witness() {
+    use crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx;
+    use crate::typed_rules::cuda_binary_elementwise;
+
+    for hlir_recovers in [false, true] {
+        let a = let_("a", Ir::Input(0, "hlir", IrDType::Int()));
+        let b = let_("b", Ir::Input(1, "lowered", IrDType::Int()));
+        let scalar = Ir::Op(OpKind::Iota(128, 1), IList::INil());
+        let hlir_mul = Ir::Op(OpKind::Mul([1], [1], [0], [1]), [&a, &scalar]);
+        let hlir = Ir::Op(
+            OpKind::Add([1], [1], [1], [1]),
+            [if hlir_recovers { &hlir_mul } else { &scalar }, &scalar],
+        );
+        let lower_mul = Ir::Op(
+            cuda_binary_elementwise("Mul", [1], [1], [0], [1], IrDType::Int()),
+            [&b, &scalar],
+        );
+        let lower_inputs = let_("lower_inputs", IList::from([&lower_mul, &scalar]));
+        let lowered = Ir::Op(
+            cuda_binary_elementwise("Add", [1], [1], [1], [1], IrDType::Int()),
+            &lower_inputs,
+        );
+        let root = let_("root", &lowered);
+        let mut live = EGraph::default();
+        live.register((&root, &a, union(&root, &hlir))).unwrap();
+        let frozen = live.freeze().unwrap();
+        let choices = Default::default();
+        let context = DecodeContext::new(&frozen, &choices);
+        let lower_inputs = frozen.lookup(&lower_inputs).unwrap();
+        let selected = frozen
+            .nodes(&frozen.lookup(&root).unwrap())
+            .unwrap()
+            .find(|node| {
+                get_args(node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+                    .unwrap()
+                    .is_some_and(|(_, inputs)| inputs == lower_inputs)
+            })
+            .unwrap();
+        let recovered = try_find_compact_gather_idx(&context, &selected).unwrap();
+        if hlir_recovers {
+            let expected = frozen
+                .nodes(&frozen.lookup(&a).unwrap())
+                .unwrap()
+                .next()
+                .unwrap();
+            assert_eq!(recovered, Some(expected));
+        } else {
+            assert_eq!(
+                recovered, None,
+                "do not fall back after choosing an HLIR list"
+            );
+        }
+        let direct = frozen
+            .nodes(&frozen.lookup(&a).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            try_find_compact_gather_idx(&context, &direct).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn flashinfer_compact_recovery_inspects_only_the_supplied_lowered_producer() {
+    use crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx;
+    use crate::typed_rules::cuda_binary_elementwise;
+
+    let a = let_("a", Ir::Input(0, "a", IrDType::Int()));
+    let b = let_("b", Ir::Input(1, "b", IrDType::Int()));
+    let scalar = Ir::Op(OpKind::Iota(128, 1), IList::INil());
+    let lower_mul = cuda_binary_elementwise("Mul", [1], [1], [0], [1], IrDType::Int());
+    let lower_add = cuda_binary_elementwise("Add", [1], [1], [1], [1], IrDType::Int());
+    let a_inputs = let_(
+        "a_inputs",
+        IList::from([Ir::Op(&lower_mul, [&a, &scalar]), scalar.clone()]),
+    );
+    let b_inputs = let_(
+        "b_inputs",
+        IList::from([Ir::Op(&lower_mul, [&b, &scalar]), scalar]),
+    );
+    let root = let_("root", Ir::Op(&lower_add, &a_inputs));
+    let mut live = EGraph::default();
+    live.register((&root, union(&root, Ir::Op(&lower_add, &b_inputs))))
+        .unwrap();
+    let frozen = live.freeze().unwrap();
+    let choices = Default::default();
+    let context = DecodeContext::new(&frozen, &choices);
+    let a_inputs = frozen.lookup(&a_inputs).unwrap();
+    for selected in frozen.nodes(&frozen.lookup(&root).unwrap()).unwrap() {
+        let (_, inputs) = get_args(&selected, |kind: &OpKind, inputs: &IList| {
+            Ir::Op(kind, inputs)
+        })
+        .unwrap()
+        .unwrap();
+        let expected = if inputs == a_inputs { &a } else { &b };
+        let expected = frozen
+            .nodes(&frozen.lookup(expected).unwrap())
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            try_find_compact_gather_idx(&context, &selected).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+// These rule fixtures deliberately install the real FlashInfer groups without
+// the runtime's device-capability gate; they neither decode nor JIT an operation.
+fn flashinfer_fixture_snapshot(graph: &Graph, s_interval: (i64, i64)) -> FrozenEGraph {
+    use crate::host::flashinfer::flashinfer_attention as fi;
+
+    let outputs = luminal::typed_reference::capture_graph(graph).unwrap();
+    // The native debug join executor recurses through these large attention
+    // queries and exceeds Rust's default 2 MiB test stack, including with the
+    // pre-compact-index rules. Keep that resource boundary local to this fixture.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let mut phases = luminal::egglog_utils::base_phase_rules();
+            phases.insert(RewritePhase::MatmulBackend, fi::matmul_backend.clone());
+            phases.insert(
+                RewritePhase::KernelLower,
+                crate::kernel::hlir::kernel_constant::kernel_lower.clone(),
+            );
+            phases.insert(
+                RewritePhase::KernelFuseLatePre,
+                fi::kernel_fuse_late_pre.clone(),
+            );
+            phases.insert(RewritePhase::KernelFuseLate2, fi::kernel_fuse_late2.clone());
+            let mut live = EGraph::default();
+            let s = DimExpr::from('s');
+            live.register((set(s.lower(), s_interval.0), set(s.upper(), s_interval.1)))
+                .unwrap();
+            if s_interval.0 == s_interval.1 {
+                live.register(union(s, s_interval.0)).unwrap();
+            }
+            live.register(fi::initial_actions()).unwrap();
+            live.register(outputs).unwrap();
+            live.run(luminal::egglog_utils::main_schedule(&phases, true))
+                .unwrap();
+            for (phase, schedule) in luminal::egglog_utils::final_phases(&phases, true) {
+                if !matches!(
+                    phase,
+                    RewritePhase::Cleanup | RewritePhase::PostCleanup | RewritePhase::BaseCleanup
+                ) {
+                    live.run(schedule).unwrap();
+                }
+            }
+            live.freeze().unwrap()
+        })
+        .expect("spawn attention fixture")
+        .join()
+        .expect("attention fixture failed")
+}
+
+// Check every emitted FlashInfer IR node's proof dependencies and recoverable
+// compact-input identity. This does not invoke the JIT-backed decoder.
+fn assert_flashinfer_compact_dependencies(frozen: &FrozenEGraph, compact_id: usize) -> usize {
+    let kinds = frozen
+        .table(
+            |qh: &DimExpr,
+             kh: &DimExpr,
+             hd: &DimExpr,
+             page: &DimExpr,
+             batch: &DimExpr,
+             dtype: &IrDType,
+             scale: &egg::F64,
+             window: &egg::F64| {
+                crate::typed_rules::flash_infer_attention(
+                    qh, kh, hd, page, batch, dtype, scale, window,
+                )
+            },
+        )
+        .unwrap();
+    let mut found = 0;
+    for row in frozen
+        .table(|kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+        .unwrap()
+        .rows
+    {
+        if !kinds.rows.iter().any(|kind| kind.output == row.args.0) {
+            continue;
+        }
+        let mut current = row.args.1;
+        let mut inputs = Vec::new();
+        loop {
+            let nodes: Vec<_> = frozen.nodes(&current).unwrap().collect();
+            assert_eq!(nodes.len(), 1, "proof dependency lists must be unambiguous");
+            if get_args(&nodes[0], IList::INil).unwrap().is_some() {
+                break;
+            }
+            let (head, tail) = get_args(&nodes[0], |head: &Ir, tail: &IList| {
+                IList::ICons(head, tail)
+            })
+            .unwrap()
+            .unwrap();
+            inputs.push(head);
+            current = tail;
+            assert!(inputs.len() <= 5, "unexpected additional proof dependency");
+        }
+        assert_eq!(inputs.len(), 5);
+        let choices = Default::default();
+        let context = DecodeContext::new(frozen, &choices);
+        let flat = frozen
+            .typed_node::<Ir>(context.producers(&inputs[3]).unwrap().next().unwrap())
+            .unwrap();
+        let compact =
+            crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx(&context, &flat)
+                .unwrap()
+                .expect("fixture has a recoverable compact index");
+        assert!({
+            get_args(
+                &compact,
+                |id: &egg::I64, label: &egg::String, dtype: &IrDType| Ir::Input(id, label, dtype),
+            )
+            .unwrap()
+            .is_some_and(|(id, _, dtype)| {
+                i64::try_from(id).unwrap() == compact_id as i64
+                    && frozen
+                        .nodes(&dtype)
+                        .unwrap()
+                        .any(|dtype| get_args(&dtype, IrDType::Int).unwrap().is_some())
+            })
+        });
+        assert!(inputs[..3].iter().all(|input| input != &inputs[3]));
+        found += 1;
+    }
+    found
+}
+
+#[test]
+fn flashinfer_rules_retain_proof_dependencies_for_all_mask_variants() {
+    for (mask, dtype, interval) in [
+        (TestMaskKind::Indptr, DType::F32, (1, 1)),
+        (TestMaskKind::DirectCausal, DType::F32, (1, 1)),
+        (TestMaskKind::TriuGather, DType::F32, (1, 1)),
+        (TestMaskKind::TriuGather, DType::Bf16, (2, 4)),
+    ] {
+        let (graph, handles) = build_paged_attention_graph_with_mask_and_cache_provenance(
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            mask,
+            TestCacheProvenance::Raw,
+            TestCacheProvenance::Raw,
+            dtype,
+        );
+        let frozen = flashinfer_fixture_snapshot(&graph, interval);
+        assert!(
+            assert_flashinfer_compact_dependencies(&frozen, handles.gather_idx.id.index()) > 0,
+            "mask {mask:?}, dtype {dtype:?}, interval {interval:?}"
+        );
+    }
+    for window in [None, Some(8)] {
+        let mut graph = Graph::new();
+        let q = graph.tensor(('s', 128)).as_dtype(DType::Bf16);
+        let k = graph.tensor(('s', 64)).as_dtype(DType::Bf16);
+        let v = graph.tensor(('s', 64)).as_dtype(DType::Bf16);
+        let k_cache = graph.tensor((16, 64)).as_dtype(DType::Bf16);
+        let v_cache = graph.tensor((16, 64)).as_dtype(DType::Bf16);
+        let scatter = graph.tensor('s').as_dtype(DType::Int);
+        let compact = graph.tensor('c').as_dtype(DType::Int);
+        let q_pos = graph.tensor('s').as_dtype(DType::Int);
+        gemma_mini_paged_attention(
+            q, k, v, k_cache, v_cache, scatter, compact, q_pos, 64, 64, 2, 2, window,
+        )
+        .output();
+        let frozen = flashinfer_fixture_snapshot(&graph, (1, 1));
+        assert!(
+            assert_flashinfer_compact_dependencies(&frozen, compact.id.index()) > 0,
+            "window {window:?}"
+        );
+    }
+}
+
+#[test]
+fn flashinfer_rules_retain_candidates_without_a_compact_witness() {
+    use rand::{SeedableRng, rngs::StdRng};
+    let (mut graph, handles) = build_paged_attention_graph_with_mask_and_cache_provenance(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+        TestCacheProvenance::Raw,
+        TestCacheProvenance::Raw,
+        DType::F32,
+    );
+    let gathers: Vec<_> = graph
+        .node_indices()
+        .filter(|&node| {
+            graph.try_get_op::<luminal::hlir::Gather>(node).is_some()
+                && graph
+                    .try_get_op::<luminal::hlir::Scatter>(graph.get_sources(node)[1])
+                    .is_some()
+        })
+        .collect();
+    assert_eq!(gathers.len(), 2);
+    for gather in gathers {
+        let sources = graph.get_sources(gather);
+        let edge = graph.find_edge(sources[0], gather).unwrap();
+        graph.remove_edge(edge);
+        graph.add_edge(handles.gather_idx.id, gather, ());
+        assert_eq!(
+            graph.get_sources(gather),
+            [handles.gather_idx.id, sources[1]]
+        );
+    }
+    let frozen = flashinfer_fixture_snapshot(&graph, (1, 1));
+    let space = luminal::egglog_utils::SearchSpace::from_frozen(frozen, &[]).unwrap();
+    let alternatives = space.alternatives().unwrap();
+    let choices = luminal::egglog_utils::random_initial_choice(
+        &space.frozen,
+        &alternatives,
+        &mut StdRng::seed_from_u64(7),
+    );
+    let mut context = DecodeContext::new(&space.frozen, &choices);
+    let candidates = op_candidates(&space, |kind| {
+        crate::typed_rules::FlashInferAttentionArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    });
+    assert!(
+        !candidates.is_empty(),
+        "missing compact recovery must not prevent fusion eligibility"
+    );
+    for [(.., node), _] in candidates {
+        let node = space.frozen.typed_node::<Ir>(node).unwrap();
+        let (_, inputs) = get_args(&node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+            .unwrap()
+            .unwrap();
+        let inputs = context.inputs(&inputs).unwrap();
+        assert_eq!(inputs.len(), 5);
+        let flat = context.selected(&inputs[3]).unwrap();
+        assert_eq!(
+            crate::host::flashinfer::find_indptrs::try_find_compact_gather_idx(&context, &flat)
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn flashinfer_rules_preserve_source_mask_and_layout_constraints() {
+    for case in [
+        "mask",
+        "width",
+        "rank",
+        "index stride",
+        "data stride",
+        "cache provenance",
+        "prefill",
+    ] {
+        let (mut graph, handles) = build_paged_attention_graph_with_mask_and_cache_provenance(
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            if case == "mask" {
+                TestMaskKind::Unproven
+            } else {
+                TestMaskKind::TriuGather
+            },
+            if case == "cache provenance" {
+                TestCacheProvenance::LoopInput {
+                    loop_id: 7,
+                    stream_id: 0,
+                }
+            } else {
+                TestCacheProvenance::Raw
+            },
+            TestCacheProvenance::Raw,
+            DType::F32,
+        );
+        if matches!(case, "width" | "rank" | "index stride" | "data stride") {
+            let gathers: Vec<_> = graph
+                .node_indices()
+                .filter(|&node| {
+                    graph.try_get_op::<luminal::hlir::Gather>(node).is_some()
+                        && graph
+                            .try_get_op::<luminal::hlir::Scatter>(graph.get_sources(node)[1])
+                            .is_some()
+                })
+                .collect();
+            assert_eq!(
+                gathers.len(),
+                2,
+                "fixture must identify only K/V cache gathers"
+            );
+            let gather = graph.get_op_mut::<luminal::hlir::Gather>(gathers[0]);
+            match case {
+                "width" => gather.input_shapes[1].dims[1] = (KV_DIM + 1).into(),
+                "rank" => {
+                    gather.input_shapes[0].dims.push(1.into());
+                    gather.input_shapes[0].strides.push(0.into());
+                }
+                "index stride" => gather.input_shapes[0].strides[0] = 'z'.into(),
+                "data stride" => gather.input_shapes[1].strides[0] = 'z'.into(),
+                _ => unreachable!(),
+            }
+        }
+        let frozen =
+            flashinfer_fixture_snapshot(&graph, if case == "prefill" { (2, 4) } else { (1, 1) });
+        assert_eq!(
+            assert_flashinfer_compact_dependencies(&frozen, handles.gather_idx.id.index()),
+            usize::from(matches!(case, "width" | "index stride" | "data stride")),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn flashinfer_runtime_recipe_respects_hardware_gate() {
+    use RewritePhase::*;
+    let (phases, actions) = CudaRuntime::rules();
+    let mut without = phases.clone();
+    without.insert(
+        MatmulBackend,
+        ruleset((
+            &crate::kernel::gemv::kernel_gemv::matmul_backend,
+            &crate::kernel::gemv::kernel_gemv_f8::matmul_backend,
+            &crate::kernel::moe_gemv::kernel_mo_e_gemv::matmul_backend,
+            &crate::kernel::generic_matmul::rewrites::matmul_backend,
+            &crate::host::cublaslt::rewrites::matmul_backend,
+        )),
+    );
+    without.insert(
+        KernelFuseLatePre,
+        ruleset((
+            &crate::kernel::rms_norm::kernel_r_m_s_norm::kernel_fuse_late_pre,
+            &crate::kernel::rope::kernel_ro_p_e::kernel_fuse_late_pre,
+            &crate::kernel::topk::kernel_stable_sort_idx::kernel_fuse_late_pre,
+        )),
+    );
+    without.insert(KernelFuseLate2, ruleset(()));
+    let enabled = crate::device_compute_major() >= 8;
+    let expected_actions = if enabled {
+        crate::host::flashinfer::flashinfer_attention::initial_actions().len()
+    } else {
+        0
+    };
+    let expected_rules = if enabled {
+        ruleset((
+            &crate::host::flashinfer::flashinfer_attention::matmul_backend,
+            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late2,
+            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late_pre,
+        ))
+        .len()
+    } else {
+        0
+    };
+    assert_eq!(
+        actions.len() - crate::host::cublaslt::rewrites::initial_actions().len(),
+        expected_actions
+    );
+    let all: usize = phases.values().map(|group| group.len()).sum();
+    let filtered: usize = without.values().map(|group| group.len()).sum();
+    assert_eq!(all - filtered, expected_rules);
 }
 
 #[test]
 fn flashinfer_egg_rule_parses() {
-    if !crate::tests::utilities::gpu_supports_flashinfer() {
-        return;
-    }
-    // Rule::raw() returns the rule with no validation; egglog parses it at
-    // graph build. Smoke-test by running it through the egglog frontend via
-    // a tiny program string.
-    let ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    let mut parser = luminal::egglog_utils::schema_parser(&ops);
-    let op = FlashInferAttention::default();
-    let rewrites = op.rewrites_commands(&mut parser);
-    assert_eq!(rewrites.len(), 1);
-    // The rule must mention FlashInferAttention to be the right one.
-    let s = format!("{}", rewrites[0]);
-    assert!(
-        s.contains("FlashInferAttention"),
-        "rewrite is not the FlashInfer rule: {s}"
-    );
+    // Validate typed declarations, rule bodies, and initialization together.
+    // This checks authoring independently of the runtime's hardware gate.
+    let rules = ruleset((
+        &crate::host::flashinfer::flashinfer_attention::matmul_backend,
+        &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late2,
+        &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late_pre,
+    ));
+    assert!(!rules.is_empty());
+    let mut live = EGraph::default();
+    live.register(crate::host::flashinfer::flashinfer_attention::initial_actions())
+        .unwrap();
+    live.run(&rules)
+        .expect("typed FlashInfer rules must install and run");
+    let frozen = live.freeze().unwrap();
+    frozen
+        .table(
+            |num_qo_heads: &DimExpr,
+             num_kv_heads: &DimExpr,
+             head_dim: &DimExpr,
+             page_size: &DimExpr,
+             batch_dim: &DimExpr,
+             dtype: &IrDType,
+             sm_scale: &egg::F64,
+             window_left: &egg::F64| {
+                crate::typed_rules::flash_infer_attention(
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size,
+                    batch_dim,
+                    dtype,
+                    sm_scale,
+                    window_left,
+                )
+            },
+        )
+        .expect("FlashInfer constructor table is installed");
 }
 
 #[test]
 fn flashinfer_op_sort_shape() {
-    let op = FlashInferAttention::default();
-    let s = op.sort();
-    // The egglog proof node still has 5 structural inputs; extract() lowers
-    // it to 4 runtime inputs by dropping mask and compacting gather_idx.
-    assert_eq!(op.n_inputs(), 5);
-    let dbg = format!("{:?}", s);
-    assert!(dbg.contains("FlashInferAttention"));
+    let kind = let_(
+        "kind",
+        crate::typed_rules::flash_infer_attention(8, 2, 64, 1, 1, IrDType::F32(), 1.0, -1.0),
+    );
+    let input = let_("input", Ir::Input(0, "input", IrDType::F32()));
+    let mut live = EGraph::default();
+    live.register((&kind, &input)).unwrap();
+    let frozen = live.freeze().unwrap();
+    let observed = frozen.lookup(&kind).unwrap();
+    let FrozenValueView::EClass(class) = frozen.as_view(&observed).unwrap().view() else {
+        unreachable!()
+    };
+    let node = class.nodes().next().unwrap();
+    assert!(
+        crate::typed_rules::FlashInferAttentionArgs::get_args(
+            &frozen.typed_node::<OpKind>(node).unwrap()
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(node.args().count(), 8);
+    assert_eq!(FlashInferAttention::default().n_inputs(), 4);
+}
+
+#[test]
+fn flashinfer_decoder_preserves_unsupported_dtype_rejection() {
+    let kind = let_(
+        "kind",
+        crate::typed_rules::flash_infer_attention(8, 2, 64, 1, 1, IrDType::Int(), 1.0, -1.0),
+    );
+    let mut live = EGraph::default();
+    live.register(&kind).unwrap();
+    let frozen = live.freeze().unwrap();
+    let observed = frozen.lookup(&kind).unwrap();
+    let selected = frozen.nodes(&observed).unwrap().next().unwrap();
+    let choices = FxHashMap::default();
+    let mut context = DecodeContext::new(&frozen, &choices);
+    assert!(matches!(
+        FlashInferAttention::decode(&selected, &mut Vec::new(), &mut context),
+        Err(TypedError::Decode(_))
+    ));
 }
 
 #[test]
@@ -574,6 +1368,7 @@ fn test_compute_attn_mask(
     qo_indptr: GraphTensor,
     kv_indptr: GraphTensor,
     c: Expression,
+    dtype: DType,
 ) -> GraphTensor {
     let s = q_pos.dims1();
     let q_request = test_indptr_to_request_idx(graph, qo_indptr, s);
@@ -587,7 +1382,7 @@ fn test_compute_attn_mask(
     let c_pos_2d = c_local_pos.expand_dim(0, s);
     let qp_2d = q_pos.expand_dim(1, c);
     let causal = c_pos_2d.le(qp_2d);
-    let allowed = same.cast(luminal::dtype::DType::F32) * causal.cast(luminal::dtype::DType::F32);
+    let allowed = same.cast(dtype) * causal.cast(dtype);
     allowed * 1e10 - 1e10
 }
 
@@ -595,9 +1390,10 @@ fn test_compute_triu_gather_mask(
     graph: &mut Graph,
     q_pos: GraphTensor,
     c: Expression,
+    dtype: DType,
 ) -> GraphTensor {
     let s = q_pos.dims1();
-    let causal_square = graph.triu(c, 1).cast(luminal::dtype::DType::F32) * -1e10;
+    let causal_square = graph.triu(c, 1).cast(dtype) * -1e10;
     let row_offsets = (q_pos * c).expand_dim(1, c);
     let col_offsets = graph.arange(c).expand_dim(0, s);
     causal_square.gather(row_offsets + col_offsets)
@@ -607,11 +1403,12 @@ fn test_compute_direct_causal_mask(
     graph: &mut Graph,
     q_pos: GraphTensor,
     c: Expression,
+    dtype: DType,
 ) -> GraphTensor {
     let s = q_pos.dims1();
     let q_pos = q_pos.expand_dim(1, c);
     let col = graph.arange(c).expand_dim(0, s);
-    q_pos.lt(col).cast(luminal::dtype::DType::F32) * -1e10
+    q_pos.lt(col).cast(dtype) * -1e10
 }
 
 fn gather_rows(data: GraphTensor, indices: GraphTensor, d: usize) -> GraphTensor {
@@ -650,11 +1447,12 @@ struct PagedAttnHandles {
     kv_indptr: GraphTensor,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TestMaskKind {
     Indptr,
     TriuGather,
     DirectCausal,
+    Unproven,
 }
 
 #[derive(Clone, Copy)]
@@ -712,6 +1510,7 @@ fn build_paged_attention_graph_with_mask(
         mask_kind,
         TestCacheProvenance::Raw,
         TestCacheProvenance::Raw,
+        DType::F32,
     )
 }
 
@@ -722,6 +1521,7 @@ fn build_paged_attention_graph_with_mask_and_cache_provenance(
     mask_kind: TestMaskKind,
     k_provenance: TestCacheProvenance,
     v_provenance: TestCacheProvenance,
+    dtype: DType,
 ) -> (Graph, PagedAttnHandles) {
     let kv_groups = n_heads / n_kv_heads;
     let kv_dim = n_kv_heads * head_dim;
@@ -729,11 +1529,17 @@ fn build_paged_attention_graph_with_mask_and_cache_provenance(
 
     let mut cx = Graph::default();
 
-    let q_rope = cx.named_tensor("q_rope", ('s', hidden));
-    let k_rope = cx.named_tensor("k_rope", ('s', kv_dim));
-    let v_new = cx.named_tensor("v_new", ('s', kv_dim));
-    let k_cache = cx.named_tensor("k_cache", (2048, kv_dim)).persist();
-    let v_cache = cx.named_tensor("v_cache", (2048, kv_dim)).persist();
+    let q_rope = cx.named_tensor("q_rope", ('s', hidden)).as_dtype(dtype);
+    let k_rope = cx.named_tensor("k_rope", ('s', kv_dim)).as_dtype(dtype);
+    let v_new = cx.named_tensor("v_new", ('s', kv_dim)).as_dtype(dtype);
+    let k_cache = cx
+        .named_tensor("k_cache", (2048, kv_dim))
+        .as_dtype(dtype)
+        .persist();
+    let v_cache = cx
+        .named_tensor("v_cache", (2048, kv_dim))
+        .as_dtype(dtype)
+        .persist();
     let scatter_idx = cx
         .named_tensor("scatter_idx", 's')
         .as_dtype(luminal::dtype::DType::Int);
@@ -761,9 +1567,12 @@ fn build_paged_attention_graph_with_mask_and_cache_provenance(
 
     let c: Expression = 'c'.into();
     let attn_mask = match mask_kind {
-        TestMaskKind::Indptr => test_compute_attn_mask(&mut cx, q_pos, qo_indptr, kv_indptr, c),
-        TestMaskKind::TriuGather => test_compute_triu_gather_mask(&mut cx, q_pos, c),
-        TestMaskKind::DirectCausal => test_compute_direct_causal_mask(&mut cx, q_pos, c),
+        TestMaskKind::Indptr => {
+            test_compute_attn_mask(&mut cx, q_pos, qo_indptr, kv_indptr, c, dtype)
+        }
+        TestMaskKind::TriuGather => test_compute_triu_gather_mask(&mut cx, q_pos, c, dtype),
+        TestMaskKind::DirectCausal => test_compute_direct_causal_mask(&mut cx, q_pos, c, dtype),
+        TestMaskKind::Unproven => cx.named_tensor("unproven_mask", ('s', 'c')).as_dtype(dtype),
     };
 
     let q = (q_rope * 1.0).split_dims(1, head_dim).transpose(0, 1);
@@ -819,61 +1628,59 @@ fn saturate_and_has_flashinfer_with_s_interval(
     saturate_and_has_flashinfer_inner(cx, Some((s_min, s_max)))
 }
 
+fn saturate_attention_graph(cx: &Graph, s_interval: Option<(i64, i64)>) -> FrozenEGraph {
+    let roots = luminal::typed_reference::capture_graph(cx).unwrap();
+    let (phases, actions) = CudaRuntime::rules();
+    let mut live = EGraph::default();
+    if let Some((min, max)) = s_interval {
+        let s = DimExpr::from('s');
+        live.register((set(s.lower(), min), set(s.upper(), max)))
+            .unwrap();
+        if min == max {
+            live.register(union(s, min)).unwrap();
+        }
+    }
+    live.register(actions).unwrap();
+    live.register(&roots).unwrap();
+    live.run(luminal::egglog_utils::main_schedule(
+        &phases,
+        s_interval.is_some(),
+    ))
+    .unwrap();
+    for (phase, schedule) in luminal::egglog_utils::final_phases(&phases, s_interval.is_some()) {
+        if !matches!(
+            phase,
+            RewritePhase::Cleanup | RewritePhase::PostCleanup | RewritePhase::BaseCleanup
+        ) {
+            live.run(schedule).unwrap();
+        }
+    }
+    // Retain the entire exact snapshot, including subsumed nodes; no
+    // admissible-alternative cleanup may hide a rule-firing witness.
+    live.freeze().unwrap()
+}
+
 fn saturate_and_has_flashinfer_inner(
     cx: &Graph,
     s_interval: Option<(i64, i64)>,
 ) -> (bool, Vec<String>) {
-    let (program, root) = hlir_to_egglog(cx);
-    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
-    // cleanup=false: keep every saturation-introduced e-node so we can inspect
-    // whether the FlashInferAttention rule produced a node, regardless of
-    // whether downstream extraction would have pruned it.
-    let egraph = if let Some((s_min, s_max)) = s_interval {
-        let mut intervals = luminal::prelude::FxHashMap::default();
-        intervals.insert('s', luminal::shape::DimInterval::new(s_min, s_max));
-        let interval_facts = luminal::egglog_utils::base::interval_facts_egglog(&intervals, []);
-        let program = format!("{interval_facts}\n{program}");
-        run_egglog_with_late_passes_and_interval_analysis(&program, &root, &ops, false, &[], true)
-            .expect("egglog failed")
-    } else {
-        run_egglog(&program, &root, &ops, false).expect("egglog failed")
-    };
-
-    let has_flashinfer = egraph
-        .enodes
-        .values()
-        .any(|(label, _)| label == "FlashInferAttention");
-
-    // Collect distinct OpKind labels so a failure can print what *did* match.
-    let mut op_kinds: Vec<String> = egraph
-        .enodes
-        .values()
-        .filter(|(l, _)| {
-            !l.starts_with('(')
-                && ![
-                    "Op",
-                    "Input",
-                    "Output",
-                    "OutputJoin",
-                    "ICons",
-                    "INil",
-                    "ECons",
-                    "ENil",
-                    "MNum",
-                    "MVar",
-                    "MMul",
-                    "MDiv",
-                    "MIter",
-                ]
-                .contains(&l.as_str())
-        })
-        .map(|(l, _)| l.clone())
+    let frozen = saturate_attention_graph(cx, s_interval);
+    let kinds: Vec<_> = frozen
+        .eclasses()
+        .filter(|class| class.sort() == OpKind::sort_ref())
+        .flat_map(|class| class.nodes())
         .collect();
-    op_kinds.sort();
-    op_kinds.dedup();
-
-    (has_flashinfer, op_kinds)
+    let found = kinds.iter().any(|&node| {
+        crate::typed_rules::FlashInferAttentionArgs::get_args(
+            &frozen.typed_node::<OpKind>(node).unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    });
+    let mut names: Vec<_> = kinds.iter().map(|node| node.name().to_owned()).collect();
+    names.sort();
+    names.dedup();
+    (found, names)
 }
 
 /// Debug aid: dump the egglog program and key e-graph metrics for the lite
@@ -881,60 +1688,36 @@ fn saturate_and_has_flashinfer_inner(
 #[test]
 #[ignore]
 fn flashinfer_dump_paged_attn_egglog() {
-    // First sanity-check that each Ops member returns its rewrites and that
-    // FlashInferAttention's rule appears in the combined corpus.
-    let ops_vec = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    eprintln!("==== Ops rewrites count ====");
-    let mut fi_rewrites = 0usize;
-    let mut total_rewrites = 0usize;
-    let mut parser = luminal::egglog_utils::schema_parser(&ops_vec);
-    for op in &ops_vec {
-        let rws = op.rewrites_commands(&mut parser);
-        total_rewrites += rws.len();
-        for r in &rws {
-            let s = format!("{r}");
-            if s.contains("FlashInferAttention") {
-                fi_rewrites += 1;
-                eprintln!("FOUND FlashInfer rewrite ({} chars)", s.len());
-            }
-        }
-    }
+    let (phases, _) = CudaRuntime::rules();
+    let total: usize = phases.values().map(|rules| rules.len()).sum();
     eprintln!(
-        "==== ops_vec.len()={} total_rewrites={total_rewrites} fi_rewrites={fi_rewrites} ====",
-        ops_vec.len()
+        "FlashInfer typed rules: {:#?}",
+        ruleset((
+            &crate::host::flashinfer::flashinfer_attention::matmul_backend,
+            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late2,
+            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late_pre,
+        ))
     );
-
+    eprintln!(
+        "decoders={} total_rewrites={total}",
+        CudaRuntime::DECODERS.len()
+    );
     let (cx, _) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
-    let (program, root) = hlir_to_egglog(&cx);
-    eprintln!("==== EGGLOG PROGRAM (root={root}) ====");
-    for (i, line) in program.lines().enumerate() {
-        eprintln!("{:5}: {line}", i + 1);
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    eprintln!("typed captured roots: {roots:#?}");
+    let (has_fi, kinds) = saturate_and_has_flashinfer(&cx);
+    eprintln!("has FlashInferAttention: {has_fi}; OpKinds: {kinds:?}");
+    let frozen = saturate_attention_graph(&cx, None);
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for node in frozen.eclasses().flat_map(|class| class.nodes()) {
+        *counts.entry(node.name().to_owned()).or_default() += 1;
     }
-    eprintln!(
-        "==== END EGGLOG PROGRAM ({} lines) ====",
-        program.lines().count()
-    );
-
-    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
-    let egraph = run_egglog(&program, &root, &ops, false).expect("egglog failed");
-
-    // Bucket enode labels by frequency.
-    let mut counts: std::collections::HashMap<String, usize> = Default::default();
-    for (label, _) in egraph.enodes.values() {
-        *counts.entry(label.clone()).or_default() += 1;
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    eprintln!("frozen constructor histogram (top 60):");
+    for (name, count) in counts.into_iter().take(60) {
+        eprintln!("  {count:6} {name}");
     }
-    let mut sorted: Vec<_> = counts.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
-    eprintln!("==== E-GRAPH LABEL HISTOGRAM (top 60) ====");
-    for (label, n) in sorted.iter().take(60) {
-        eprintln!("  {n:6}  {label}");
-    }
-    let has_fi = egraph
-        .enodes
-        .values()
-        .any(|(label, _)| label == "FlashInferAttention");
-    eprintln!("==== has FlashInferAttention enode: {has_fi} ====");
 }
 
 #[test]
@@ -996,6 +1779,7 @@ fn flashinfer_rule_rejects_mixed_cache_provenance() {
             stream_id: 0,
         },
         TestCacheProvenance::Raw,
+        DType::F32,
     );
     let (has_flashinfer, _) = saturate_and_has_flashinfer_with_decode_interval(&cx);
     assert!(
@@ -1037,6 +1821,7 @@ fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
             loop_id: 7,
             stream_id: 1,
         },
+        DType::F32,
     );
     let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
     assert!(
@@ -1261,8 +2046,8 @@ fn flashinfer_rule_fires_on_mha() {
 // FlashInfer host op (which pays a `plan()` setup cost per call), so asserting
 // "GA picked FlashInfer" is flaky. Instead, sample many random valid genomes
 // from the search space and assert that the FlashInfer extraction is reachable
-// — meaning the rule fired AND `find_indptrs` extraction succeeded for at
-// least one offspring. That is the end-to-end check we actually want.
+// — meaning the rule fired and its final execution dependencies reconstructed
+// successfully for at least one offspring.
 
 #[test]
 fn flashinfer_extraction_reachable_from_search_space() {
@@ -1282,40 +2067,44 @@ fn flashinfer_extraction_reachable_from_search_space() {
         .egraph()
         .expect("egraph missing after build_search_space");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("egglog_ops missing after build_search_space");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
 
     let mut rng = StdRng::seed_from_u64(0xf1a541);
     let mut prev: FxHashSet<u64> = FxHashSet::default();
-    let initial = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
+    let initial =
+        luminal::egglog_utils::random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     prev.insert(luminal::egglog_utils::hash_choice_set(&initial));
     let mut base = initial;
 
     let mut found = false;
     'outer: for _ in 0..50 {
-        let offspring =
-            luminal::egglog_utils::extract_generation(egraph, &base, 10, 2, &mut prev, &mut rng);
+        let offspring = luminal::egglog_utils::extract_reachable_generation(
+            egraph,
+            &alternatives,
+            &base,
+            10,
+            2,
+            &mut prev,
+            &mut rng,
+        );
         if offspring.is_empty() {
             break;
         }
         for genome in offspring {
-            if luminal::egglog_utils::validate_choice_set(egraph, &genome, ops).is_err() {
+            if luminal::egglog_utils::validate_choice_set(egraph, &alternatives, &genome).is_err() {
                 continue;
             }
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            // Catch a possible panic from find_indptrs walking the mask — we
-            // want the test to fail with a clean message, not abort.
+            // A rejected candidate should not prevent testing the other valid
+            // dependency selections for the reachable FlashInfer operation.
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                luminal::egglog_utils::egglog_to_llir(
-                    egraph,
-                    genome.clone(),
-                    ops,
-                    &cx.custom_ops,
-                    &mut list_cache,
-                    &mut expr_cache,
-                    None,
-                )
+                luminal::egglog_utils::reconstruct(egraph, &genome, ops, &cx.custom_ops)
+                    .expect("typed candidate reconstruction")
+                    .0
             }));
             let Ok(llir_graph) = panicked else { continue };
 
@@ -1338,27 +2127,6 @@ fn flashinfer_extraction_reachable_from_search_space() {
     );
 }
 
-fn flashinfer_ir_nodes(egraph: &luminal::egglog_utils::SerializedEGraph) -> Vec<&ENodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == "FlashInferAttention")
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
-        })
-        .collect()
-}
-
 fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -1367,9 +2135,17 @@ fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph 
 
     let egraph = cx.egraph().expect("search space should have an e-graph");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("search space should have registered egglog ops");
-    let flashinfer_nodes = flashinfer_ir_nodes(egraph);
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
+    let flashinfer_nodes = op_candidates(egraph, |kind| {
+        crate::typed_rules::FlashInferAttentionArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    });
     assert!(
         !flashinfer_nodes.is_empty(),
         "expected a FlashInferAttention rewrite candidate for {case_name}"
@@ -1378,26 +2154,18 @@ fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph 
     let mut last_error = None;
     for (idx, flashinfer_node) in flashinfer_nodes.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(0xF1A5_0000 + idx as u64);
-        let mut choices = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
-        let flashinfer_class = &egraph.node_to_class[*flashinfer_node];
-        choices.insert(flashinfer_class, flashinfer_node);
+        let mut choices =
+            luminal::egglog_utils::random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        choices.extend(*flashinfer_node);
 
-        if let Err(err) = luminal::egglog_utils::validate_choice_set(egraph, &choices, ops) {
-            last_error = Some(err);
+        if let Err(err) =
+            luminal::egglog_utils::validate_choice_set(egraph, &alternatives, &choices)
+        {
+            last_error = Some(err.to_string());
             continue;
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = luminal::egglog_utils::egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = luminal::egglog_utils::reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected FlashInfer candidate should reconstruct");
 
         let has_flashinfer = llir.node_indices().any(|n| {
             llir[n]
@@ -1786,70 +2554,100 @@ fn egraph_choice_eclass_census() {
     );
     let _out = out.cast(DType::F32).output();
 
-    let (program, root) = hlir_to_egglog(&cx);
-    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
-    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
-    // cleanup=true: census the egraph the search actually extracts from.
-    let egraph = run_egglog(&program, &root, &ops, true).expect("egglog failed");
-
-    let elementwise_labels = [
-        "Add",
-        "Mul",
-        "Cast",
-        "Exp2",
-        "Log2",
-        "Sin",
-        "Sqrt",
-        "Recip",
-        "CudaUnaryElementwise",
-        "CudaBinaryElementwise",
-        "FusionStart",
-        "FusionEnd",
-    ];
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().unwrap();
+    let alternatives = egraph.alternatives().unwrap();
+    let is_elementwise = |kind: &OpKind| {
+        use crate::typed_rules::{CudaBinaryElementwiseArgs, FusionEndArgs, FusionStartArgs};
+        use luminal::typed_reference::schema::{
+            AddArgs, CastArgs, Exp2Args, Log2Args, MulArgs, RecipArgs, SinArgs, SqrtArgs,
+        };
+        AddArgs::get_args(kind).unwrap().is_some()
+            || MulArgs::get_args(kind).unwrap().is_some()
+            || CastArgs::get_args(kind).unwrap().is_some()
+            || Exp2Args::get_args(kind).unwrap().is_some()
+            || Log2Args::get_args(kind).unwrap().is_some()
+            || SinArgs::get_args(kind).unwrap().is_some()
+            || SqrtArgs::get_args(kind).unwrap().is_some()
+            || RecipArgs::get_args(kind).unwrap().is_some()
+            || get_args(
+                kind,
+                |op: &egg::String,
+                 shape: &EList,
+                 strides: &EList,
+                 out_strides: &EList,
+                 dtype: &IrDType| {
+                    crate::typed_rules::cuda_unary_elementwise(
+                        op,
+                        shape,
+                        strides,
+                        out_strides,
+                        dtype,
+                    )
+                },
+            )
+            .unwrap()
+            .is_some()
+            || CudaBinaryElementwiseArgs::get_args(kind).unwrap().is_some()
+            || FusionStartArgs::get_args(kind).unwrap().is_some()
+            || FusionEndArgs::get_args(kind).unwrap().is_some()
+    };
     let mut multi = 0usize;
     let mut elementwise_only = 0usize;
-    let mut profile_hist: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
+    let mut profile_hist = std::collections::BTreeMap::<String, usize>::new();
     let mut choice_product_log2 = 0f64;
     let mut frozen_product_log2 = 0f64;
-    for (label, enodes) in egraph.eclasses.values() {
-        let searchable =
-            label.contains("IR") || label.contains("IList") || label.contains("OpKind");
-        if !searchable || enodes.len() < 2 {
+    for (class, nodes) in &alternatives {
+        let sort = class.sort();
+        if ![Ir::sort_ref(), IList::sort_ref(), OpKind::sort_ref()].contains(&sort)
+            || nodes.len() < 2
+        {
             continue;
         }
         multi += 1;
-        choice_product_log2 += (enodes.len() as f64).log2();
-        // Resolve each variant to its op *kind*: an `Op` enode's first
-        // child is its OpKind eclass; use that eclass's enode labels.
-        // Non-Op variants (list cons, kind constructors) keep their own
-        // label.
-        let mut labels: Vec<&str> = enodes
-            .iter()
-            .flat_map(|n| {
-                let (lbl, children) = &egraph.enodes[n];
-                if lbl == "Op" && !children.is_empty() {
-                    egraph.eclasses[&children[0]]
-                        .1
-                        .iter()
-                        .map(|kn| egraph.enodes[kn].0.as_str())
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![lbl.as_str()]
+        choice_product_log2 += (nodes.len() as f64).log2();
+        let mut labels = Vec::new();
+        let mut ew_only = true;
+        for &node in nodes {
+            if sort == Ir::sort_ref() {
+                let ir = egraph.frozen.typed_node::<Ir>(node).unwrap();
+                if let Some((kind, _)) =
+                    get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs)).unwrap()
+                {
+                    let FrozenValueView::EClass(kind) =
+                        egraph.frozen.as_view(&kind).unwrap().view()
+                    else {
+                        unreachable!()
+                    };
+                    for &node in &alternatives[&kind] {
+                        ew_only &=
+                            is_elementwise(&egraph.frozen.typed_node::<OpKind>(node).unwrap());
+                        labels.push(node.name().to_owned());
+                    }
+                    continue;
                 }
-            })
-            .collect();
-        labels.sort_unstable();
-        labels.dedup();
-        let ew_only = labels.iter().all(|l| {
-            elementwise_labels.contains(l) || l.starts_with("ICons") || l.starts_with("INil")
-        });
+            }
+            ew_only &= if sort == OpKind::sort_ref() {
+                is_elementwise(&egraph.frozen.typed_node::<OpKind>(node).unwrap())
+            } else if sort == IList::sort_ref() {
+                let list = egraph.frozen.typed_node::<IList>(node).unwrap();
+                get_args(&list, |head: &Ir, tail: &IList| IList::ICons(head, tail))
+                    .unwrap()
+                    .is_some()
+                    || get_args(&list, IList::INil).unwrap().is_some()
+            } else {
+                false
+            };
+            labels.push(node.name().to_owned());
+        }
         if ew_only {
             elementwise_only += 1;
         } else {
-            frozen_product_log2 += (enodes.len() as f64).log2();
+            frozen_product_log2 += (nodes.len() as f64).log2();
         }
-        *profile_hist.entry(format!("{labels:?}")).or_insert(0) += 1;
+        labels.sort_unstable();
+        labels.dedup();
+        *profile_hist.entry(format!("{labels:?}")).or_default() += 1;
     }
     println!("multi-alternative choice eclasses: {multi}");
     println!("  elementwise-only (freezable):    {elementwise_only}");
@@ -1895,8 +2693,8 @@ fn dump_gemma_sliding_attention_egglog() {
         Some(8),
     );
     let _out = out.cast(DType::F32).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
-    println!("{program}");
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    println!("{roots:#?}");
 }
 
 #[test]
@@ -2038,6 +2836,6 @@ fn dump_llama_swiglu_chain_egglog() {
     let scale_e = scale.expand_dim(0, 's').expand_dim(1, I);
     let q = (hf / scale_e).cast(DType::F8E4M3);
     let _ = q.cast(DType::F32).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
-    println!("{program}");
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    println!("{roots:#?}");
 }

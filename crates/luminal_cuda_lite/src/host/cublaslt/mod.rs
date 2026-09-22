@@ -1,4 +1,25 @@
-use luminal::prelude::{Command, Parser, raw_rules};
+#[path = "cublaslt_beta_rewrite.rs"]
+pub(crate) mod beta_rewrite;
+#[path = "cublaslt_CmCm_rewrite.rs"]
+pub(crate) mod cmcm_rewrite;
+#[path = "cublaslt_CmRm_rewrite.rs"]
+pub(crate) mod cmrm_rewrite;
+#[path = "cublaslt_epilogue_rewrite.rs"]
+pub(crate) mod epilogue_rewrite;
+#[path = "cublaslt_fp8_rewrite.rs"]
+pub(crate) mod fp8_rewrite;
+#[path = "cublaslt_RmCm_rewrite.rs"]
+pub(crate) mod rmcm_rewrite;
+#[path = "cublaslt_RmRm_rewrite.rs"]
+pub(crate) mod rmrm_rewrite;
+#[path = "cublaslt_row_order_rewrite.rs"]
+pub(crate) mod row_order_rewrite;
+#[path = "cublaslt_scale_rewrite.rs"]
+pub(crate) mod scale_rewrite;
+
+use egglog_experimental::typed::TypedError;
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{Ir, OpKind};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(test)]
@@ -7,12 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use half::{bf16, f16};
 use luminal::{
     dtype::DType,
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, EXPRESSION, F64, OP_KIND, STRING},
-        extract_dtype, extract_expr,
-    },
-    op::{EgglogOp, LLIROp},
+    op::LLIROp,
     prelude::{
         tracing::{Level, span, trace},
         *,
@@ -45,14 +61,17 @@ use crate::{
     try_create_cublaslt,
 };
 
-fn parse_cublas_op(s: &str) -> cublasOperation_t {
-    let stripped = s.trim_matches('"');
-    match stripped {
+fn parse_cublas_op(s: &str) -> Result<cublasOperation_t, TypedError> {
+    Ok(match s {
         "T" => cublasOperation_t::CUBLAS_OP_T,
         "N" => cublasOperation_t::CUBLAS_OP_N,
         "C" => cublasOperation_t::CUBLAS_OP_C,
-        other => panic!("Unknown cuBLAS operation: '{other}' (original: '{s}')"),
-    }
+        other => {
+            return Err(TypedError::Decode(format!(
+                "Unknown cuBLAS operation: '{other}' (original: '{s}')"
+            )));
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -90,228 +109,191 @@ pub struct CuBlasLt {
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
 }
 
-// Useless default for IntoEgglogOp
-impl Default for CuBlasLt {
-    fn default() -> Self {
-        Self {
-            m: Expression::default(),
-            n: Expression::default(),
-            k: Expression::default(),
-            a_layout: cublasOperation_t::CUBLAS_OP_N,
-            b_layout: cublasOperation_t::CUBLAS_OP_T,
-            a_order: cublasLtOrder_t::CUBLASLT_ORDER_COL,
-            b_order: cublasLtOrder_t::CUBLASLT_ORDER_COL,
-            c_order: cublasLtOrder_t::CUBLASLT_ORDER_COL,
-            d_order: cublasLtOrder_t::CUBLASLT_ORDER_COL,
-            lda: Expression::default(),
-            ldb: Expression::default(),
-            ldc: Expression::default(),
-            ldd: Expression::default(),
-            batch_count: 1.into(),
-            stride_a: 0.into(),
-            stride_b: 0.into(),
-            stride_c: 0.into(),
-            stride_d: 0.into(),
-            a_dtype: DType::F32,
-            b_dtype: DType::F32,
-            c_dtype: DType::F32,
-            d_dtype: DType::F32,
-            compute_type: cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            scale_dtype: DType::F32,
-            alpha: 1.0,
-            beta: 0.0,
-            epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
-            a_scale_input: false,
-            b_scale_input: false,
-            cublaslt: OnceLock::new(),
-        }
-    }
-}
+pub(crate) mod rewrites {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-#[derive(Debug, Default)]
-pub struct CuBlasLtScaled;
+    #[relation]
+    pub(crate) fn cublaslt_base_dtype(a0: DType);
 
-fn cublaslt_sort(name: &'static str) -> SortDef {
-    sort(
-        OP_KIND,
-        name,
-        &[
-            ("m", EXPRESSION),
-            ("n", EXPRESSION),
-            ("k", EXPRESSION),
-            ("a_layout", STRING),
-            ("b_layout", STRING),
-            ("a_order", STRING),
-            ("b_order", STRING),
-            ("c_order", STRING),
-            ("d_order", STRING),
-            ("lda", EXPRESSION),
-            ("ldb", EXPRESSION),
-            ("ldc", EXPRESSION),
-            ("ldd", EXPRESSION),
-            ("batch_count", EXPRESSION),
-            ("stride_a", EXPRESSION),
-            ("stride_b", EXPRESSION),
-            ("stride_c", EXPRESSION),
-            ("stride_d", EXPRESSION),
-            ("a_dtype", DTYPE),
-            ("b_dtype", DTYPE),
-            ("c_dtype", DTYPE),
-            ("d_dtype", DTYPE),
-            ("compute_type", STRING),
-            ("scale_dtype", STRING),
-            ("alpha", F64),
-            ("beta", F64),
-            ("epilogue", STRING),
-        ],
-    )
-}
+    #[relation]
+    pub(crate) fn cublaslt_fp8_dtype(a0: DType);
 
-impl EgglogOp for CuBlasLt {
-    fn sort(&self) -> SortDef {
-        cublaslt_sort("cublaslt")
+    #[relation]
+    pub(crate) fn cublaslt_fp8_f32_output_pair(a0: DType, a1: DType);
+
+    #[ruleset]
+    pub(crate) fn matmul_backend() -> Ruleset {
+        ruleset((
+            &super::rmrm_rewrite::matmul_backend,
+            &super::rmcm_rewrite::matmul_backend,
+            &super::cmrm_rewrite::matmul_backend,
+            &super::cmcm_rewrite::matmul_backend,
+            &super::fp8_rewrite::matmul_backend,
+            &super::scale_rewrite::matmul_backend,
+            &super::beta_rewrite::matmul_backend,
+            &super::epilogue_rewrite::matmul_backend,
+            &super::row_order_rewrite::matmul_backend,
+        ))
     }
 
-    fn n_inputs(&self) -> usize {
-        let c_input = usize::from(self.beta != 0.0);
-        let bias_input = usize::from(epilogue_uses_bias(self.epilogue));
-        let scale_inputs = usize::from(self.a_scale_input) + usize::from(self.b_scale_input);
-        2 + c_input + bias_input + scale_inputs
+    // cuBLASLt now specializes GenericMatmul, so cleanup should prune
+    // the matmul output alternatives directly. Do not delete the
+    // broadcast Mul here; it may still have non-matmul consumers.
+    #[ruleset]
+    pub(crate) fn cleanup(
+        shape: &EList,
+        k: &DimExpr,
+        sis: &EList,
+        sks: &DimExpr,
+        sos: &EList,
+        inputs: &IList,
+        sum: &Ir,
+        ci: &IList,
+        dt: &DType,
+        generic_inputs: &IList,
+        cublas_inputs: &IList,
+    ) -> Ruleset {
+        let sum_source = &Ir::Op(OpKind::Sum(shape, k, sis, sks, sos), inputs);
+        let generic_source = &Ir::Op(GenericMatmulArgs::fresh(), generic_inputs);
+        ruleset((
+            &super::fp8_rewrite::cleanup,
+            [
+                rule(
+                    (
+                        eq(sum, sum_source),
+                        eq(sum, Ir::Op(CuBlasLtArgs::fresh(), ci)),
+                    ),
+                    (delete(sum_source),),
+                )
+                .label("delete-sum-when-cublaslt-exists"),
+                rule(
+                    (
+                        eq(sum, Ir::Op(kernel_sum(shape, k, sis, sks, sos, dt), inputs)),
+                        eq(sum, Ir::Op(CuBlasLtArgs::fresh(), ci)),
+                    ),
+                    (delete(Ir::Op(
+                        kernel_sum(shape, k, sis, sks, sos, dt),
+                        inputs,
+                    )),),
+                )
+                .label("delete-kernel-sum-when-cublaslt-exists"),
+                rule(
+                    (
+                        eq(sum, sum_source),
+                        eq(sum, Ir::Op(CuBlasLtScaledArgs::fresh(), ci)),
+                    ),
+                    (delete(sum_source),),
+                )
+                .label("delete-sum-when-scaled-cublaslt-exists"),
+                rule(
+                    (
+                        eq(sum, Ir::Op(kernel_sum(shape, k, sis, sks, sos, dt), inputs)),
+                        eq(sum, Ir::Op(CuBlasLtScaledArgs::fresh(), ci)),
+                    ),
+                    (delete(Ir::Op(
+                        kernel_sum(shape, k, sis, sks, sos, dt),
+                        inputs,
+                    )),),
+                )
+                .label("delete-kernel-sum-when-scaled-cublaslt-exists"),
+                rule(
+                    (
+                        eq(sum, generic_source),
+                        eq(sum, Ir::Op(CuBlasLtArgs::fresh(), cublas_inputs)),
+                    ),
+                    (delete(generic_source),),
+                )
+                .label("prefer-cublaslt-over-generic-matmul"),
+                rule(
+                    (
+                        eq(sum, generic_source),
+                        eq(sum, Ir::Op(CuBlasLtScaledArgs::fresh(), cublas_inputs)),
+                    ),
+                    (delete(generic_source),),
+                )
+                .label("prefer-scaled-cublaslt-over-generic-matmul"),
+            ],
+        ))
     }
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+    pub(crate) fn initial_actions() -> Vec<Action> {
         vec![
-            raw_rules(parser, 
-                "(relation cublaslt_base_dtype (DType))
-                 (cublaslt_base_dtype (F32))
-                 (cublaslt_base_dtype (F16))
-                 (cublaslt_base_dtype (Bf16))
-                 (cublaslt_base_dtype (TF32))
-                 (relation cublaslt_fp8_dtype (DType))
-                 (cublaslt_fp8_dtype (F8E4M3))
-                 (cublaslt_fp8_dtype (F8E5M2))
-                 (relation cublaslt_fp8_f32_output_pair (DType DType))
-                 (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E4M3))
-                 (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E5M2))
-                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))
-                 ; (scale_product FusionEnd, a_scale, b_scale) — staged by the
-                 ; fp8 scale-product fact rule so the fused-output-scale rule
-                 ; looks the scalars up instead of enumerating scalar
-                 ; FusionStart pairs (a K² blowup on scalar-rich graphs).
-                 (relation cublaslt_fp8_scale_product (IR IR IR))",
-            ),
-            raw_rules(parser, include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
-            raw_rules(parser, include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
-            raw_rules(parser, include_str!["cublaslt_CmRm_rewrite.egg"]), // col row
-            raw_rules(parser, include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
-            raw_rules(parser, include_str!["cublaslt_fp8_rewrite.egg"]),
-            raw_rules(parser, include_str!["cublaslt_scale_rewrite.egg"]),
-            raw_rules(parser, include_str!["cublaslt_beta_rewrite.egg"]),
-            raw_rules(parser, include_str!["cublaslt_epilogue_rewrite.egg"]),
-            raw_rules(parser, include_str!["cublaslt_row_order_rewrite.egg"]),
-            // cuBLASLt now specializes GenericMatmul, so cleanup should prune
-            // the matmul output alternatives directly. Do not delete the
-            // broadcast Mul here; it may still have non-matmul consumers.
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-sum-when-cublaslt-exists\"
-            )"),
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-kernel-sum-when-cublaslt-exists\"
-            )"),
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-sum-when-scaled-cublaslt-exists\"
-            )"),
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-kernel-sum-when-scaled-cublaslt-exists\"
-            )"),
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
-                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
-                :ruleset cleanup
-                :name \"prefer-cublaslt-over-generic-matmul\"
-            )"),
-            raw_rules(parser, "(rule
-                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
-                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
-                :ruleset cleanup
-                :name \"prefer-scaled-cublaslt-over-generic-matmul\"
-            )"),
+            Action::from(cublaslt_base_dtype(DType::F32())),
+            Action::from(cublaslt_base_dtype(DType::F16())),
+            Action::from(cublaslt_base_dtype(DType::Bf16())),
+            Action::from(cublaslt_base_dtype(DType::TF32())),
+            Action::from(cublaslt_fp8_dtype(DType::F8E4M3())),
+            Action::from(cublaslt_fp8_dtype(DType::F8E5M2())),
+            Action::from(cublaslt_fp8_f32_output_pair(
+                DType::F8E4M3(),
+                DType::F8E4M3(),
+            )),
+            Action::from(cublaslt_fp8_f32_output_pair(
+                DType::F8E4M3(),
+                DType::F8E5M2(),
+            )),
+            Action::from(cublaslt_fp8_f32_output_pair(
+                DType::F8E5M2(),
+                DType::F8E4M3(),
+            )),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
+}
 
-    #[allow(unused_variables)]
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a luminal::egglog_utils::SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
+impl CuBlasLt {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some(args) = crate::typed_rules::CuBlasLtArgs::get_args(kind)? else {
+            return Ok(None);
+        };
         // Extract dimensions from egglog
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let m = context.expression(&args.m)?;
+        let n = context.expression(&args.n)?;
+        let k = context.expression(&args.k)?;
 
         // Extract transpose/layout strings from egglog
-        let a_layout_str = &egraph.enodes[kind_children[3]].0;
-        let b_layout_str = &egraph.enodes[kind_children[4]].0;
-        let a_layout = parse_cublas_op(a_layout_str);
-        let b_layout = parse_cublas_op(b_layout_str);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
+        let a_layout_str = String::try_from(&args.a_layout)?;
+        let b_layout_str = String::try_from(&args.b_layout)?;
+        let a_layout = parse_cublas_op(&a_layout_str)?;
+        let b_layout = parse_cublas_op(&b_layout_str)?;
+        let a_order = parse_cublaslt_order(&String::try_from(&args.a_order)?)?;
+        let b_order = parse_cublaslt_order(&String::try_from(&args.b_order)?)?;
+        let c_order = parse_cublaslt_order(&String::try_from(&args.c_order)?)?;
+        let d_order = parse_cublaslt_order(&String::try_from(&args.d_order)?)?;
 
         // Extract leading dimensions from egglog
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
+        let lda = context.expression(&args.lda)?;
+        let ldb = context.expression(&args.ldb)?;
+        let ldc = context.expression(&args.ldc)?;
+        let ldd = context.expression(&args.ldd)?;
 
         // Extract batch parameters
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
+        let batch_count = context.expression(&args.batch_count)?;
+        let stride_a = context.expression(&args.stride_a)?;
+        let stride_b = context.expression(&args.stride_b)?;
+        let stride_c = context.expression(&args.stride_c)?;
+        let stride_d = context.expression(&args.stride_d)?;
 
         // Extract cuBLASLt type tuple from egglog. Existing rewrites emit the
         // same dtype for A/B/C/D, but keeping these fields separate lets later
         // rewrites model mixed-input and mixed-output matmuls without changing
         // the host launch helper again.
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
+        let a_dtype = context.dtype(&args.a_dtype)?;
+        let b_dtype = context.dtype(&args.b_dtype)?;
+        let c_dtype = context.dtype(&args.c_dtype)?;
+        let d_dtype = context.dtype(&args.d_dtype)?;
+        let compute_type_str = String::try_from(&args.compute_type)?;
+        let scale_dtype_str = String::try_from(&args.scale_dtype)?;
+        let compute_type = parse_cublaslt_compute_type(&compute_type_str, a_dtype)?;
+        let scale_dtype = parse_cublaslt_scale_dtype(&scale_dtype_str, a_dtype)?;
+        let alpha = f64::try_from(&args.alpha)?;
+        let beta = f64::try_from(&args.beta)?;
+        let epilogue = parse_cublaslt_epilogue(&String::try_from(&args.epilogue)?)?;
 
         let extracted_state = Self {
             m,
@@ -349,65 +331,52 @@ impl EgglogOp for CuBlasLt {
 
         let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
 
-        (extracted, input_enodes)
-    }
-
-    fn cleanup(&self) -> bool {
-        false
+        Ok(Some(extracted))
     }
 }
 
-impl EgglogOp for CuBlasLtScaled {
-    fn sort(&self) -> SortDef {
-        cublaslt_sort("cublaslt_scaled")
-    }
+impl CuBlasLt {
+    pub fn decode_scaled(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some(args) = crate::typed_rules::CuBlasLtScaledArgs::get_args(kind)? else {
+            return Ok(None);
+        };
+        let m = context.expression(&args.m)?;
+        let n = context.expression(&args.n)?;
+        let k = context.expression(&args.k)?;
 
-    fn n_inputs(&self) -> usize {
-        4
-    }
+        let a_layout = parse_cublas_op(&String::try_from(&args.a_layout)?)?;
+        let b_layout = parse_cublas_op(&String::try_from(&args.b_layout)?)?;
+        let a_order = parse_cublaslt_order(&String::try_from(&args.a_order)?)?;
+        let b_order = parse_cublaslt_order(&String::try_from(&args.b_order)?)?;
+        let c_order = parse_cublaslt_order(&String::try_from(&args.c_order)?)?;
+        let d_order = parse_cublaslt_order(&String::try_from(&args.d_order)?)?;
 
-    #[allow(unused_variables)]
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a luminal::egglog_utils::SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let lda = context.expression(&args.lda)?;
+        let ldb = context.expression(&args.ldb)?;
+        let ldc = context.expression(&args.ldc)?;
+        let ldd = context.expression(&args.ldd)?;
 
-        let a_layout = parse_cublas_op(&egraph.enodes[kind_children[3]].0);
-        let b_layout = parse_cublas_op(&egraph.enodes[kind_children[4]].0);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
+        let batch_count = context.expression(&args.batch_count)?;
+        let stride_a = context.expression(&args.stride_a)?;
+        let stride_b = context.expression(&args.stride_b)?;
+        let stride_c = context.expression(&args.stride_c)?;
+        let stride_d = context.expression(&args.stride_d)?;
 
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
-
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
-
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
+        let a_dtype = context.dtype(&args.a_dtype)?;
+        let b_dtype = context.dtype(&args.b_dtype)?;
+        let c_dtype = context.dtype(&args.c_dtype)?;
+        let d_dtype = context.dtype(&args.d_dtype)?;
+        let compute_type_str = String::try_from(&args.compute_type)?;
+        let scale_dtype_str = String::try_from(&args.scale_dtype)?;
+        let compute_type = parse_cublaslt_compute_type(&compute_type_str, a_dtype)?;
+        let scale_dtype = parse_cublaslt_scale_dtype(&scale_dtype_str, a_dtype)?;
+        let alpha = f64::try_from(&args.alpha)?;
+        let beta = f64::try_from(&args.beta)?;
+        let epilogue = parse_cublaslt_epilogue(&String::try_from(&args.epilogue)?)?;
 
         let extracted_state = CuBlasLt {
             m,
@@ -445,11 +414,7 @@ impl EgglogOp for CuBlasLtScaled {
 
         let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
 
-        (extracted, input_enodes)
-    }
-
-    fn cleanup(&self) -> bool {
-        false
+        Ok(Some(extracted))
     }
 }
 
@@ -490,21 +455,26 @@ fn default_compute_and_scale_dtype(dtype: DType) -> (cublasComputeType_t, DType)
     }
 }
 
-fn parse_cublaslt_compute_type(s: &str, default_dtype: DType) -> cublasComputeType_t {
-    let stripped = s.trim_matches('"');
-    match stripped {
+fn parse_cublaslt_compute_type(
+    s: &str,
+    default_dtype: DType,
+) -> Result<cublasComputeType_t, TypedError> {
+    Ok(match s {
         "default" => default_compute_and_scale_dtype(default_dtype).0,
         "64F" => cublasComputeType_t::CUBLAS_COMPUTE_64F,
         "32F" => cublasComputeType_t::CUBLAS_COMPUTE_32F,
         "32F_FAST_16BF" => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
         "32F_FAST_TF32" => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
-        other => panic!("Unknown cuBLASLt compute type: '{other}' (original: '{s}')"),
-    }
+        other => {
+            return Err(TypedError::Decode(format!(
+                "Unknown cuBLASLt compute type: '{other}' (original: '{s}')"
+            )));
+        }
+    })
 }
 
-fn parse_cublaslt_scale_dtype(s: &str, default_dtype: DType) -> DType {
-    let stripped = s.trim_matches('"');
-    match stripped {
+fn parse_cublaslt_scale_dtype(s: &str, default_dtype: DType) -> Result<DType, TypedError> {
+    Ok(match s {
         "default" => default_compute_and_scale_dtype(default_dtype).1,
         "F64" => DType::F64,
         "F32" => DType::F32,
@@ -513,40 +483,43 @@ fn parse_cublaslt_scale_dtype(s: &str, default_dtype: DType) -> DType {
         "TF32" => DType::TF32,
         "F8E4M3" => DType::F8E4M3,
         "F8E5M2" => DType::F8E5M2,
-        other => panic!("Unknown cuBLASLt scale dtype: '{other}' (original: '{s}')"),
-    }
-}
-
-fn parse_cublaslt_scalar(s: &str) -> f64 {
-    let stripped = s.trim_matches('"');
-    stripped.parse::<f64>().unwrap_or_else(|_| {
-        panic!("Unknown cuBLASLt scalar literal: '{stripped}' (original: '{s}')")
+        other => {
+            return Err(TypedError::Decode(format!(
+                "Unknown cuBLASLt scale dtype: '{other}' (original: '{s}')"
+            )));
+        }
     })
 }
 
-fn parse_cublaslt_order(s: &str) -> cublasLtOrder_t {
-    let stripped = s.trim_matches('"');
-    match stripped {
+fn parse_cublaslt_order(s: &str) -> Result<cublasLtOrder_t, TypedError> {
+    Ok(match s {
         "COL" => cublasLtOrder_t::CUBLASLT_ORDER_COL,
         "ROW" => cublasLtOrder_t::CUBLASLT_ORDER_ROW,
         "COL32" => cublasLtOrder_t::CUBLASLT_ORDER_COL32,
         "COL4_4R2_8C" => cublasLtOrder_t::CUBLASLT_ORDER_COL4_4R2_8C,
         "COL32_2R_4R4" => cublasLtOrder_t::CUBLASLT_ORDER_COL32_2R_4R4,
-        other => panic!("Unknown cuBLASLt matrix order: '{other}' (original: '{s}')"),
-    }
+        other => {
+            return Err(TypedError::Decode(format!(
+                "Unknown cuBLASLt matrix order: '{other}' (original: '{s}')"
+            )));
+        }
+    })
 }
 
-fn parse_cublaslt_epilogue(s: &str) -> cublasLtEpilogue_t {
-    let stripped = s.trim_matches('"');
-    match stripped {
+fn parse_cublaslt_epilogue(s: &str) -> Result<cublasLtEpilogue_t, TypedError> {
+    Ok(match s {
         "DEFAULT" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
         "BIAS" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
         "RELU" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
         "RELU_BIAS" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS,
         "GELU" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU,
         "GELU_BIAS" => cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS,
-        other => panic!("Unknown cuBLASLt epilogue: '{other}' (original: '{s}')"),
-    }
+        other => {
+            return Err(TypedError::Decode(format!(
+                "Unknown cuBLASLt epilogue: '{other}' (original: '{s}')"
+            )));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1691,6 +1664,12 @@ impl CuBlasLt {
 }
 
 impl HostOp for CuBlasLt {
+    fn n_inputs(&self) -> usize {
+        2 + usize::from(self.beta != 0.0)
+            + usize::from(epilogue_uses_bias(self.epilogue))
+            + usize::from(self.a_scale_input)
+            + usize::from(self.b_scale_input)
+    }
     fn execute(
         &self,
         stream: &Arc<CudaStream>,
@@ -1845,6 +1824,148 @@ impl HostOp for CuBlasLt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_arguments_preserve_cublaslt_preparation_without_a_device() -> Result<(), TypedError> {
+        use crate::typed_rules::{cublaslt, cublaslt_scaled};
+        use egglog_experimental::typed::{EGraph, let_};
+        use luminal::op::DecodeFn;
+        use luminal::typed_reference::schema::DType as IrDType;
+
+        for (kind, decoder, scaled) in [
+            (
+                cublaslt(
+                    2,
+                    3,
+                    4,
+                    "N",
+                    "T",
+                    "COL",
+                    "ROW",
+                    "COL32",
+                    "COL4_4R2_8C",
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    IrDType::F16(),
+                    IrDType::Bf16(),
+                    IrDType::TF32(),
+                    IrDType::F32(),
+                    "32F_FAST_TF32",
+                    "F32",
+                    2.5,
+                    3.5,
+                    "GELU_BIAS",
+                ),
+                CuBlasLt::decode as DecodeFn,
+                false,
+            ),
+            (
+                cublaslt_scaled(
+                    2,
+                    3,
+                    4,
+                    "N",
+                    "T",
+                    "COL",
+                    "ROW",
+                    "COL32",
+                    "COL4_4R2_8C",
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    IrDType::F16(),
+                    IrDType::Bf16(),
+                    IrDType::TF32(),
+                    IrDType::F32(),
+                    "32F_FAST_TF32",
+                    "F32",
+                    2.5,
+                    3.5,
+                    "GELU_BIAS",
+                ),
+                CuBlasLt::decode_scaled as DecodeFn,
+                true,
+            ),
+        ] {
+            let kind = let_("kind", kind);
+            let mut live = EGraph::default();
+            live.register(&kind)?;
+            let frozen = live.freeze()?;
+            let selected = frozen.nodes(&frozen.lookup(&kind)?)?.next().unwrap();
+            let choices = Default::default();
+            let mut context = DecodeContext::new(&frozen, &choices);
+            let inputs = (0..if scaled { 6 } else { 4 })
+                .map(|i| Ir::Input(i, "input", IrDType::F32()))
+                .collect::<Vec<_>>();
+            // Like the original extractor, preparation does not validate input arity.
+            assert!(
+                decoder(
+                    &selected,
+                    &mut inputs[..inputs.len() - 1].to_vec(),
+                    &mut context
+                )?
+                .is_some()
+            );
+            let prepared = decoder(&selected, &mut inputs.clone(), &mut context)?.unwrap();
+            let op = prepared.to_dialect::<dyn HostOp>().unwrap();
+            let op = op
+                .as_ref()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<CuBlasLt>()
+                .unwrap();
+            for (actual, expected) in [
+                op.m,
+                op.n,
+                op.k,
+                op.lda,
+                op.ldb,
+                op.ldc,
+                op.ldd,
+                op.batch_count,
+                op.stride_a,
+                op.stride_b,
+                op.stride_c,
+                op.stride_d,
+            ]
+            .into_iter()
+            .zip(2..=13)
+            {
+                assert_eq!(actual.exec(&FxHashMap::default()), Some(expected));
+            }
+            assert_eq!(op.transpose_ops(), ("N", "T"));
+            assert_eq!(op.matrix_orders(), ("COL", "ROW", "COL32", "COL4_4R2_8C"));
+            assert_eq!(
+                op.type_tuple(),
+                (
+                    DType::F16,
+                    DType::Bf16,
+                    DType::TF32,
+                    DType::F32,
+                    "32F_FAST_TF32",
+                    DType::F32
+                )
+            );
+            assert_eq!(op.scale_values(), (2.5, 3.5));
+            assert_eq!(op.epilogue(), "GELU_BIAS");
+            assert_eq!(op.tensor_scale_inputs(), (scaled, scaled));
+            assert!(op.cublaslt.get().is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn lt_scalar_packs_f32_scale_values() {

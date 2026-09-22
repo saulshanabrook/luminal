@@ -4,7 +4,6 @@ pub use matmul::*;
 pub use ops::*;
 
 use luminal::dtype::DType;
-use luminal::op::EgglogOp;
 use luminal::prelude::*;
 use metal::{
     Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device,
@@ -143,7 +142,7 @@ pub struct MetalSumReduceInfo {
     pub iter_stride: Expression,
 }
 
-pub trait MetalKernelOp: EgglogOp {
+pub trait MetalKernelOp: std::fmt::Debug {
     fn compile(
         &self,
         device: &Device,
@@ -217,5 +216,3 @@ pub trait MetalKernelOp: EgglogOp {
         false
     }
 }
-
-luminal::impl_into_ops!(MetalKernelOp);

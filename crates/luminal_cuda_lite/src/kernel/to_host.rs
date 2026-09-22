@@ -3,7 +3,6 @@
 //! CudaGraphOp wraps a subgraph of KernelOps into a single executable unit
 //! that can be executed like any other HostOp.
 
-use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 use std::{
     cell::RefCell,
@@ -17,10 +16,9 @@ use cudarc::driver::{
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use luminal::{
-    egglog_utils::base::OP_KIND,
     graph::LLIRGraph,
     hlir::{LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart},
-    op::{EgglogOp, LLIROp},
+    op::LLIROp,
     prelude::{
         petgraph::{Direction, algo::toposort, visit::EdgeRef},
         *,
@@ -629,34 +627,6 @@ impl std::fmt::Debug for CudaGraphOp {
             .field("n_flashinfer", &state.flashinfer_ops.len())
             .field("n_buffer_nodes", &self.buffer_nodes.len())
             .finish()
-    }
-}
-
-impl EgglogOp for CudaGraphOp {
-    fn sort(&self) -> luminal::egglog_utils::api::SortDef {
-        luminal::egglog_utils::api::sort(OP_KIND, "CudaGraphOp", &[])
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn extract<'a>(
-        &'a self,
-        _egraph: &'a luminal::egglog_utils::SerializedEGraph,
-        _kind_children: &[&'a luminal::prelude::ENodeId],
-        _input_enodes: Vec<&'a luminal::prelude::ENodeId>,
-        _list_cache: &mut FxHashMap<&'a luminal::prelude::ENodeId, Vec<Expression>>,
-        _expr_cache: &mut FxHashMap<&'a luminal::prelude::ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a luminal::prelude::ENodeId>) {
-        panic!("CudaGraphOp should not be extracted from egglog")
-    }
-
-    fn cleanup(&self) -> bool {
-        false
     }
 }
 

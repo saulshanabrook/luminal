@@ -9,9 +9,13 @@
 //! "finite-but-wrong logits on some search selections" failure observed on
 //! the full model to a specific genome composition.
 
+use crate::tests::utilities::op_candidates;
+use egglog_experimental::typed::builtins as egg;
+use egglog_experimental::typed::{EgglogValue, FrozenValue, FrozenValueView, get_args};
 use half::bf16;
 use luminal::dtype::DType;
 use luminal::prelude::*;
+use luminal::typed_reference::schema::{EList, IList, Ir, OpKind};
 
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{get_cuda_stream, random_f32_vec, random_i32_vec};
@@ -697,8 +701,26 @@ fn mini_qwen_stage5_exclude_moe_gemv() {
     let d = mini_data();
     let (m, reference, _n_out) = reference_run(5, || {
         let mut m = build_mini_qwen_stage(DType::F32, 5);
-        m.cx.build_search_space_exclude_ops::<CudaRuntime, crate::kernel::moe_gemv::KernelMoEGemv>(
+        let (mut phases, actions) = CudaRuntime::rules();
+        use egglog_experimental::typed::ruleset;
+        use luminal::egglog_utils::RewritePhase::MatmulBackend;
+        let mut matmul = ruleset((
+            &crate::kernel::gemv::kernel_gemv::matmul_backend,
+            &crate::kernel::gemv::kernel_gemv_f8::matmul_backend,
+            &crate::kernel::generic_matmul::rewrites::matmul_backend,
+            &crate::host::cublaslt::rewrites::matmul_backend,
+        ));
+        if crate::device_compute_major() >= 8 {
+            matmul = ruleset((
+                &matmul,
+                &crate::host::flashinfer::flashinfer_attention::matmul_backend,
+            ));
+        }
+        phases.insert(MatmulBackend, matmul);
+        m.cx.build_search_space_with_rules::<CudaRuntime>(
             CompileOptions::default(),
+            phases,
+            actions,
         );
         let mut rt = CudaRuntime::initialize(stream.clone());
         set_inputs(&m, &d, DType::F32, &mut rt);
@@ -731,8 +753,15 @@ fn mini_qwen_stage5_exclude_glumoe() {
     let d = mini_data();
     let (m, reference, _n_out) = reference_run(5, || {
         let mut m = build_mini_qwen_stage(DType::F32, 5);
-        m.cx.build_search_space_exclude_ops::<CudaRuntime, crate::host::moe::GLUMoE>(
+        let (mut phases, actions) = CudaRuntime::rules();
+        phases.insert(
+            luminal::egglog_utils::RewritePhase::Glumoe,
+            egglog_experimental::typed::ruleset(()),
+        );
+        m.cx.build_search_space_with_rules::<CudaRuntime>(
             CompileOptions::default(),
+            phases,
+            actions,
         );
         let mut rt = CudaRuntime::initialize(stream.clone());
         set_inputs(&m, &d, DType::F32, &mut rt);
@@ -768,28 +797,17 @@ fn rms_norm_rule_fires_on_mini_layer() {
     let mut m = build_mini_qwen(DType::Bf16);
     m.cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = m.cx.egraph().unwrap();
-    let kinds_of = |class| {
-        egraph
-            .eclasses
-            .get(class)
-            .map(|(_l, ns)| {
-                ns.iter()
-                    .map(|n| egraph.enodes[n].0.clone())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default()
-    };
-    let mut found = 0;
-    for (_id, (head, children)) in egraph.enodes.iter() {
-        if head == "Op"
-            && !children.is_empty()
-            && kinds_of(&children[0])
-                .iter()
-                .any(|k| k.contains("KernelRMSNorm"))
-        {
-            found += 1;
-        }
-    }
+    let found = op_candidates(egraph, |kind| {
+        egglog_experimental::typed::get_args(kind, |out_shape: &EList, eps: &egg::F64| {
+            crate::typed_rules::kernel_rms_norm(out_shape, eps)
+        })
+        .unwrap()
+        .is_some()
+    })
+    .into_iter()
+    .map(|candidate| candidate[0])
+    .collect::<FxHashSet<_>>()
+    .len();
     // 2 plain norms + 2 QK norms expected in one layer.
     assert!(
         found >= 4,
@@ -804,8 +822,8 @@ fn dump_norm_chain_egglog() {
     let x = cx.tensor((3, 64)).as_dtype(DType::Bf16);
     let w = cx.tensor(64);
     let _out = norm_in_f32(x, w).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
-    println!("{program}");
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    println!("{roots:#?}");
 }
 
 #[test]
@@ -814,8 +832,8 @@ fn dump_argsort_chain_egglog() {
     let mut cx = Graph::default();
     let x = cx.tensor((3, 8));
     let _out = x.stable_argsort(1, true).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
-    println!("{program}");
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    println!("{roots:#?}");
 }
 
 #[test]
@@ -836,13 +854,12 @@ fn rope_rule_fires_and_matches() {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let egraph = cx.egraph().unwrap();
-    let has = egraph.enodes.values().any(|(h, ch)| {
-        h == "Op"
-            && !ch.is_empty()
-            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
-                ns.iter().any(|n| egraph.enodes[n].0.contains("KernelRoPE"))
-            })
-    });
+    let has = !op_candidates(egraph, |kind| {
+        crate::typed_rules::KernelRoPEArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    })
+    .is_empty();
     assert!(has, "rope rule should fire on the bf16 rotary chain");
 
     // CPU reference: half-rotation rope on bf16-rounded inputs.
@@ -906,119 +923,121 @@ fn dump_rotary_post_egglog() {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
 
-    // Render an expression eclass: all enode variants, children rendered
-    // via the first enode of each child eclass (depth-limited).
-    fn render(
-        egraph: &SerializedEGraph,
-        class: &luminal::egglog_utils::ClassId,
-        depth: usize,
-    ) -> String {
+    // Render frozen values directly. The depth bound keeps cyclic alternatives finite.
+    fn render(value: FrozenValue<'_>, depth: usize) -> String {
         if depth == 0 {
-            return "…".to_string();
+            return "…".into();
         }
-        let Some((_l, ns)) = egraph.eclasses.get(class) else {
-            return format!("?{class:?}");
-        };
-        let n = ns.first().unwrap();
-        let (label, children) = &egraph.enodes[n];
-        if children.is_empty() {
-            label.clone()
-        } else {
-            format!(
-                "({label} {})",
-                children
-                    .iter()
-                    .map(|c| render(egraph, c, depth - 1))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        }
-    }
-
-    // Probe: find the final-gather Op (kind = the 2D-data Gather), then dump
-    // every enode in its data-input eclass.
-    for (label, children) in egraph.enodes.values() {
-        if label != "Op" || children.len() != 2 {
-            continue;
-        }
-        let (_kl, kind_nodes) = &egraph.eclasses[&children[0]];
-        let is_final_gather = kind_nodes.iter().any(|kn| {
-            let (kl, kc) = &egraph.enodes[kn];
-            kl == "Gather" && kc.len() == 4 && {
-                // data shape is a 2-element ECons list
-                let (_dl, dsh_nodes) = &egraph.eclasses[&kc[2]];
-                dsh_nodes.iter().any(|dn| {
-                    let (dl, dc) = &egraph.enodes[dn];
-                    dl == "ECons" && dc.len() == 2 && {
-                        let (_tl, tail_nodes) = &egraph.eclasses[&dc[1]];
-                        tail_nodes.iter().any(|tn| {
-                            let (tl, tc) = &egraph.enodes[tn];
-                            tl == "ECons"
-                                && tc.len() == 2
-                                && egraph.eclasses[&tc[1]]
-                                    .1
-                                    .iter()
-                                    .any(|nn| egraph.enodes[nn].0 == "ENil")
-                        })
-                    }
-                })
-            }
-        });
-        if !is_final_gather {
-            continue;
-        }
-        // walk ilist: (ICons fidx (ICons cat (INil)))
-        let (_il, ilist_nodes) = &egraph.eclasses[&children[1]];
-        for iln in ilist_nodes {
-            let (ill, ilc) = &egraph.enodes[iln];
-            if ill != "ICons" {
-                continue;
-            }
-            let (_t2l, tail2) = &egraph.eclasses[&ilc[1]];
-            for t2n in tail2 {
-                let (t2l, t2c) = &egraph.enodes[t2n];
-                if t2l != "ICons" {
-                    continue;
-                }
-                println!("=== cat eclass {:?} enodes:", &t2c[0]);
-                for cn in &egraph.eclasses[&t2c[0]].1 {
-                    let (cl, cc) = &egraph.enodes[cn];
-                    if cl == "Op" && cc.len() == 2 {
-                        let kinds = egraph.eclasses[&cc[0]]
-                            .1
-                            .iter()
-                            .map(|kn| egraph.enodes[kn].0.clone())
+        match value.view() {
+            FrozenValueView::EClass(class) => class
+                .nodes()
+                .next()
+                .map(|node| {
+                    format!(
+                        "({} {})",
+                        node.name(),
+                        node.args()
+                            .map(|arg| render(arg, depth - 1))
                             .collect::<Vec<_>>()
-                            .join("|");
-                        println!("  Op kind=[{kinds}]");
-                    } else {
-                        println!("  {cl} ({} children)", cc.len());
+                            .join(" ")
+                    )
+                })
+                .unwrap_or_else(|| "<no producer>".into()),
+            FrozenValueView::Scalar(value) => format!("{value:?}"),
+            _ => format!("<{} container>", value.sort().name()),
+        }
+    }
+    let alternatives = egraph.alternatives().unwrap();
+    let choices = luminal::egglog_utils::random_initial_choice(
+        &egraph.frozen,
+        &alternatives,
+        &mut rand::rng(),
+    );
+    let mut context = luminal::egglog_utils::DecodeContext::new(&egraph.frozen, &choices);
+    for candidate in op_candidates(egraph, |kind| {
+        luminal::typed_reference::schema::GatherArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    }) {
+        let kind = egraph.frozen.typed_node::<OpKind>(candidate[1].1).unwrap();
+        let Some((_, _, data_shape, _)) = get_args(
+            &kind,
+            |index_shape: &EList,
+             index_strides: &EList,
+             data_shape: &EList,
+             data_strides: &EList| {
+                OpKind::Gather(index_shape, index_strides, data_shape, data_strides)
+            },
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        if context
+            .expressions(&data_shape)
+            .is_ok_and(|shape| shape.len() == 2)
+        {
+            let ir = egraph.frozen.typed_node::<Ir>(candidate[0].1).unwrap();
+            let (_, inputs) = get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+                .unwrap()
+                .unwrap();
+            // Walk every list alternative rather than picking a diagnostic genome.
+            for head in egraph.frozen.nodes(&inputs).unwrap() {
+                if let Some((_, tail)) =
+                    get_args(&head, |head: &Ir, tail: &IList| IList::ICons(head, tail)).unwrap()
+                {
+                    for tail in egraph.frozen.nodes(&tail).unwrap() {
+                        if let Some((data, _)) =
+                            get_args(&tail, |head: &Ir, tail: &IList| IList::ICons(head, tail))
+                                .unwrap()
+                        {
+                            let FrozenValueView::EClass(class) =
+                                egraph.frozen.as_view(&data).unwrap().view()
+                            else {
+                                unreachable!()
+                            };
+                            println!("=== cat data class {:?}:", class);
+                            for node in class.nodes() {
+                                println!(
+                                    "  {} [{}]",
+                                    node.name(),
+                                    node.args()
+                                        .map(|arg| render(arg, 5))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
     }
-
-    for (label, children) in egraph.enodes.values() {
-        if label.contains("KernelRoPE") {
-            println!(
-                "KernelRoPE marker: ln_theta[{}]",
-                render(egraph, &children[2], 2)
-            );
-        }
-        if label == "Iota" {
-            println!(
-                "Iota: expr[{}] range[{}]",
-                render(egraph, &children[0], 12),
-                render(egraph, &children[1], 4),
-            );
-        }
-        if label == "Gather" {
-            println!(
-                "Gather: dsh[{}] dstr[{}]",
-                render(egraph, &children[2], 8),
-                render(egraph, &children[3], 10),
-            );
+    for class in egraph
+        .frozen
+        .eclasses()
+        .filter(|class| class.sort() == OpKind::sort_ref())
+    {
+        for node in class.nodes() {
+            let kind = egraph.frozen.typed_node::<OpKind>(node).unwrap();
+            if crate::typed_rules::KernelRoPEArgs::get_args(&kind)
+                .unwrap()
+                .is_some()
+                || luminal::typed_reference::schema::IotaArgs::get_args(&kind)
+                    .unwrap()
+                    .is_some()
+                || luminal::typed_reference::schema::GatherArgs::get_args(&kind)
+                    .unwrap()
+                    .is_some()
+            {
+                println!(
+                    "{}: [{}]",
+                    node.name(),
+                    node.args()
+                        .map(|arg| render(arg, 12))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
     }
 }
@@ -1080,8 +1099,8 @@ fn dump_rotary_chain_egglog() {
     let x = cx.tensor((S, Q_DIM)).cast(DType::Bf16);
     let pos = cx.tensor(S).as_dtype(DType::Int);
     let _out = rotary(x, pos, N_HEADS).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
-    println!("{program}");
+    let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
+    println!("{roots:#?}");
 }
 
 #[test]
@@ -1098,14 +1117,14 @@ fn stable_ranks_rule_fires_and_matches() {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let egraph = cx.egraph().unwrap();
-    let has = egraph.enodes.values().any(|(h, ch)| {
-        h == "Op"
-            && !ch.is_empty()
-            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
-                ns.iter()
-                    .any(|n| egraph.enodes[n].0.contains("KernelStableSortIdx"))
-            })
-    });
+    let has = !op_candidates(egraph, |kind| {
+        egglog_experimental::typed::get_args(kind, |out_shape: &EList| {
+            crate::typed_rules::kernel_stable_sort_idx(out_shape)
+        })
+        .unwrap()
+        .is_some()
+    })
+    .is_empty();
     assert!(has, "stable ranks rule should fire on the topk chain");
 
     // CPU reference: stable descending argsort, top-4.

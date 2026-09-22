@@ -1,3 +1,4 @@
+pub mod typed_rules;
 // Allow files path-included into this crate's tests (e.g. the llama example
 // model in search_equivalence_fuzz.rs) to keep their normal
 // `use luminal_cuda_lite::...` imports.

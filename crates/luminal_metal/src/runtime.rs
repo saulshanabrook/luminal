@@ -318,20 +318,153 @@ impl MetalRuntime {
 }
 
 impl Runtime for MetalRuntime {
-    type Ops = crate::kernel::MetalOps;
+    const DECODERS: &'static [luminal::op::DecodeFn] = &[
+        crate::kernel::prepare_exp2,
+        crate::kernel::prepare_log2,
+        crate::kernel::prepare_sin,
+        crate::kernel::prepare_sqrt,
+        crate::kernel::prepare_recip,
+        crate::kernel::MetalAdd::decode,
+        crate::kernel::MetalMul::decode,
+        crate::kernel::MetalMod::decode,
+        crate::kernel::MetalLessThan::decode,
+        crate::kernel::MetalSumReduce::decode,
+        crate::kernel::MetalMaxReduce::decode,
+        crate::kernel::MPSMatmul::decode,
+        crate::kernel::MPSBatchedMatmul::decode,
+        crate::kernel::GenericMatmul::decode,
+        crate::kernel::MetalConstant::decode,
+        crate::kernel::MetalIota::decode,
+        crate::kernel::MetalGather::decode,
+        crate::kernel::MetalScatter::decode,
+        crate::kernel::MetalScatterNoCopy::decode,
+        crate::kernel::MetalCast::decode,
+    ];
+
+    fn cleanup_ignored(
+        kind: &luminal::typed_reference::schema::OpKind,
+    ) -> Result<bool, egglog_experimental::typed::TypedError> {
+        use crate::typed_rules::*;
+        use egglog_experimental::typed::{builtins as egg, get_args};
+        use luminal::typed_reference::schema::{DType, DimExpr, EList};
+        // Exactly the constructors declared as IR, rather than OpKind, at HEAD.
+        Ok(
+            get_args(kind, |value: &egg::F64| metal_constant(value))?.is_some()
+                || get_args(kind, |expr: &DimExpr, range: &DimExpr| {
+                    metal_iota(expr, range)
+                })?
+                .is_some()
+                || get_args(kind, |size: &DimExpr, dtype: &DType| {
+                    metal_cast(size, dtype)
+                })?
+                .is_some()
+                || get_args(
+                    kind,
+                    |shape: &EList, index: &EList, data: &EList, strides: &EList, out: &EList| {
+                        metal_gather(shape, index, data, strides, out)
+                    },
+                )?
+                .is_some()
+                || get_args(
+                    kind,
+                    |shape: &EList,
+                     dest: &EList,
+                     index_shape: &EList,
+                     index: &EList,
+                     src: &EList,
+                     out: &EList| {
+                        metal_scatter(shape, dest, index_shape, index, src, out)
+                    },
+                )?
+                .is_some()
+                || MPSMatmulArgs::get_args(kind)?.is_some()
+                || MPSBatchedMatmulArgs::get_args(kind)?.is_some()
+                || GenericMatmulArgs::get_args(kind)?.is_some(),
+        )
+    }
+
+    fn rules() -> (
+        luminal::egglog_utils::PhaseRules,
+        Vec<egglog_experimental::typed::Action>,
+    ) {
+        use egglog_experimental::typed::ruleset;
+        use luminal::egglog_utils::{RewritePhase::*, base_phase_rules};
+        let mut phases = base_phase_rules();
+        phases.insert(LateAnalysis, crate::memory_analysis::rules());
+        phases.insert(
+            KernelLower,
+            ruleset((
+                &phases[&KernelLower],
+                &crate::kernel::metal_exp2::kernel_lower,
+                &crate::kernel::metal_log2::kernel_lower,
+                &crate::kernel::metal_sin::kernel_lower,
+                &crate::kernel::metal_sqrt::kernel_lower,
+                &crate::kernel::metal_recip::kernel_lower,
+                &crate::kernel::metal_add::kernel_lower,
+                &crate::kernel::metal_mul::kernel_lower,
+                &crate::kernel::metal_mod::kernel_lower,
+                &crate::kernel::metal_less_than::kernel_lower,
+                &crate::kernel::metal_sum::kernel_lower,
+                &crate::kernel::metal_max::kernel_lower,
+                &crate::kernel::m_p_s_matmul::kernel_lower,
+                &crate::kernel::m_p_s_batched_matmul::kernel_lower,
+                &crate::kernel::metal_constant::kernel_lower,
+                &crate::kernel::metal_iota::kernel_lower,
+                &crate::kernel::metal_gather::kernel_lower,
+                &crate::kernel::metal_scatter::kernel_lower,
+                &crate::kernel::metal_cast::kernel_lower,
+            )),
+        );
+        phases.insert(
+            MatmulBackend,
+            ruleset((
+                &phases[&MatmulBackend],
+                &crate::kernel::generic_matmul::matmul_backend,
+            )),
+        );
+        phases.insert(
+            Cleanup,
+            ruleset((
+                &phases[&Cleanup],
+                &crate::kernel::m_p_s_matmul::cleanup,
+                &crate::kernel::m_p_s_batched_matmul::cleanup,
+                &crate::kernel::generic_matmul::cleanup,
+                &crate::kernel::metal_scatter_no_copy::cleanup,
+            )),
+        );
+        phases.insert(
+            BufferReuse,
+            ruleset((
+                &phases[&BufferReuse],
+                &crate::kernel::metal_scatter_no_copy::buffer_reuse,
+            )),
+        );
+        phases.insert(
+            DtypeProp,
+            ruleset((
+                &phases[&DtypeProp],
+                &crate::kernel::metal_scatter_no_copy::dtype_prop,
+            )),
+        );
+        phases.insert(
+            PostCleanup,
+            ruleset((
+                &phases[&PostCleanup],
+                &crate::kernel::metal_scatter_no_copy::post_cleanup,
+            )),
+        );
+        phases.insert(
+            BaseCleanup,
+            ruleset((
+                &phases[&BaseCleanup],
+                &crate::kernel::metal_scatter_no_copy::base_cleanup,
+            )),
+        );
+        (phases, Vec::new())
+    }
     type CompileArg = ();
     type ExecReturn = ();
     type ProfileMetric = Duration;
-
-    fn late_egglog_passes(
-        ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
-        _options: &luminal::graph::CompileOptions,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
-        vec![crate::memory_analysis::metal_memory_analysis_pass(
-            ops, None, dyn_map,
-        )]
-    }
 
     fn initialize(_: Self::CompileArg) -> Self {
         let device = Device::system_default().expect("No Metal device found!");

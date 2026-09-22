@@ -15,8 +15,3 @@ pub mod region_codegen;
 
 pub use elementwise::{CudaBinaryElementwise, CudaUnaryElementwise};
 pub use markers::{FusionEnd, FusionStart};
-
-/// All fusion-related op types that the egglog runtime needs to know about
-/// (markers + interior generic elementwise variants). Combined into a flat
-/// tuple for the `Ops` registry in `kernel::mod`.
-pub type Ops = (markers::Ops, elementwise::Ops);

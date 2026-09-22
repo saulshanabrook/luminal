@@ -1,20 +1,17 @@
-//! Core analysis functions for egglog debugging.
-
+//! Diagnostic queries over typed captures and immutable observations.
 use super::{
     DTypeChainAnalysis, DTypeStatus, DependencyGraph, FactStatus, FunctionChainAnalysis,
     FunctionTraceEntry,
 };
-use egraph_serialize::ClassId;
-use luminal::egglog_utils;
-use luminal::hlir::HLIROps;
-use luminal::op::{EgglogOp, IntoEgglogOp, Runtime};
-use luminal::prelude::egglog;
-use luminal::prelude::egglog::prelude::exprs;
-use luminal::prelude::egglog_ast::{RustSpan, Span};
-use luminal::prelude::*;
+use egglog_experimental::typed::{
+    FrozenEClass, FrozenEGraph, FrozenValue, FrozenValueView, prelude::*,
+};
+use luminal::{
+    egglog_utils::{Alternatives, SearchSpace, final_phases, main_schedule},
+    op::Runtime,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// Analysis result for lowering.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -83,468 +80,316 @@ pub struct ChildInspection {
     pub dtype: Option<String>,
 }
 
-fn find_let_line(program: &str, var: &str) -> Option<String> {
-    for line in program.lines() {
-        let line = line.trim();
-        if line.starts_with("(let ") && line.split_whitespace().nth(1) == Some(var) {
-            return Some(line.to_string());
-        }
+/// Run the same recipe with either HLIR-only or backend declarations.
+/// Source aliases are captures only in this diagnostic destination.
+pub fn run_egraph<R: Runtime>(program: &DependencyGraph) -> Result<SearchSpace, TypedError> {
+    let (phases, actions) = R::rules();
+    let mut egraph = EGraph::new(EGraphOptions::default());
+    egraph.register(actions)?;
+    for name in &program.order {
+        egraph.register(&program.captures[name])?;
     }
-    None
-}
-
-fn run_egraph(program: &str, ops: Vec<Arc<Box<dyn EgglogOp>>>) -> egglog::EGraph {
-    let code = egglog_utils::full_egglog(program, &ops, false);
-    let mut egraph = egglog::EGraph::default();
-    let commands = egraph.parser.get_program_from_string(None, &code).unwrap();
-    let _outputs = egraph.run_program(commands).unwrap();
-    egraph
-}
-
-fn annotate_dtypes(graph: &mut DependencyGraph, egraph: &mut egglog::EGraph) {
-    for node in graph.nodes.values_mut() {
-        node.dtype = Some(eval_dtype(egraph, &node.var));
+    // The original diagnostic full_egglog recipe runs one saturated main
+    // schedule plus final phases, without the production driver's outer loop.
+    egraph.run(main_schedule(&phases, false))?;
+    for (_, schedule) in final_phases(&phases, false) {
+        egraph.run(schedule)?;
     }
+    SearchSpace::from_frozen(egraph.freeze()?, &[])
 }
 
-fn class_labels(serialized: &egglog_utils::SerializedEGraph, class_id: &ClassId) -> Vec<String> {
-    let Some((_, nodes)) = serialized.eclasses.get(class_id) else {
-        return vec!["<missing>".to_string()];
-    };
-    let mut labels: Vec<String> = nodes
-        .iter()
-        .filter_map(|node_id| {
-            serialized
-                .enodes
-                .get(node_id)
-                .map(|(label, _)| label.clone())
-        })
+fn class_labels<'f>(class: FrozenEClass<'f>, alternatives: &Alternatives<'f>) -> Vec<String> {
+    let mut labels: Vec<_> = alternatives
+        .get(&class)
+        .into_iter()
+        .flatten()
+        .map(|node| node.name().to_owned())
         .collect();
     labels.sort();
     labels.dedup();
     labels
 }
 
-fn class_type(serialized: &egglog_utils::SerializedEGraph, class_id: &ClassId) -> String {
-    serialized
-        .eclasses
-        .get(class_id)
-        .map(|(typ, _)| typ.clone())
-        .unwrap_or_else(|| "<missing>".to_string())
+/// Read an existing unary table row. No primitive evaluation, insertion or extraction.
+fn function_value<'f>(
+    frozen: &'f FrozenEGraph,
+    name: &str,
+    input: FrozenValue<'f>,
+) -> Option<FrozenValue<'f>> {
+    frozen
+        .tables()
+        .filter(|table| table.name() == name && table.inputs() == [input.sort()])
+        .flat_map(|table| table.rows())
+        .find(|row| row.args().next() == Some(input))
+        .map(|row| row.output())
 }
 
-fn collect_dtype_facts(serialized: &egglog_utils::SerializedEGraph) -> FxHashMap<ClassId, String> {
-    let mut map: FxHashMap<ClassId, String> = FxHashMap::default();
-    for (node_id, (label, children)) in &serialized.enodes {
-        if !label.starts_with("dtype") {
-            continue;
-        }
-        if children.is_empty() {
-            continue;
-        }
-        let input_class = children[0].clone();
-        let dtype_class = serialized.node_to_class[node_id].clone();
-        let dtype_labels = class_labels(serialized, &dtype_class);
-        let dtype_label = dtype_labels
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "<unknown>".to_string());
-        map.insert(input_class, dtype_label);
-    }
-    map
-}
-
-fn eval_function(egraph: &mut egglog::EGraph, fn_name: &str, var: &str) -> FactStatus {
-    let expr = exprs::call(fn_name, vec![exprs::var(var)]);
-    match egraph.eval_expr(&expr) {
-        Ok((sort, value)) => match egraph.extract_value_to_string(&sort, value) {
-            Ok((s, _)) => FactStatus::Resolved(s),
-            Err(_) => FactStatus::Missing("extract-error".to_string()),
-        },
-        Err(err) => FactStatus::Missing(format!("{err}")),
+fn describe<'f>(value: FrozenValue<'f>, alternatives: &Alternatives<'f>) -> String {
+    match value.view() {
+        FrozenValueView::EClass(class) => class_labels(class, alternatives).join("|"),
+        _ => luminal::visualization::display_frozen_value(value),
     }
 }
 
-/// Inspect a specific var with a given set of ops.
-pub fn inspect_var_with_ops(
-    program: &str,
-    ops: Vec<Arc<Box<dyn EgglogOp>>>,
+fn eval_function<'f>(
+    frozen: &'f FrozenEGraph,
+    alternatives: &Alternatives<'f>,
+    program: &DependencyGraph,
+    name: &str,
+    var: &str,
+) -> FactStatus {
+    let result = (|| {
+        let capture = program
+            .captures
+            .get(var)
+            .ok_or_else(|| format!("unknown variable {var}"))?;
+        let observed = frozen.lookup(capture).map_err(|error| error.to_string())?;
+        let input = frozen
+            .as_view(&observed)
+            .map_err(|error| error.to_string())?;
+        function_value(frozen, name, input)
+            .map(|value| describe(value, alternatives))
+            .ok_or_else(|| format!("no {name} row for {var}"))
+    })();
+    match result {
+        Ok(value) => FactStatus::Resolved(value),
+        Err(error) => FactStatus::Missing(error),
+    }
+}
+
+fn inspect_child<'f>(
+    frozen: &'f FrozenEGraph,
+    alternatives: &Alternatives<'f>,
+    value: FrozenValue<'f>,
+) -> ChildInspection {
+    let (class_id, class_labels) = match value.view() {
+        FrozenValueView::EClass(class) => (
+            format!(
+                "class {}",
+                frozen
+                    .eclasses()
+                    .position(|candidate| candidate == class)
+                    .unwrap()
+            ),
+            class_labels(class, alternatives),
+        ),
+        _ => (
+            describe(value, alternatives),
+            vec![describe(value, alternatives)],
+        ),
+    };
+    ChildInspection {
+        class_id,
+        class_type: value.sort().name().to_owned(),
+        class_labels,
+        dtype: function_value(frozen, "dtype", value).map(|value| describe(value, alternatives)),
+    }
+}
+
+/// Inspect one retained source alias without evaluating its initializer.
+pub fn inspect_var(
+    space: &SearchSpace,
+    program: &DependencyGraph,
     var: &str,
     label: &str,
 ) -> VarInspection {
-    let mut egraph = run_egraph(program, ops);
-    let let_line = find_let_line(program, var);
-
-    let mut inspection = VarInspection {
-        label: label.to_string(),
-        var: var.to_string(),
-        let_line,
+    let frozen = &space.frozen;
+    let alternatives = space
+        .alternatives()
+        .expect("rootless diagnostic observation");
+    let mut result = VarInspection {
+        label: label.to_owned(),
+        var: var.to_owned(),
+        let_line: program.lines.get(var).cloned(),
         ..Default::default()
     };
-
-    let var_expr = egglog::var!(var.to_string());
-    let (sort, value) = match egraph.eval_expr(&var_expr) {
-        Ok(res) => res,
-        Err(err) => {
-            inspection.eval_error = Some(format!("{err}"));
-            return inspection;
+    let observed = program
+        .captures
+        .get(var)
+        .ok_or_else(|| format!("unknown variable {var}"))
+        .and_then(|capture| frozen.lookup(capture).map_err(|error| error.to_string()));
+    let observed = match observed {
+        Ok(value) => value,
+        Err(error) => {
+            result.eval_error = Some(error);
+            return result;
         }
     };
-
-    let serialized = egglog_utils::SerializedEGraph::new(&egraph, vec![(sort, value)]);
-    let dtype_facts = collect_dtype_facts(&serialized);
-
-    let class_id = serialized.roots.first().cloned();
-    if let Some(class_id) = class_id {
-        inspection.class_id = Some(format!("{:?}", class_id));
-        inspection.class_type = Some(class_type(&serialized, &class_id));
-        inspection.class_labels = class_labels(&serialized, &class_id);
-        inspection.dtype = dtype_facts.get(&class_id).cloned();
-
-        if let Some((_, nodes)) = serialized.eclasses.get(&class_id) {
-            for node_id in nodes {
-                let Some((label, children)) = serialized.enodes.get(node_id) else {
-                    continue;
-                };
-                let mut enode = EnodeInspection {
-                    label: label.clone(),
-                    ..Default::default()
-                };
-                for child in children {
-                    let child_labels = class_labels(&serialized, child);
-                    let child_type = class_type(&serialized, child);
-                    let dtype = dtype_facts.get(child).cloned();
-                    enode.children.push(ChildInspection {
-                        class_id: format!("{:?}", child),
-                        class_type: child_type,
-                        class_labels: child_labels,
-                        dtype,
-                    });
-                }
-                inspection.enodes.push(enode);
-            }
+    let value = match frozen.as_view(&observed) {
+        Ok(value) => value,
+        Err(error) => {
+            result.eval_error = Some(error.to_string());
+            return result;
         }
+    };
+    let child = inspect_child(frozen, &alternatives, value);
+    result.class_id = Some(child.class_id);
+    result.class_type = Some(child.class_type);
+    result.class_labels = child.class_labels;
+    result.dtype = child.dtype;
+    if let FrozenValueView::EClass(class) = value.view() {
+        result.enodes = alternatives
+            .get(&class)
+            .into_iter()
+            .flatten()
+            .map(|node| EnodeInspection {
+                label: node.name().to_owned(),
+                children: node
+                    .args()
+                    .map(|arg| inspect_child(frozen, &alternatives, arg))
+                    .collect(),
+            })
+            .collect();
     }
-
-    inspection
+    result
 }
 
-/// Inspect a specific var using HLIR-only ops.
-pub fn inspect_var_hlir(program: &str, var: &str) -> VarInspection {
-    let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-    inspect_var_with_ops(program, hlir_ops, var, "HLIR")
-}
-
-/// Evaluate dtype for a variable in an egraph.
-pub fn eval_dtype(egraph: &mut egglog::EGraph, var: &str) -> DTypeStatus {
-    let expr = egglog::call!("dtype", vec![egglog::var!(var.to_string())]);
-    match egraph.eval_expr(&expr) {
-        Ok((sort, value)) => match egraph.extract_value_to_string(&sort, value) {
-            Ok((s, _)) => DTypeStatus::Resolved(s),
-            Err(_) => DTypeStatus::Missing("extract-error".to_string()),
-        },
-        Err(err) => DTypeStatus::Missing(format!("{err}")),
-    }
-}
-
-/// Analyze backend lowering for a specific HLIR op -> backend op mapping.
-pub fn analyze_op_lowering_with_ops(
-    program: &str,
-    ops: Vec<Arc<Box<dyn EgglogOp>>>,
-    hlir_op: &str,
-    backend_op: &str,
-    label: &str,
-) -> OpLoweringReport {
-    let mut egraph = run_egraph(program, ops);
-    let (sort, value) = egraph
-        .eval_expr(&egglog::var!("t0"))
-        .or_else(|_| egraph.eval_expr(&egglog::var!("t1")))
-        .unwrap_or_else(|_| {
-            panic!("failed to eval any root variable (t0/t1) for op inspection");
-        });
-    let serialized = egglog_utils::SerializedEGraph::new(&egraph, vec![(sort, value)]);
-    let dtype_facts = collect_dtype_facts(&serialized);
-
-    let mut eclass_has_backend: FxHashSet<ClassId> = FxHashSet::default();
-    for (node_id, (lbl, _)) in &serialized.enodes {
-        if lbl == backend_op {
-            eclass_has_backend.insert(serialized.node_to_class[node_id].clone());
-        }
-    }
-
-    let mut seen_classes: FxHashSet<ClassId> = FxHashSet::default();
-    let mut missing: Vec<OpMissing> = Vec::new();
-    for (node_id, (lbl, children)) in &serialized.enodes {
-        if lbl != hlir_op {
-            continue;
-        }
-        let class_id = &serialized.node_to_class[node_id];
-        if seen_classes.contains(class_id) {
-            continue;
-        }
-        seen_classes.insert(class_id.clone());
-        if eclass_has_backend.contains(class_id) {
-            continue;
-        }
-        let mut child_summaries = Vec::new();
-        for child in children {
-            let labels = class_labels(&serialized, child);
-            let typ = class_type(&serialized, child);
-            let dtype = dtype_facts.get(child).cloned();
-            child_summaries.push(ChildInspection {
-                class_id: format!("{:?}", child),
-                class_type: typ,
-                class_labels: labels,
-                dtype,
-            });
-        }
-        missing.push(OpMissing {
-            class_id: format!("{:?}", class_id),
-            op: hlir_op.to_string(),
-            children: child_summaries,
-        });
-    }
-
-    OpLoweringReport {
-        label: label.to_string(),
-        hlir_op: hlir_op.to_string(),
-        backend_op: backend_op.to_string(),
-        total_classes: seen_classes.len(),
-        missing,
-    }
-}
-
-/// Analyze backend lowering for a specific HLIR op using a runtime's ops.
-pub fn analyze_backend_op_lowering<R: Runtime>(
-    program: &str,
-    hlir_op: &str,
-    backend_op: &str,
-) -> OpLoweringReport
-where
-    R::Ops: IntoEgglogOp,
-{
-    let mut backend_ops = R::Ops::into_vec();
-    backend_ops.extend(<HLIROps as IntoEgglogOp>::into_vec());
-    let label = format!(
-        "{}+HLIR",
-        std::any::type_name::<R>()
-            .split("::")
-            .last()
-            .unwrap_or("Backend")
-    );
-    analyze_op_lowering_with_ops(program, backend_ops, hlir_op, backend_op, &label)
-}
-
-/// Analyze lowering with a specific set of ops.
-///
-/// This is the core analysis function that works with any set of ops.
-/// Use `analyze_lowering` for convenience when working with a specific backend.
-pub fn analyze_with_ops(
-    program: &str,
-    root: &str,
-    ops: Vec<Arc<Box<dyn EgglogOp>>>,
+/// Preserve report structure and the original global op-coverage scope.
+pub fn analyze(
+    space: &SearchSpace,
+    program: &DependencyGraph,
     label: &str,
     fact_queries: &[FactQuery],
     op_mappings: &[(String, String)],
 ) -> LoweringAnalysis {
-    let mut egraph = run_egraph(program, ops);
-
-    let (sort, value) = egraph.eval_expr(&egglog::var!(root)).unwrap();
-    let serialized = egglog_utils::SerializedEGraph::new(&egraph, vec![(sort, value)]);
-    let dtype_facts = collect_dtype_facts(&serialized);
-
-    let root_class_id = serialized.roots.first().unwrap();
-    let root_labels = class_labels(&serialized, root_class_id);
-
+    let frozen = &space.frozen;
+    let alternatives = space
+        .alternatives()
+        .expect("rootless diagnostic observation");
     let mut analysis = LoweringAnalysis {
-        label: label.to_string(),
-        root_labels,
-        output_input_labels: Vec::new(),
-        op_reports: Vec::new(),
-        facts: BTreeMap::new(),
+        label: label.to_owned(),
+        ..Default::default()
     };
-
-    // Output input labels (if any Output exists under this root).
-    for (lbl, children) in serialized.enodes.values() {
-        if lbl != "Output" || children.is_empty() {
-            continue;
-        }
-        analysis.output_input_labels = class_labels(&serialized, &children[0]);
-        break;
+    for root in &program.roots {
+        let inspection = inspect_var(space, program, root, label);
+        analysis.root_labels.extend(inspection.class_labels);
     }
-
-    // Op coverage reports (only when explicitly requested).
-    for (hlir_op, backend_op) in op_mappings {
-        // Determine which eclasses contain the backend op.
-        let mut eclass_has_backend: FxHashSet<ClassId> = FxHashSet::default();
-        for (node_id, (lbl, _)) in &serialized.enodes {
-            if lbl == backend_op {
-                eclass_has_backend.insert(serialized.node_to_class[node_id].clone());
+    analysis.root_labels.sort();
+    analysis.root_labels.dedup();
+    for class in frozen.eclasses() {
+        if let Some(output) = alternatives
+            .get(&class)
+            .into_iter()
+            .flatten()
+            .find(|node| node.name() == "Output")
+        {
+            if let Some(input) = output.args().next() {
+                analysis.output_input_labels =
+                    inspect_child(frozen, &alternatives, input).class_labels;
             }
+            break;
         }
-
-        let mut seen_classes: FxHashSet<ClassId> = FxHashSet::default();
-        let mut missing: Vec<OpMissing> = Vec::new();
-        for (node_id, (lbl, children)) in &serialized.enodes {
-            if lbl != hlir_op {
+    }
+    for (source, backend) in op_mappings {
+        let mut report = OpLoweringReport {
+            label: label.to_owned(),
+            hlir_op: source.clone(),
+            backend_op: backend.clone(),
+            ..Default::default()
+        };
+        for (index, class) in frozen.eclasses().enumerate() {
+            let nodes: Vec<_> = alternatives.get(&class).into_iter().flatten().collect();
+            let source_nodes: Vec<_> = nodes.iter().filter(|node| node.name() == source).collect();
+            if source_nodes.is_empty() {
                 continue;
             }
-            let class_id = &serialized.node_to_class[node_id];
-            if !seen_classes.insert(class_id.clone()) {
+            report.total_classes += 1;
+            if nodes.iter().any(|node| node.name() == backend) {
                 continue;
             }
-            if eclass_has_backend.contains(class_id) {
-                continue;
-            }
-            let mut child_summaries = Vec::new();
-            for child in children {
-                child_summaries.push(ChildInspection {
-                    class_id: format!("{:?}", child),
-                    class_type: class_type(&serialized, child),
-                    class_labels: class_labels(&serialized, child),
-                    dtype: dtype_facts.get(child).cloned(),
-                });
-            }
-            missing.push(OpMissing {
-                class_id: format!("{:?}", class_id),
-                op: hlir_op.clone(),
-                children: child_summaries,
+            report.missing.push(OpMissing {
+                class_id: format!("class {index}"),
+                op: source.clone(),
+                children: source_nodes[0]
+                    .args()
+                    .map(|value| inspect_child(frozen, &alternatives, value))
+                    .collect(),
             });
         }
-
-        analysis.op_reports.push(OpLoweringReport {
-            label: label.to_string(),
-            hlir_op: hlir_op.clone(),
-            backend_op: backend_op.clone(),
-            total_classes: seen_classes.len(),
-            missing,
-        });
+        analysis.op_reports.push(report);
     }
-
-    // Evaluate requested facts.
-    for q in fact_queries {
-        let mut table: BTreeMap<String, FactStatus> = BTreeMap::new();
-        for var in &q.vars {
-            table.insert(var.clone(), eval_function(&mut egraph, &q.fn_name, var));
-        }
-        analysis.facts.insert(q.fn_name.clone(), table);
+    for query in fact_queries {
+        analysis.facts.insert(
+            query.fn_name.clone(),
+            query
+                .vars
+                .iter()
+                .map(|var| {
+                    (
+                        var.clone(),
+                        eval_function(frozen, &alternatives, program, &query.fn_name, var),
+                    )
+                })
+                .collect(),
+        );
     }
-
     analysis
 }
 
-/// Analyze dtype propagation chain for a specific variable with a given set of ops.
-pub fn analyze_dtype_chain_with_ops(
-    program: &str,
-    ops: Vec<Arc<Box<dyn EgglogOp>>>,
+pub fn analyze_dtype_chain(
+    space: &SearchSpace,
+    program: &DependencyGraph,
     target: &str,
 ) -> DTypeChainAnalysis {
-    let mut egraph = run_egraph(program, ops);
-    let mut graph = DependencyGraph::from_program(program);
-    annotate_dtypes(&mut graph, &mut egraph);
-    DTypeChainAnalysis::analyze(&graph, target)
-}
-
-/// Analyze dtype propagation chain for a specific variable using HLIR-only ops.
-pub fn analyze_hlir_dtype_chain(program: &str, target: &str) -> DTypeChainAnalysis {
-    let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-    analyze_dtype_chain_with_ops(program, hlir_ops, target)
-}
-
-/// Analyze function propagation chain for a specific variable with a given set of ops.
-pub fn analyze_function_chain_with_ops(
-    program: &str,
-    ops: Vec<Arc<Box<dyn EgglogOp>>>,
-    fn_name: &str,
-    target: &str,
-) -> FunctionChainAnalysis {
-    let mut egraph = run_egraph(program, ops);
-    let graph = DependencyGraph::from_program(program);
-    let trace = graph.trace_back(target, 20);
-    let mut chain = Vec::new();
-    let mut first_missing = None;
-
-    for entry in trace {
-        let status = eval_function(&mut egraph, fn_name, &entry.var);
-        if first_missing.is_none() && status.is_missing() {
-            first_missing = Some(entry.var.clone());
+    let frozen = &space.frozen;
+    let alternatives = space
+        .alternatives()
+        .expect("rootless diagnostic observation");
+    let mut chain = program.trace_back(target, 20);
+    for entry in &mut chain {
+        if !program.nodes.contains_key(&entry.var) {
+            continue;
         }
-        chain.push(FunctionTraceEntry {
-            depth: entry.depth,
-            var: entry.var,
-            op_type: entry.op_type,
-            status,
-        });
+        entry.dtype = Some(
+            match eval_function(frozen, &alternatives, program, "dtype", &entry.var) {
+                FactStatus::Resolved(value) => DTypeStatus::Resolved(value),
+                FactStatus::Missing(error) => DTypeStatus::Missing(error),
+            },
+        );
     }
-
+    let first_missing = chain
+        .iter()
+        .find(|entry| matches!(&entry.dtype, Some(DTypeStatus::Missing(_))))
+        .map(|entry| entry.var.clone());
     let all_resolved = first_missing.is_none();
-    FunctionChainAnalysis {
-        target: target.to_string(),
-        fn_name: fn_name.to_string(),
+    DTypeChainAnalysis {
+        target: target.to_owned(),
         chain,
         first_missing,
         all_resolved,
     }
 }
 
-/// Analyze function propagation chain for a specific variable using HLIR-only ops.
-pub fn analyze_hlir_function_chain(
-    program: &str,
-    fn_name: &str,
+pub fn analyze_function_chain(
+    space: &SearchSpace,
+    program: &DependencyGraph,
+    name: &str,
     target: &str,
 ) -> FunctionChainAnalysis {
-    let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-    analyze_function_chain_with_ops(program, hlir_ops, fn_name, target)
-}
-
-/// Run full lowering analysis comparing HLIR-only vs Backend+HLIR.
-///
-/// This is a generic function that works with any backend implementing `Runtime`.
-///
-/// # Type Parameters
-/// * `R` - The runtime type (e.g., `MetalRuntime`, `CudaRuntime`)
-///
-/// # Arguments
-/// * `program` - The egglog program string
-/// * `root` - The root variable name
-/// * `backend_add_name` - The name of the backend's Add operation (e.g., "MetalAdd")
-pub fn analyze_lowering<R: Runtime>(
-    program: &str,
-    root: &str,
-    fact_queries: &[FactQuery],
-    op_mappings: &[(String, String)],
-) -> (LoweringAnalysis, LoweringAnalysis)
-where
-    R::Ops: IntoEgglogOp,
-{
-    // HLIR-only analysis
-    let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-    let hlir_analysis = analyze_with_ops(program, root, hlir_ops, "HLIR", fact_queries, &[]);
-
-    // Backend+HLIR analysis
-    let mut backend_ops = R::Ops::into_vec();
-    backend_ops.extend(<HLIROps as IntoEgglogOp>::into_vec());
-    let backend_label = format!(
-        "{}+HLIR",
-        std::any::type_name::<R>()
-            .split("::")
-            .last()
-            .unwrap_or("Backend")
-    );
-    let backend_analysis = analyze_with_ops(
-        program,
-        root,
-        backend_ops,
-        &backend_label,
-        fact_queries,
-        op_mappings,
-    );
-
-    (hlir_analysis, backend_analysis)
-}
-
-/// Convenience function for HLIR-only analysis (no backend).
-pub fn analyze_hlir_only(program: &str, root: &str) -> LoweringAnalysis {
-    let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-    analyze_with_ops(program, root, hlir_ops, "HLIR", &[], &[])
+    let frozen = &space.frozen;
+    let alternatives = space
+        .alternatives()
+        .expect("rootless diagnostic observation");
+    let chain: Vec<_> = program
+        .trace_back(target, 20)
+        .into_iter()
+        .map(|entry| FunctionTraceEntry {
+            depth: entry.depth,
+            var: entry.var.clone(),
+            op_type: entry.op_type,
+            status: eval_function(frozen, &alternatives, program, name, &entry.var),
+        })
+        .collect();
+    let first_missing = chain
+        .iter()
+        .find(|entry| entry.status.is_missing())
+        .map(|entry| entry.var.clone());
+    let all_resolved = first_missing.is_none();
+    FunctionChainAnalysis {
+        target: target.to_owned(),
+        fn_name: name.to_owned(),
+        chain,
+        first_missing,
+        all_resolved,
+    }
 }

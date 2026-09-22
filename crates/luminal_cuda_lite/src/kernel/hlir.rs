@@ -1,3 +1,6 @@
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -7,16 +10,10 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
 use luminal::{
-    egglog_utils::{
-        api::{SortDef, app, call_named, sort, v},
-        base::{DTYPE, ELIST, EXPRESSION, F64, OP_KIND, SORTS, dtype, ilist, op_term},
-        extract_dtype, extract_expr, extract_expr_list,
-    },
     hlir::{LessThan, MaxReduce, Mod, Scatter, SumReduce},
     op::*,
     prelude::*,
 };
-use egglog::{egglog, sexp}; // the `egglog!` / `sexp!` quasiquote macros
 
 /// Generates CUDA include directives based on the dtypes used in a kernel
 pub fn dtype_includes(dtypes: &[DType]) -> String {
@@ -48,47 +45,6 @@ pub fn dtype_includes(dtypes: &[DType]) -> String {
     s
 }
 
-pub type Ops = (
-    KernelMod,
-    KernelLessThan,
-    KernelIota,
-    KernelGather,
-    KernelScatter,
-    KernelSumReduce,
-    KernelCastSumReduce,
-    KernelMaxReduce,
-    KernelConstant,
-    KernelCast,
-    KernelEmbed,
-);
-
-/// Build a rewrite that matches an HLIR op, reads dtype(s) from the given source fields,
-/// and unions with a kernel op that has the same fields plus the dtype(s) appended.
-pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>(
-    parser: &mut Parser,
-) -> Vec<Command> {
-    // Build the hlir/llir op patterns as `Sexp` fragments (no `Term`): fields
-    // are shared by name (`?__<field>`) and spliced with `#..`; llir adds a
-    // `dtype` field (`?__dtype`) that the guard binds from the hlir op.
-    let hlir = H::default().sort();
-    let llir = L::default().sort();
-    let hk = hlir.name.as_str();
-    let lk = llir.name.as_str();
-    let hlir_fields: Vec<String> =
-        hlir.fields.iter().map(|f| format!("?__{}", f.name)).collect();
-    let llir_fields: Vec<String> =
-        llir.fields.iter().map(|f| format!("?__{}", f.name)).collect();
-    let hlir_op = sexp!((Op (#hk #..hlir_fields) ?__inputs));
-    let llir_op = sexp!((Op (#lk #..llir_fields) ?__inputs));
-    egglog!(
-        *parser,
-        (rule ((= ?__dtype (dtype #(hlir_op.clone()))))
-              ((union #hlir_op #llir_op))
-            :ruleset kernel_lower)
-    )
-    .expect("kernel_rewrite rule should parse")
-}
-
 #[derive(Default, Debug, Clone)]
 
 pub struct KernelMaxReduce {
@@ -99,59 +55,84 @@ pub struct KernelMaxReduce {
     out_stride: Vec<Expression>,
     dtype: DType,
 }
-impl EgglogOp for KernelMaxReduce {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelMax",
-            &[
-                ("shape", ELIST),
-                ("iters", EXPRESSION),
-                ("strides", ELIST),
-                ("iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_max {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        iters: &DimExpr,
+        strides: &EList,
+        iter_stride: &DimExpr,
+        out_strides: &EList,
+        inputs: &IList,
+        dtype: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Max(shape, iters, strides, iter_stride, out_strides),
+            inputs,
+        );
+        rule(
+            (source, eq(dtype, source.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_max(shape, iters, strides, iter_stride, out_strides, dtype),
+                    inputs,
+                ),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![kernel_rewrite::<MaxReduce, Self>(parser)]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                in_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[5]),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelMaxReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_shape,
+            field_iters,
+            field_strides,
+            field_iter_stride,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_max(
+                    shape,
+                    iters,
+                    strides,
+                    iter_stride,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            iters: context.expression(&field_iters)?,
+            in_stride: decoded_strides,
+            iter_stride: context.expression(&field_iter_stride)?,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 
@@ -326,67 +307,91 @@ pub struct KernelSumReduce {
     out_stride: Vec<Expression>,
     dtype: DType,
 }
-impl EgglogOp for KernelSumReduce {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelSum",
-            &[
-                ("shape", ELIST),
-                ("iters", EXPRESSION),
-                ("strides", ELIST),
-                ("iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_sum {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        iters: &DimExpr,
+        strides: &EList,
+        iter_stride: &DimExpr,
+        out_strides: &EList,
+        inputs: &IList,
+        dtype: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Sum(shape, iters, strides, iter_stride, out_strides),
+            inputs,
+        );
+        rule(
+            (source, eq(dtype, source.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_sum(shape, iters, strides, iter_stride, out_strides, dtype),
+                    inputs,
+                ),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![kernel_rewrite::<SumReduce, Self>(parser)]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            {
-                let out_shape =
-                    extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-                let iters = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-                let in_stride =
-                    extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
-                let iter_stride = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-                let out_stride =
-                    extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
-                let dtype = extract_dtype(egraph, kind_children[5]);
-                LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                    out_shape,
+impl KernelSumReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_shape,
+            field_iters,
+            field_strides,
+            field_iter_stride,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_sum(
+                    shape,
                     iters,
-                    in_stride,
+                    strides,
                     iter_stride,
-                    out_stride,
+                    out_strides,
                     dtype,
-                }) as Box<dyn KernelOp>)
+                )
             },
-            input_enodes,
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some({
+            let out_shape = decoded_shape;
+            let iters = context.expression(&field_iters)?;
+            let in_stride = decoded_strides;
+            let iter_stride = context.expression(&field_iter_stride)?;
+            let out_stride = decoded_out_strides;
+            let dtype = context.dtype(&field_dtype)?;
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape,
+                iters,
+                in_stride,
+                iter_stride,
+                out_stride,
+                dtype,
+            }) as Box<dyn KernelOp>)
+        }))
     }
 }
 
@@ -576,78 +581,131 @@ pub struct KernelCastSumReduce {
     dtype: DType,
 }
 
-impl EgglogOp for KernelCastSumReduce {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelCastSum",
-            &[
-                ("shape", ELIST),
-                ("iters", EXPRESSION),
-                ("strides", ELIST),
-                ("iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
+pub(crate) mod kernel_cast_sum {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        1
+    #[ruleset]
+    pub(crate) fn kernel_specialize(
+        cast_size: &DimExpr,
+        x: &Ir,
+        shape: &EList,
+        iters: &DimExpr,
+        strides: &EList,
+        iter_stride: &DimExpr,
+        out_strides: &EList,
+        out_size: &DimExpr,
+        out_cast: &Ir,
+    ) -> Vec<Rule> {
+        let f16_sum = &Ir::Op(
+            kernel_cast_sum(
+                shape,
+                iters,
+                strides,
+                iter_stride,
+                out_strides,
+                DType::F16(),
+            ),
+            [x],
+        );
+        let bf16_sum = &Ir::Op(
+            kernel_cast_sum(
+                shape,
+                iters,
+                strides,
+                iter_stride,
+                out_strides,
+                DType::Bf16(),
+            ),
+            [x],
+        );
+        let x_cast = &Ir::Op(OpKind::Cast(cast_size, DType::F32()), [x]);
+        let sum = &Ir::Op(
+            OpKind::Sum(shape, iters, strides, iter_stride, out_strides),
+            [x_cast],
+        );
+        vec![
+            rule(
+                (
+                    eq(DType::F16(), x.dtype()),
+                    eq(
+                        out_cast,
+                        Ir::Op(OpKind::Cast(out_size, DType::F16()), [sum]),
+                    ),
+                ),
+                (
+                    f16_sum,
+                    union(out_cast, f16_sum),
+                    set(f16_sum.dtype(), DType::F16()),
+                ),
+            )
+            .label("kernel-cast-sum-F16"),
+            rule(
+                (
+                    eq(DType::Bf16(), x.dtype()),
+                    eq(
+                        out_cast,
+                        Ir::Op(OpKind::Cast(out_size, DType::Bf16()), [sum]),
+                    ),
+                ),
+                (
+                    bf16_sum,
+                    union(out_cast, bf16_sum),
+                    set(bf16_sum.dtype(), DType::Bf16()),
+                ),
+            )
+            .label("kernel-cast-sum-Bf16"),
+        ]
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // The inner Cast is positionwise (out[z] = (float)in[z]), so the
-        // SumReduce's shape/strides over the cast output apply unchanged to
-        // the 16-bit input.
-        ["F16", "Bf16"]
-            .into_iter()
-            .map(|dt| {
-                raw_rules(parser, format!(
-                    "(rule (
-                        (= ?x_cast (Op (Cast ?cast_size (F32)) (ICons ?x (INil))))
-                        (= ({dt}) (dtype ?x))
-                        (= ?sum (Op (Sum ?shape ?iters ?strides ?iter_stride ?out_strides) (ICons ?x_cast (INil))))
-                        (= ?out_cast (Op (Cast ?out_size ({dt})) (ICons ?sum (INil))))
-                     ) (
-                        (let ?ks (Op (KernelCastSum ?shape ?iters ?strides ?iter_stride ?out_strides ({dt})) (ICons ?x (INil))))
-                        (union ?out_cast ?ks)
-                        (set (dtype ?ks) ({dt}))
-                     ) :ruleset kernel_specialize :name \"kernel-cast-sum-{dt}\")"
-                ))
-            })
-            .collect()
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                in_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[5]),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelCastSumReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_shape,
+            field_iters,
+            field_strides,
+            field_iter_stride,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_cast_sum(
+                    shape,
+                    iters,
+                    strides,
+                    iter_stride,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            iters: context.expression(&field_iters)?,
+            in_stride: decoded_strides,
+            iter_stride: context.expression(&field_iter_stride)?,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 
@@ -807,109 +865,97 @@ pub struct KernelGather {
     dtype: DType,
 }
 
-impl EgglogOp for KernelGather {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelGather",
-            &[
-                ("out_shape", ELIST),
-                ("index_strides", ELIST),
-                ("data_shape", ELIST),
-                ("data_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
+pub(crate) mod kernel_gather {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
+    // Match an open IList tail, as Gather's dtype rule does. A strict INil
+    // misses deep-model Gathers whose tail eclass has merged with another
+    // chain (for example YOLO's stacked make_contiguous chains).
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Match HLIR Gather (now in Op format) and rewrite to KernelGather.
-        // Mirror the IList pattern used by `Gather`'s own dtype propagation
-        // rule (`src/hlir.rs`): use a `?__tail` variable instead of a
-        // strict `(INil)` so we don't accidentally fail to match against a
-        // Gather Op whose IList tail eclass has been merged with another
-        // chain by some unrelated egglog union. Without this the kernel
-        // rewrite is silently skipped for some Gathers in deep models
-        // (e.g. YOLO's stacked make_contiguous chains).
-        let hlir_gather = luminal::hlir::Gather::default().sort();
-        let (gather_args, gather_kind_term) = hlir_gather.new_call();
-        let indexes = v("?__indexes");
-        let data = v("?__data");
-        let tail = v("?__tail");
-        let gather_inputs = call_named(
-            "ICons",
-            vec![
-                indexes.clone(),
-                call_named("ICons", vec![data.clone(), tail]),
-            ],
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        index_shape: &EList,
+        index_strides: &EList,
+        data_shape: &EList,
+        data_strides: &EList,
+        indexes: &Ir,
+        data: &Ir,
+        tail: &IList,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Gather(index_shape, index_strides, data_shape, data_strides),
+            IList::ICons(indexes, IList::ICons(data, tail)),
         );
-        let gather_op = op_term(gather_kind_term, gather_inputs);
-
-        let out_strides = SORTS
-            .row_major
-            .call(("list".to_string(), gather_args["index_shape"].clone()));
-        let dt = v("?__dt");
-        let kernel_kind_args = [
-            ("out_shape".to_string(), gather_args["index_shape"].clone()),
-            (
-                "index_strides".to_string(),
-                gather_args["index_strides"].clone(),
-            ),
-            ("data_shape".to_string(), gather_args["data_shape"].clone()),
-            (
-                "data_strides".to_string(),
-                gather_args["data_strides"].clone(),
-            ),
-            ("out_strides".to_string(), out_strides),
-            ("dtype".to_string(), dt.clone()),
-        ];
-        let kernel_kind_term = self.sort().call(kernel_kind_args);
-        let kernel_op = op_term(kernel_kind_term, ilist(vec![indexes, data.clone()]));
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #dt (dtype #data))) ((union #gather_op #kernel_op)) :ruleset kernel_lower)
-            )
-            .expect("Gather kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                index_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                data_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                data_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[5]),
-            })),
-            input_enodes,
+        rule(
+            (source, eq(dt, data.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_gather(
+                        index_shape,
+                        index_strides,
+                        data_shape,
+                        data_strides,
+                        EList::RowMajor(index_shape),
+                        dt,
+                    ),
+                    [indexes, data],
+                ),
+            ),),
         )
+    }
+}
+
+impl KernelGather {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_out_shape,
+            field_index_strides,
+            field_data_shape,
+            field_data_strides,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |out_shape: &EList,
+             index_strides: &EList,
+             data_shape: &EList,
+             data_strides: &EList,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_gather(
+                    out_shape,
+                    index_strides,
+                    data_shape,
+                    data_strides,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_data_shape = context.expressions(&field_data_shape)?;
+        let decoded_data_strides = context.expressions(&field_data_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+            index_stride: decoded_index_strides,
+            data_shape: decoded_data_shape,
+            data_stride: decoded_data_strides,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -1055,107 +1101,106 @@ impl Default for KernelScatter {
     }
 }
 
-impl EgglogOp for KernelScatter {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelScatter",
-            &[
-                ("dest_shape", ELIST),
-                ("dest_strides", ELIST),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("src_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_scatter {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        dest_shape: &EList,
+        dest_strides: &EList,
+        index_shape: &EList,
+        index_strides: &EList,
+        src_strides: &EList,
+        dest: &Ir,
+        indexes: &Ir,
+        src: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Scatter(
+                dest_shape,
+                dest_strides,
+                index_shape,
+                index_strides,
+                src_strides,
+            ),
+            [dest, indexes, src],
+        );
+        rule(
+            (source, eq(dt, src.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_scatter(
+                        dest_shape,
+                        dest_strides,
+                        index_shape,
+                        index_strides,
+                        src_strides,
+                        EList::RowMajor(dest_shape),
+                        dt,
+                    ),
+                    [dest, indexes, src],
+                ),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        3
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Match HLIR Scatter (now in Op format) and rewrite to KernelScatter
-        let hlir_scatter = luminal::hlir::Scatter::default().sort();
-        let (scatter_args, scatter_kind_term) = hlir_scatter.new_call();
-        // HLIR Scatter inputs: [dest, indexes, src] (n_inputs=3)
-        let dest = v("?__dest");
-        let indexes = v("?__indexes");
-        let src = v("?__src");
-        let scatter_inputs = ilist(vec![dest.clone(), indexes.clone(), src.clone()]);
-        let scatter_op = op_term(scatter_kind_term, scatter_inputs);
-
-        let out_strides = SORTS
-            .row_major
-            .call(("list".to_string(), scatter_args["dest_shape"].clone()));
-        let dt = v("?__dt");
-        let kernel_kind_args = [
-            ("dest_shape".to_string(), scatter_args["dest_shape"].clone()),
-            (
-                "dest_strides".to_string(),
-                scatter_args["dest_strides"].clone(),
-            ),
-            (
-                "index_shape".to_string(),
-                scatter_args["index_shape"].clone(),
-            ),
-            (
-                "index_strides".to_string(),
-                scatter_args["index_strides"].clone(),
-            ),
-            (
-                "src_strides".to_string(),
-                scatter_args["src_strides"].clone(),
-            ),
-            ("out_strides".to_string(), out_strides),
-            ("dtype".to_string(), dt.clone()),
-        ];
-        let kernel_kind_term = self.sort().call(kernel_kind_args);
-        let kernel_op = op_term(kernel_kind_term, ilist(vec![dest, indexes, src.clone()]));
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #dt (dtype #src))) ((union #scatter_op #kernel_op)) :ruleset kernel_lower)
-            )
-            .expect("Scatter kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                dest_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                dest_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                index_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                src_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[5], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[6]),
-            })),
-            input_enodes, // dest, indexes, src
-        )
+impl KernelScatter {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_dest_shape,
+            field_dest_strides,
+            field_index_shape,
+            field_index_strides,
+            field_src_strides,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |dest_shape: &EList,
+             dest_strides: &EList,
+             index_shape: &EList,
+             index_strides: &EList,
+             src_strides: &EList,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_scatter(
+                    dest_shape,
+                    dest_strides,
+                    index_shape,
+                    index_strides,
+                    src_strides,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_dest_shape = context.expressions(&field_dest_shape)?;
+        let decoded_dest_strides = context.expressions(&field_dest_strides)?;
+        let decoded_index_shape = context.expressions(&field_index_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_src_strides = context.expressions(&field_src_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            dest_shape: decoded_dest_shape,
+            dest_strides: decoded_dest_strides,
+            index_shape: decoded_index_shape,
+            index_strides: decoded_index_strides,
+            src_strides: decoded_src_strides,
+            out_strides: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -1354,56 +1399,42 @@ pub struct KernelIota {
     range: Expression,
 }
 
-impl EgglogOp for KernelIota {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelIota",
-            &[("expr", EXPRESSION), ("range", EXPRESSION)],
+pub(crate) mod kernel_iota {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(expr: &DimExpr, range: &DimExpr, inputs: &IList) -> Rule {
+        let source = &Ir::Op(OpKind::Iota(expr, range), inputs);
+        let replacement = &Ir::Op(kernel_iota(expr, range), inputs);
+        rule(
+            source,
+            (
+                union(source, replacement),
+                set(replacement.dtype(), DType::Int()),
+            ),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        0
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (args, hlir_iota_kind) = luminal::hlir::Iota::default().sort().new_call();
-        let hlir_inputs = v("?__inputs");
-        let hlir_op = op_term(hlir_iota_kind, hlir_inputs.clone());
-        let kernel_kind = self.sort().call(&args);
-        let kernel_op = op_term(kernel_kind, hlir_inputs);
-        vec![
-            egglog!(
-                *parser,
-                (rule () ((union #hlir_op #(kernel_op.clone())) (set (dtype #kernel_op) (Int))) :ruleset kernel_lower)
-            )
-            .expect("Iota kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                expr: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                range: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-            })),
-            vec![],
-        )
+impl KernelIota {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_expr, field_range)) =
+            typed::get_args(kind, |expr: &DimExpr, range: &DimExpr| {
+                crate::typed_rules::kernel_iota(expr, range)
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            expr: context.expression(&field_expr)?,
+            range: context.expression(&field_range)?,
+        }))))
     }
 }
 
@@ -1501,58 +1532,68 @@ pub struct KernelMod {
     dtype: DType,
 }
 
-impl EgglogOp for KernelMod {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelMod",
-            &[
-                ("shape", ELIST),
-                ("a_strides", ELIST),
-                ("b_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_mod {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inputs: &IList,
+        dtype: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Mod(shape, a_strides, b_strides, out_strides),
+            inputs,
+        );
+        rule(
+            (source, eq(dtype, source.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_mod(shape, a_strides, b_strides, out_strides, dtype),
+                    inputs,
+                ),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![kernel_rewrite::<Mod, Self>(parser)]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                a_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
-            })),
-            input_enodes,
-        )
+impl KernelMod {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides, field_dtype)) =
+            typed::get_args(
+                kind,
+                |shape: &EList,
+                 a_strides: &EList,
+                 b_strides: &EList,
+                 out_strides: &EList,
+                 dtype: &luminal::typed_reference::schema::DType| {
+                    crate::typed_rules::kernel_mod(shape, a_strides, b_strides, out_strides, dtype)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            a_stride: decoded_a_strides,
+            b_stride: decoded_b_strides,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -1666,76 +1707,75 @@ pub struct KernelLessThan {
     dtype: DType,
 }
 
-impl EgglogOp for KernelLessThan {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelLessThan",
-            &[
-                ("shape", ELIST),
-                ("a_strides", ELIST),
-                ("b_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_less_than {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inp_a: &Ir,
+        inp_b: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::LessThan(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        rule(
+            (source, eq(dt, inp_a.dtype())),
+            (union(
+                source,
+                Ir::Op(
+                    kernel_less_than(shape, a_strides, b_strides, out_strides, dt),
+                    [inp_a, inp_b],
+                ),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let hlir = LessThan::default().sort();
-        let (mut args, hlir_kind_term) = hlir.new_call();
-        // LessThan's dtype is Bool (output type), but the kernel needs the INPUT dtype
-        // HLIR LessThan inputs: [inp_a, inp_b]
-        let inp_a = v("?__inp_a");
-        let inp_b = v("?__inp_b");
-        let hlir_inputs = ilist(vec![inp_a.clone(), inp_b.clone()]);
-        let hlir_op = op_term(hlir_kind_term, hlir_inputs.clone());
-        let dt = v("?__dt");
-        args.add("dtype", dt.clone());
-        let kernel_kind_term = self.sort().call(&args);
-        let kernel_op = op_term(kernel_kind_term, hlir_inputs);
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #dt (dtype #inp_a))) ((union #hlir_op #kernel_op)) :ruleset kernel_lower)
-            )
-            .expect("LessThan kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                a_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
-            })),
-            input_enodes,
-        )
+impl KernelLessThan {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides, field_dtype)) =
+            typed::get_args(
+                kind,
+                |shape: &EList,
+                 a_strides: &EList,
+                 b_strides: &EList,
+                 out_strides: &EList,
+                 dtype: &luminal::typed_reference::schema::DType| {
+                    crate::typed_rules::kernel_less_than(
+                        shape,
+                        a_strides,
+                        b_strides,
+                        out_strides,
+                        dtype,
+                    )
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            a_stride: decoded_a_strides,
+            b_stride: decoded_b_strides,
+            out_stride: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -1848,82 +1888,84 @@ pub struct KernelConstant {
     dtype: DType,
 }
 
-impl EgglogOp for KernelConstant {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelConstant",
-            &[("value", F64), ("dtype", DTYPE)],
-        )
-    }
+pub(crate) mod kernel_constant {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        0
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (mut args, const_kind) = luminal::hlir::Constant::default().sort().new_call();
-        let hlir_inputs = v("?__inputs");
-        let hlir_op = op_term(const_kind, hlir_inputs.clone());
-        args.add("dtype", app(&SORTS.f32_dt, vec![]));
-        let kernel_kind = self.sort().call(&args);
-        let kernel_op = op_term(kernel_kind, hlir_inputs);
-        let mut rules = vec![
-            egglog!(
-                *parser,
-                (rule () ((union #hlir_op #(kernel_op.clone())) (set (dtype #kernel_op) (F32))) :ruleset kernel_lower)
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        value: &egg::F64,
+        inputs: &IList,
+        val: &egg::F64,
+        size: &DimExpr,
+        cast: &Ir,
+    ) -> Vec<Rule> {
+        let source = &Ir::Op(kernel_constant(value, DType::F32()), inputs);
+        let replacement = &Ir::Op(OpKind::Constant(value), inputs);
+        let f16_constant = &Ir::Op(kernel_constant(val, DType::F16()), IList::INil());
+        let bf16_constant = &Ir::Op(kernel_constant(val, DType::Bf16()), IList::INil());
+        let f32_constant = &Ir::Op(kernel_constant(val, DType::F32()), IList::INil());
+        let c = &Ir::Op(OpKind::Constant(val), IList::INil());
+        vec![
+            rule(
+                replacement,
+                (
+                    union(replacement, source),
+                    set(source.dtype(), DType::F32()),
+                ),
+            ),
+            rule(
+                (eq(cast, Ir::Op(OpKind::Cast(size, DType::F16()), [c])),),
+                (
+                    f16_constant,
+                    union(cast, f16_constant),
+                    set(f16_constant.dtype(), DType::F16()),
+                ),
             )
-            .expect("Constant kernel-lowering rule should parse"),
-        ];
-        // Fold an explicit Cast around a Constant into a dtype-typed
-        // KernelConstant. HLIR constants are always F32 (the frontend emits
-        // `constant(v).cast(dt)` for non-F32 dtypes), so this is the only
-        // way a non-F32 constant reaches the kernel level. The fused op is
-        // unioned into the Cast's eclass, whose dtype it matches exactly.
-        // F32 included: the frontend emits `constant(v).cast(F32)` identity
-        // casts for scalars on f32 tensors; folding gives downstream rules a
-        // constant-valued enode (see const_like) in the cast's eclass.
-        for dt in ["F16", "Bf16", "F32"] {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?c (Op (Constant ?val) (INil)))
-                    (= ?cast (Op (Cast ?size ({dt})) (ICons ?c (INil))))
-                 ) (
-                    (let ?kc (Op (KernelConstant ?val ({dt})) (INil)))
-                    (union ?cast ?kc)
-                    (set (dtype ?kc) ({dt}))
-                 ) :ruleset kernel_lower :name \"kernel-constant-cast-{dt}\")"
-            )));
-        }
-        rules
-    };
-        __rules.into_iter().flatten().collect()
+            .label("kernel-constant-cast-F16"),
+            rule(
+                (eq(cast, Ir::Op(OpKind::Cast(size, DType::Bf16()), [c])),),
+                (
+                    bf16_constant,
+                    union(cast, bf16_constant),
+                    set(bf16_constant.dtype(), DType::Bf16()),
+                ),
+            )
+            .label("kernel-constant-cast-Bf16"),
+            rule(
+                (eq(cast, Ir::Op(OpKind::Cast(size, DType::F32()), [c])),),
+                (
+                    f32_constant,
+                    union(cast, f32_constant),
+                    set(f32_constant.dtype(), DType::F32()),
+                ),
+            )
+            .label("kernel-constant-cast-F32"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                value: egraph.enodes[kind_children[0]]
-                    .0
-                    .replace("\"", "")
-                    .parse::<f32>()
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[1]),
-            })),
-            vec![],
-        )
+impl KernelConstant {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_value, field_dtype)) = typed::get_args(
+            kind,
+            |value: &egg::F64, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_constant(value, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            value: f64::try_from(&field_value)? as f32,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -2018,65 +2060,46 @@ pub struct KernelCast {
     out_dtype: DType,
 }
 
-impl EgglogOp for KernelCast {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelCast",
-            &[("size", EXPRESSION), ("dtype", DTYPE), ("src_dtype", DTYPE)],
+pub(crate) mod kernel_cast {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(size: &DimExpr, dtype: &DType, inp: &Ir, in_dt: &DType) -> Rule {
+        let source = &Ir::Op(OpKind::Cast(size, dtype), [inp]);
+        rule(
+            (source, eq(in_dt, inp.dtype())),
+            (union(
+                source,
+                Ir::Op(kernel_cast(size, in_dt, dtype), [inp]),
+            ),),
         )
     }
+}
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Match HLIR Cast and rewrite to KernelCast
-        let hlir_cast = luminal::hlir::Cast::default().sort();
-        let (mut cast_args, cast_kind_term) = hlir_cast.new_call();
-        let inp = v("?__inp");
-        let cast_inputs = ilist(vec![inp.clone()]);
-        let cast_op = op_term(cast_kind_term, cast_inputs.clone());
-
-        let out_dty = cast_args.remove("dtype");
-        let in_dty = v("?__in_dt");
-        cast_args.add("dtype", in_dty.clone());
-        cast_args.add("src_dtype", out_dty);
-        let kernel_kind_term = self.sort().call(&cast_args);
-        let kernel_op = op_term(kernel_kind_term, cast_inputs);
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #in_dty (dtype #inp))) ((union #cast_op #kernel_op)) :ruleset kernel_lower)
-            )
-            .expect("Cast kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                size: extract_expr(egraph, kind_children[0], expr_cache).unwrap_or_default(),
-                in_dtype: extract_dtype(egraph, kind_children[1]),
-                out_dtype: extract_dtype(egraph, kind_children[2]),
-            })),
-            input_enodes,
-        )
+impl KernelCast {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_size, field_dtype, field_src_dtype)) = typed::get_args(
+            kind,
+            |size: &DimExpr,
+             dtype: &luminal::typed_reference::schema::DType,
+             src_dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_cast(size, dtype, src_dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            size: context.expression(&field_size)?,
+            in_dtype: context.dtype(&field_dtype)?,
+            out_dtype: context.dtype(&field_src_dtype)?,
+        }))))
     }
 }
 
@@ -2283,165 +2306,292 @@ pub struct KernelEmbed {
     dtype: DType,                  // embedding table / output dtype
 }
 
-impl EgglogOp for KernelEmbed {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelEmbed",
-            &[
-                ("batch_shape", ELIST),
-                ("token_stride", ELIST),
-                ("out_stride", ELIST),
-                ("embed_dim", EXPRESSION),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
+pub(crate) mod kernel_embed {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+    #[ruleset]
+    pub(crate) fn kernel_specialize(
+        idx_shape: &EList,
+        embed_shape: &EList,
+        indices: &Ir,
+        embed_table: &Ir,
+        gather: &Ir,
+        add_out_stride: &EList,
+        mul_result: &Ir,
+        iota_result: &Ir,
+        token_cast_stride: &EList,
+        token_ids_cast: &Ir,
+        mul_const: &Ir,
+        token_ids: &Ir,
+        embed_dim: &DimExpr,
+        embed_dt: &DType,
+        token_stride: &EList,
+    ) -> Vec<Rule> {
+        let batch_shape = &EList::RemoveNthFromEnd(idx_shape, 0_i64);
+        let out_stride_batch = &EList::RemoveNthFromEnd(add_out_stride, 0_i64);
+        let cast_embed = &Ir::Op(
+            kernel_embed(
+                batch_shape,
+                token_cast_stride,
+                out_stride_batch,
+                embed_dim,
+                embed_dt,
+            ),
+            [token_ids_cast, embed_table],
+        );
+        let embed = &Ir::Op(
+            kernel_embed(
+                batch_shape,
+                token_stride,
+                out_stride_batch,
+                embed_dim,
+                embed_dt,
+            ),
+            [token_ids, embed_table],
+        );
         vec![
-            // Match Gather with Add(Mul(Cast(token_ids), const), Iota) indices
-            // Now uses (Op (OpKind ...) (ICons ...)) format
-            raw_rules(parser, "(rule
+            rule(
                 (
-                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
-                    (= (len ?idx_shape) 2)
-                    (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
-                    (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
-                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
-                    ; its stride is length 1, matching batch_shape =
-                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
-                    ; the rule mis-fires on 2D/non-embedding gathers whose token
-                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
-                    ; token_stride lengths differ -> flatten_strides panic.
-                    (= (len ?token_cast_stride) 1)
-                    (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?embed_dt (dtype ?embed_table))
-                )
+                    eq(
+                        gather,
+                        Ir::Op(
+                            GatherArgs {
+                                index_shape: idx_shape.into(),
+                                data_shape: embed_shape.into(),
+                                ..GatherArgs::fresh()
+                            },
+                            [indices, embed_table],
+                        ),
+                    ),
+                    eq(idx_shape.len(), 2_i64),
+                    eq(
+                        indices,
+                        Ir::Op(
+                            AddArgs {
+                                out_strides: add_out_stride.into(),
+                                ..AddArgs::fresh()
+                            },
+                            [mul_result, iota_result],
+                        ),
+                    ),
+                    eq(
+                        mul_result,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: token_cast_stride.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [token_ids_cast, mul_const],
+                        ),
+                    ),
+                    // A genuine 1D-token embedding has one token stride,
+                    // matching RemoveNthFromEnd(idx_shape). A 2D token view
+                    // would produce mismatched ranks in flatten_strides.
+                    eq(token_cast_stride.len(), 1_i64),
+                    eq(token_ids_cast, Ir::Op(CastArgs::fresh(), [token_ids])),
+                    eq(embed_dim, embed_shape.nth_from_end(0_i64)),
+                    eq(embed_dt, embed_table.dtype()),
+                ),
                 (
-                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
-                    (union ?gather ?ke)
-                    (set (dtype ?ke) ?embed_dt)
-                )
-                :ruleset kernel_specialize
-                :name \"kernel embed with cast mul\"
-            )"),
-            // Match Gather with Add(Iota, Mul(Cast(token_ids), const)) indices (reversed order)
-            raw_rules(parser, "(rule
+                    batch_shape,
+                    out_stride_batch,
+                    cast_embed,
+                    union(gather, cast_embed),
+                    set(cast_embed.dtype(), embed_dt),
+                ),
+            )
+            .label("kernel embed with cast mul"),
+            rule(
                 (
-                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
-                    (= (len ?idx_shape) 2)
-                    (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
-                    (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
-                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
-                    ; its stride is length 1, matching batch_shape =
-                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
-                    ; the rule mis-fires on 2D/non-embedding gathers whose token
-                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
-                    ; token_stride lengths differ -> flatten_strides panic.
-                    (= (len ?token_cast_stride) 1)
-                    (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?embed_dt (dtype ?embed_table))
-                )
+                    eq(
+                        gather,
+                        Ir::Op(
+                            GatherArgs {
+                                index_shape: idx_shape.into(),
+                                data_shape: embed_shape.into(),
+                                ..GatherArgs::fresh()
+                            },
+                            [indices, embed_table],
+                        ),
+                    ),
+                    eq(idx_shape.len(), 2_i64),
+                    eq(
+                        indices,
+                        Ir::Op(
+                            AddArgs {
+                                out_strides: add_out_stride.into(),
+                                ..AddArgs::fresh()
+                            },
+                            [iota_result, mul_result],
+                        ),
+                    ),
+                    eq(
+                        mul_result,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: token_cast_stride.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [token_ids_cast, mul_const],
+                        ),
+                    ),
+                    // Keep the same 1D-token stride guard for reversed Add.
+                    eq(token_cast_stride.len(), 1_i64),
+                    eq(token_ids_cast, Ir::Op(CastArgs::fresh(), [token_ids])),
+                    eq(embed_dim, embed_shape.nth_from_end(0_i64)),
+                    eq(embed_dt, embed_table.dtype()),
+                ),
                 (
-                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
-                    (union ?gather ?ke)
-                    (set (dtype ?ke) ?embed_dt)
-                )
-                :ruleset kernel_specialize
-                :name \"kernel embed with cast mul reversed\"
-            )"),
-            // Match Gather with Add(Mul(token_ids, const), Iota) indices (no Cast)
-            raw_rules(parser, "(rule
+                    batch_shape,
+                    out_stride_batch,
+                    cast_embed,
+                    union(gather, cast_embed),
+                    set(cast_embed.dtype(), embed_dt),
+                ),
+            )
+            .label("kernel embed with cast mul reversed"),
+            rule(
                 (
-                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
-                    (= (len ?idx_shape) 2)
-                    (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
-                    (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
-                    ; Same length guard as the cast-mul variant: only fire for
-                    ; genuine 1D token embeddings (token stride length 1) so
-                    ; batch_shape and token_stride lengths agree and the rule
-                    ; doesn't mis-fire on non-embedding 2D gathers.
-                    (= (len ?token_stride) 1)
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?embed_dt (dtype ?embed_table))
-                )
+                    eq(
+                        gather,
+                        Ir::Op(
+                            GatherArgs {
+                                index_shape: idx_shape.into(),
+                                data_shape: embed_shape.into(),
+                                ..GatherArgs::fresh()
+                            },
+                            [indices, embed_table],
+                        ),
+                    ),
+                    eq(idx_shape.len(), 2_i64),
+                    eq(
+                        indices,
+                        Ir::Op(
+                            AddArgs {
+                                out_strides: add_out_stride.into(),
+                                ..AddArgs::fresh()
+                            },
+                            [mul_result, iota_result],
+                        ),
+                    ),
+                    eq(
+                        mul_result,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: token_stride.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [token_ids, mul_const],
+                        ),
+                    ),
+                    eq(token_stride.len(), 1_i64),
+                    eq(embed_dim, embed_shape.nth_from_end(0_i64)),
+                    eq(embed_dt, embed_table.dtype()),
+                ),
                 (
-                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
-                    (union ?gather ?ke)
-                    (set (dtype ?ke) ?embed_dt)
-                )
-                :ruleset kernel_specialize
-                :name \"kernel embed with mul\"
-            )"),
-            // Match Gather with Add(Iota, Mul(token_ids, const)) indices (reversed order, no Cast)
-            raw_rules(parser, "(rule
+                    batch_shape,
+                    out_stride_batch,
+                    embed,
+                    union(gather, embed),
+                    set(embed.dtype(), embed_dt),
+                ),
+            )
+            .label("kernel embed with mul"),
+            rule(
                 (
-                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
-                    (= (len ?idx_shape) 2)
-                    (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
-                    (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
-                    ; Same length guard as the cast-mul variant: only fire for
-                    ; genuine 1D token embeddings (token stride length 1) so
-                    ; batch_shape and token_stride lengths agree and the rule
-                    ; doesn't mis-fire on non-embedding 2D gathers.
-                    (= (len ?token_stride) 1)
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?embed_dt (dtype ?embed_table))
-                )
+                    eq(
+                        gather,
+                        Ir::Op(
+                            GatherArgs {
+                                index_shape: idx_shape.into(),
+                                data_shape: embed_shape.into(),
+                                ..GatherArgs::fresh()
+                            },
+                            [indices, embed_table],
+                        ),
+                    ),
+                    eq(idx_shape.len(), 2_i64),
+                    eq(
+                        indices,
+                        Ir::Op(
+                            AddArgs {
+                                out_strides: add_out_stride.into(),
+                                ..AddArgs::fresh()
+                            },
+                            [iota_result, mul_result],
+                        ),
+                    ),
+                    eq(
+                        mul_result,
+                        Ir::Op(
+                            MulArgs {
+                                a_strides: token_stride.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [token_ids, mul_const],
+                        ),
+                    ),
+                    eq(token_stride.len(), 1_i64),
+                    eq(embed_dim, embed_shape.nth_from_end(0_i64)),
+                    eq(embed_dt, embed_table.dtype()),
+                ),
                 (
-                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
-                    (union ?gather ?ke)
-                    (set (dtype ?ke) ?embed_dt)
-                )
-                :ruleset kernel_specialize
-                :name \"kernel embed with mul reversed\"
-            )"),
+                    batch_shape,
+                    out_stride_batch,
+                    embed,
+                    union(gather, embed),
+                    set(embed.dtype(), embed_dt),
+                ),
+            )
+            .label("kernel embed with mul reversed"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                batch_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                token_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                embed_dim: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
-            })),
-            input_enodes, // token_ids, embedding_table
-        )
+impl KernelEmbed {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_batch_shape,
+            field_token_stride,
+            field_out_stride,
+            field_embed_dim,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |batch_shape: &EList,
+             token_stride: &EList,
+             out_stride: &EList,
+             embed_dim: &DimExpr,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_embed(
+                    batch_shape,
+                    token_stride,
+                    out_stride,
+                    embed_dim,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_batch_shape = context.expressions(&field_batch_shape)?;
+        let decoded_token_stride = context.expressions(&field_token_stride)?;
+        let decoded_out_stride = context.expressions(&field_out_stride)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            batch_shape: decoded_batch_shape,
+            token_stride: decoded_token_stride,
+            out_stride: decoded_out_stride,
+            embed_dim: context.expression(&field_embed_dim)?,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

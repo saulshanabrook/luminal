@@ -1,160 +1,186 @@
-//! Recover the compact row-index input from a lowered `gather_rows` flat index.
+//! Recover the compact row-index dependency of an already-selected FlashInfer op.
 
-use luminal::egglog_utils::{ClassId, NodeId, SerializedEGraph};
+use egglog_experimental::typed::{TypedError, builtins as egg, get_args};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{
+    AddArgs, DType, EList, IList, InputArgs, Ir, MulArgs, OpArgs, OpKind,
+};
 
-/// Find the compact row-index tensor used to build a `gather_rows` flat index.
-///
-/// `gather_rows(data, indices, d)` lowers the index tensor as:
-/// `indices * d + arange(d)`. FlashInfer wants `indices`, not the expanded
-/// `(c, d)` flat index.
-pub fn try_find_compact_gather_idx<'a>(
-    egraph: &'a SerializedEGraph,
-    flat_idx_node: &'a NodeId,
-) -> Option<&'a NodeId> {
-    let add_inputs = logical_binary_inputs(egraph, flat_idx_node, "Add")?;
+/// Walk Add/Mul inputs and return the first recoverable compact index.
+/// `flat` is the candidate's selected producer; internal producer ties use the
+/// admissible snapshot's native order, without searching additional branches.
+pub(crate) fn try_find_compact_gather_idx(
+    context: &DecodeContext<'_, '_>,
+    flat: &Ir,
+) -> Result<Option<Ir>, TypedError> {
+    let Some(add_inputs) = logical_binary_inputs(
+        context,
+        flat,
+        |kind| Ok(AddArgs::get_args(kind)?.is_some()),
+        "Add",
+    )?
+    else {
+        return Ok(None);
+    };
     for input in add_inputs {
-        let Some(mul_inputs) = logical_binary_inputs(egraph, input, "Mul") else {
+        let Some(mul_inputs) = logical_binary_inputs(
+            context,
+            &input,
+            |kind| Ok(MulArgs::get_args(kind)?.is_some()),
+            "Mul",
+        )?
+        else {
             continue;
         };
-        for mul_input in mul_inputs {
-            if let Some(input_node) = resolve_input_node(egraph, mul_input) {
-                return Some(input_node);
+        for input in mul_inputs {
+            for node in context.producers(&input)? {
+                let node = context.frozen.typed_node::<Ir>(node)?;
+                if get_args(
+                    &node,
+                    |id: &egg::I64, label: &egg::String, dtype: &DType| Ir::Input(id, label, dtype),
+                )?
+                .is_some()
+                {
+                    return Ok(Some(node));
+                }
             }
         }
     }
-    None
+    Ok(None)
 }
 
-fn walk_ilist_simple<'a>(
-    egraph: &'a SerializedEGraph,
-    ilist_eclass: &'a ClassId,
-) -> Vec<&'a NodeId> {
-    let mut inputs = Vec::new();
-    let mut current = resolve_first_node(egraph, ilist_eclass);
-
+fn walk_ilist(context: &DecodeContext<'_, '_>, inputs: &IList) -> Result<Vec<Ir>, TypedError> {
+    let mut result = Vec::new();
+    let mut current = inputs.clone();
     loop {
-        let (label, children) = &egraph.enodes[current];
-        if label == "INil" {
-            break;
+        let node = context
+            .producers(&current)?
+            .next()
+            .expect("admissible input list producer");
+        let node = context.frozen.typed_node::<IList>(node)?;
+        let Some((head, tail)) =
+            get_args(&node, |head: &Ir, tail: &IList| IList::ICons(head, tail))?
+        else {
+            // The old walk also stopped at non-ICons list transformations.
+            return Ok(result);
+        };
+        let mut nodes = context.producers(&head)?;
+        let first = nodes.next().expect("admissible IR producer");
+        let mut selected = context.frozen.typed_node::<Ir>(first)?;
+        for node in std::iter::once(first).chain(nodes) {
+            let node = context.frozen.typed_node::<Ir>(node)?;
+            if OpArgs::get_args(&node)?.is_some() || InputArgs::get_args(&node)?.is_some() {
+                selected = node;
+                break;
+            }
         }
-        if label != "ICons" {
-            break;
-        }
-        let ir_node = resolve_first_ir_node(egraph, &children[0]);
-        inputs.push(ir_node);
-        current = resolve_first_node(egraph, &children[1]);
+        result.push(selected);
+        current = tail;
     }
-
-    inputs
 }
 
-fn resolve_first_node<'a>(egraph: &'a SerializedEGraph, eclass: &ClassId) -> &'a NodeId {
-    &egraph.eclasses[eclass].1[0]
-}
-
-fn resolve_first_ir_node<'a>(egraph: &'a SerializedEGraph, eclass: &ClassId) -> &'a NodeId {
-    let nodes = &egraph.eclasses[eclass].1;
-    for node in nodes {
-        let label = &egraph.enodes[node].0;
-        if label == "Op" || label == "Input" {
-            return node;
-        }
-    }
-    &nodes[0]
-}
-
-fn resolve_input_node<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> Option<&'a NodeId> {
-    let class = egraph.node_to_class.get(node)?;
-    egraph.eclasses[class]
-        .1
-        .iter()
-        .find(|candidate| egraph.enodes[*candidate].0 == "Input")
-}
-
-fn resolve_op_with_kind<'a>(
-    egraph: &'a SerializedEGraph,
-    node: &'a NodeId,
-    kind_substr: &str,
-) -> Option<&'a NodeId> {
-    let class = egraph.node_to_class.get(node)?;
-    for candidate in &egraph.eclasses[class].1 {
-        let (label, children) = &egraph.enodes[candidate];
-        if label != "Op" || children.is_empty() {
-            continue;
-        }
-        let kind = resolve_first_node(egraph, &children[0]);
-        if egraph.enodes[kind].0.contains(kind_substr) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn logical_binary_inputs<'a>(
-    egraph: &'a SerializedEGraph,
-    node: &'a NodeId,
+fn logical_binary_inputs(
+    context: &DecodeContext<'_, '_>,
+    node: &Ir,
+    matches_hlir: impl Fn(&OpKind) -> Result<bool, TypedError>,
     op_name: &str,
-) -> Option<Vec<&'a NodeId>> {
-    if let Some(op_node) = resolve_op_with_kind(egraph, node, op_name) {
-        let (_, children) = &egraph.enodes[op_node];
-        return Some(walk_ilist_simple(egraph, &children[1]));
+) -> Result<Option<Vec<Ir>>, TypedError> {
+    for candidate in context.producers(node)? {
+        let candidate = context.frozen.typed_node::<Ir>(candidate)?;
+        let Some((kind, inputs)) = get_args(&candidate, |kind: &OpKind, inputs: &IList| {
+            Ir::Op(kind, inputs)
+        })?
+        else {
+            continue;
+        };
+        let kind = context
+            .producers(&kind)?
+            .next()
+            .expect("admissible OpKind producer");
+        if matches_hlir(&context.frozen.typed_node::<OpKind>(kind)?)? {
+            // Selecting an HLIR list commits to this branch, even if it later
+            // contains no recoverable compact input.
+            return Ok(Some(walk_ilist(context, &inputs)?));
+        }
     }
 
-    let (label, children) = &egraph.enodes[node];
-    if label != "Op" || children.len() < 2 {
-        return None;
+    // No HLIR match: inspect only the supplied producer, then the first fused
+    // element if it is a FusionEnd. Do not search other lowered alternatives.
+    let Some((kind, inputs)) =
+        get_args(node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))?
+    else {
+        return Ok(None);
+    };
+    let kind = context.frozen.typed_node::<OpKind>(
+        context
+            .producers(&kind)?
+            .next()
+            .expect("admissible OpKind producer"),
+    )?;
+    let (kind, inputs) = if get_args(&kind, |shape: &EList, strides: &EList, dtype: &DType| {
+        crate::typed_rules::fusion_end(shape, strides, dtype)
+    })?
+    .is_some()
+    {
+        let Some(element) = walk_ilist(context, &inputs)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some((kind, inputs)) = get_args(&element, |kind: &OpKind, inputs: &IList| {
+            Ir::Op(kind, inputs)
+        })?
+        else {
+            return Ok(None);
+        };
+        let kind = context.frozen.typed_node::<OpKind>(
+            context
+                .producers(&kind)?
+                .next()
+                .expect("admissible OpKind producer"),
+        )?;
+        (kind, inputs)
+    } else {
+        (kind, inputs)
+    };
+    let Some((opcode, _, _, _, _, _)) = get_args(
+        &kind,
+        |opcode: &egg::String, shape: &EList, a: &EList, b: &EList, out: &EList, dtype: &DType| {
+            crate::typed_rules::cuda_binary_elementwise(opcode, shape, a, b, out, dtype)
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    if String::try_from(opcode)? != op_name {
+        return Ok(None);
     }
-    let kind = resolve_first_node(egraph, &children[0]);
-    if egraph.enodes[kind].0.contains("CudaBinaryElementwise") {
-        let opcode_class = egraph.enodes[kind].1.first()?;
-        let opcode_node = resolve_first_node(egraph, opcode_class);
-        if egraph.enodes[opcode_node].0.trim_matches('"') != op_name {
-            return None;
-        }
-        return Some(
-            walk_ilist_simple(egraph, &children[1])
-                .into_iter()
-                .map(|input| unwrap_fusion_start(egraph, input))
-                .collect(),
-        );
-    }
-    if !egraph.enodes[kind].0.contains("FusionEnd") {
-        return None;
-    }
-    let fe_inputs = walk_ilist_simple(egraph, &children[1]);
-    let elem = *fe_inputs.first()?;
-    let (elem_label, elem_children) = &egraph.enodes[elem];
-    if elem_label != "Op" || elem_children.len() < 2 {
-        return None;
-    }
-    let elem_kind = resolve_first_node(egraph, &elem_children[0]);
-    if !egraph.enodes[elem_kind].0.contains("CudaBinaryElementwise") {
-        return None;
-    }
-    let opcode_class = egraph.enodes[elem_kind].1.first()?;
-    let opcode_node = resolve_first_node(egraph, opcode_class);
-    if egraph.enodes[opcode_node].0.trim_matches('"') != op_name {
-        return None;
-    }
-    Some(
-        walk_ilist_simple(egraph, &elem_children[1])
-            .into_iter()
-            .map(|input| unwrap_fusion_start(egraph, input))
-            .collect(),
-    )
+    walk_ilist(context, &inputs)?
+        .into_iter()
+        .map(|input| unwrap_fusion_start(context, input))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
-fn unwrap_fusion_start<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> &'a NodeId {
-    let (label, children) = &egraph.enodes[node];
-    if label != "Op" || children.len() < 2 {
-        return node;
+fn unwrap_fusion_start(context: &DecodeContext<'_, '_>, node: Ir) -> Result<Ir, TypedError> {
+    let Some((kind, inputs)) =
+        get_args(&node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))?
+    else {
+        return Ok(node);
+    };
+    let kind = context.frozen.typed_node::<OpKind>(
+        context
+            .producers(&kind)?
+            .next()
+            .expect("admissible OpKind producer"),
+    )?;
+    if get_args(&kind, |shape: &EList, strides: &EList, dtype: &DType| {
+        crate::typed_rules::fusion_start(shape, strides, dtype)
+    })?
+    .is_none()
+    {
+        return Ok(node);
     }
-    let kind = resolve_first_node(egraph, &children[0]);
-    if !egraph.enodes[kind].0.contains("FusionStart") {
-        return node;
-    }
-    walk_ilist_simple(egraph, &children[1])
-        .first()
-        .copied()
-        .unwrap_or(node)
+    Ok(walk_ilist(context, &inputs)?
+        .into_iter()
+        .next()
+        .unwrap_or(node))
 }

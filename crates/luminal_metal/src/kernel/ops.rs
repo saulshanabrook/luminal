@@ -1,59 +1,14 @@
-use super::{MPSMatrixLayout, MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
-use luminal::{
-    egglog_utils::{
-        SerializedEGraph,
-        api::{
-            Args, SortDef, Term as EggTerm, app, eq, i64 as lit_i64, sort, v,
-        },
-        base::{
-            DTYPE, ELIST, EXPRESSION, F64, I64, IR, OP_KIND, SORTS, add, cons, div, dtype, ilist,
-            iter, modd, mul, new_op_call, nil, num, op_term,
-        },
-    },
-    hlir::{
-        Add, Cast, Constant, Gather, Iota, LessThan, MaxReduce, Mod, Mul, Scatter, SumReduce,
-        binary_sort, reduce_sort, unary_sort,
-    },
-    op::*,
-    prelude::*,
-    shape::flatten_strides,
-};
-use egglog::{egglog, sexp}; // the `egglog!` / `sexp!` quasiquote macros
+use super::{MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, Ir, OpKind};
+use luminal::{op::*, prelude::*, shape::flatten_strides};
 use metal::{
     Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLLanguageVersion, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
 };
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
-
-pub type MetalOps = (
-    // Unary ops
-    MetalExp2,
-    MetalLog2,
-    MetalSin,
-    MetalSqrt,
-    MetalRecip,
-    // Binary ops
-    MetalAdd,
-    MetalMul,
-    MetalMod,
-    MetalLessThan,
-    // Reduce ops
-    MetalSumReduce,
-    MetalMaxReduce,
-    // Matrix ops
-    MPSMatmul,
-    MPSBatchedMatmul,
-    GenericMatmul,
-    // Data ops
-    MetalConstant,
-    MetalIota,
-    MetalGather,
-    MetalScatter,
-    MetalScatterNoCopy,
-    // Type conversion
-    MetalCast,
-);
 
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
     let options = metal::CompileOptions::new();
@@ -137,63 +92,6 @@ fn metal_binary_op_values(
     (read(a_dtype, "a", a_idx), read(b_dtype, "b", b_idx))
 }
 
-fn call_sort_from_args(sort: &SortDef, args: &Args) -> EggTerm {
-    let mut filtered_args = Args::new();
-    for field in &sort.fields {
-        filtered_args.add(&field.name, args[field.name.as_str()].clone());
-    }
-    sort.call(filtered_args)
-}
-
-fn unary_dtype_rewrite(
-    parser: &mut Parser,
-    hlir_sort: &SortDef,
-    metal_sort: &SortDef,
-) -> Vec<Command> {
-    let (args, hlir_match) = new_op_call(hlir_sort, &["inp"]);
-    let metal_op = op_term(
-        call_sort_from_args(metal_sort, &args),
-        args["__inputs"].clone(),
-    );
-    let inp = args["inp"].clone();
-    egglog!(
-        *parser,
-        (rule ((= ?__dt (dtype #inp)))
-              ((union #(hlir_match.clone()) #(metal_op.clone()))
-               (subsume #hlir_match)
-               (set (dtype #metal_op) ?__dt))
-            :ruleset kernel_lower)
-    )
-    .expect("metal unary dtype rewrite should parse")
-}
-
-fn binary_dtype_rewrite(
-    parser: &mut Parser,
-    hlir_sort: &SortDef,
-    metal_sort: &SortDef,
-) -> Vec<Command> {
-    let (args, hlir_match) = new_op_call(hlir_sort, &["inp_a", "inp_b"]);
-    let metal_op = op_term(
-        call_sort_from_args(metal_sort, &args),
-        args["__inputs"].clone(),
-    );
-    let inp_a = args["inp_a"].clone();
-    egglog!(
-        *parser,
-        (rule ((= ?__dt (dtype #inp_a)))
-              ((union #(hlir_match.clone()) #(metal_op.clone()))
-               (subsume #hlir_match)
-               (set (dtype #metal_op) ?__dt))
-            :ruleset kernel_lower)
-    )
-    .expect("metal binary dtype rewrite should parse")
-}
-
-// ============================================================================
-// Performance Metrics Macros
-// ============================================================================
-
-/// Generate metrics methods for unary ops: 1 input read, 1 output write, 1 flop per element
 macro_rules! impl_unary_metrics {
     ($self:ident, $dyn_map:ident) => {
         fn bytes_loaded(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
@@ -254,7 +152,7 @@ macro_rules! impl_reduce_metrics {
 }
 
 macro_rules! metal_unary_op {
-    ($name:ident, $op_name:expr, $expr_builder:expr) => {
+    ($name:ident, $prepare:ident, $constructor:ident, $expr_builder:expr) => {
         #[derive(Debug, Default, Clone)]
         pub struct $name {
             shape: Vec<Expression>,
@@ -262,55 +160,25 @@ macro_rules! metal_unary_op {
             output_strides: Vec<Expression>,
         }
 
-        impl EgglogOp for $name {
-            fn sort(&self) -> SortDef {
-                unary_sort($op_name)
-            }
-
-            fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-                let hlir_name = ($op_name).strip_prefix("Metal").unwrap_or($op_name);
-                let hlir_sort = unary_sort(hlir_name);
-                vec![unary_dtype_rewrite(parser, &hlir_sort, &self.sort())]
+        pub fn $prepare(
+            kind: &OpKind,
+            _inputs: &mut Vec<Ir>,
+            context: &mut DecodeContext<'_, '_>,
+        ) -> Result<Option<LLIROp>, TypedError> {
+            let Some((shape, strides, out_strides)) = typed::get_args(
+                kind,
+                |shape: &EList, strides: &EList, out_strides: &EList| {
+                    crate::typed_rules::$constructor(shape, strides, out_strides)
+                },
+            )?
+            else {
+                return Ok(None);
             };
-        __rules.into_iter().flatten().collect()
-    }
-
-            fn cleanup(&self) -> bool {
-                false
-            }
-
-            fn extract<'a>(
-                &'a self,
-                egraph: &'a SerializedEGraph,
-                kind_children: &[&'a ENodeId],
-                input_enodes: Vec<&'a ENodeId>,
-                list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-                expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-            ) -> (LLIROp, Vec<&'a ENodeId>) {
-                use luminal::egglog_utils::extract_expr_list;
-                (
-                    LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                        shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                            .unwrap(),
-                        input_strides: extract_expr_list(
-                            egraph,
-                            kind_children[1],
-                            list_cache,
-                            expr_cache,
-                        )
-                        .unwrap(),
-                        output_strides: extract_expr_list(
-                            egraph,
-                            kind_children[2],
-                            list_cache,
-                            expr_cache,
-                        )
-                        .unwrap(),
-                    })),
-                    input_enodes,
-                )
-            }
+            Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new($name {
+                shape: context.expressions(&shape)?,
+                input_strides: context.expressions(&strides)?,
+                output_strides: context.expressions(&out_strides)?,
+            }))))
         }
 
         impl MetalKernelOp for $name {
@@ -399,11 +267,151 @@ macro_rules! metal_unary_op {
     };
 }
 
-metal_unary_op!(MetalExp2, "MetalExp2", |x: &str| format!("exp2({x})"));
-metal_unary_op!(MetalLog2, "MetalLog2", |x: &str| format!("log2({x})"));
-metal_unary_op!(MetalSin, "MetalSin", |x: &str| format!("sin({x})"));
-metal_unary_op!(MetalSqrt, "MetalSqrt", |x: &str| format!("sqrt({x})"));
-metal_unary_op!(MetalRecip, "MetalRecip", |x: &str| format!("1.0f / ({x})"));
+pub(crate) mod metal_exp2 {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        strides: &EList,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(OpKind::Exp2(shape, strides, out_strides), [inp]);
+        let replacement = &Ir::Op(metal_exp2(shape, strides, out_strides), [inp]);
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
+        )
+    }
+}
+
+pub(crate) mod metal_log2 {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        strides: &EList,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(OpKind::Log2(shape, strides, out_strides), [inp]);
+        let replacement = &Ir::Op(metal_log2(shape, strides, out_strides), [inp]);
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
+        )
+    }
+}
+
+pub(crate) mod metal_sin {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        strides: &EList,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(OpKind::Sin(shape, strides, out_strides), [inp]);
+        let replacement = &Ir::Op(metal_sin(shape, strides, out_strides), [inp]);
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
+        )
+    }
+}
+
+pub(crate) mod metal_sqrt {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        strides: &EList,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(OpKind::Sqrt(shape, strides, out_strides), [inp]);
+        let replacement = &Ir::Op(metal_sqrt(shape, strides, out_strides), [inp]);
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
+        )
+    }
+}
+
+pub(crate) mod metal_recip {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        strides: &EList,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(OpKind::Recip(shape, strides, out_strides), [inp]);
+        let replacement = &Ir::Op(metal_recip(shape, strides, out_strides), [inp]);
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
+        )
+    }
+}
+
+metal_unary_op!(MetalExp2, prepare_exp2, metal_exp2, |x: &str| format!(
+    "exp2({x})"
+));
+metal_unary_op!(MetalLog2, prepare_log2, metal_log2, |x: &str| format!(
+    "log2({x})"
+));
+metal_unary_op!(MetalSin, prepare_sin, metal_sin, |x: &str| format!(
+    "sin({x})"
+));
+metal_unary_op!(MetalSqrt, prepare_sqrt, metal_sqrt, |x: &str| format!(
+    "sqrt({x})"
+));
+metal_unary_op!(MetalRecip, prepare_recip, metal_recip, |x: &str| format!(
+    "1.0f / ({x})"
+));
 
 #[derive(Debug, Default, Clone)]
 pub struct MetalAdd {
@@ -413,56 +421,76 @@ pub struct MetalAdd {
     output_strides: Vec<Expression>,
 }
 
-impl EgglogOp for MetalAdd {
-    fn sort(&self) -> SortDef {
-        binary_sort("MetalAdd")
-    }
+pub(crate) mod metal_add {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (args2, hlir_match2) = new_op_call(&Add::default().sort(), &["inp_a", "inp_b"]);
-        let metal_op2 = op_term(
-            call_sort_from_args(&self.sort(), &args2),
-            args2["__inputs"].clone(),
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inp_a: &Ir,
+        inp_b: &Ir,
+        dt: &DType,
+    ) -> Vec<Rule> {
+        let source = &Ir::Op(
+            OpKind::Add(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
         );
-
+        let replacement = &Ir::Op(
+            metal_add(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
         vec![
-            binary_dtype_rewrite(parser, &Add::default().sort(), &self.sort()),
-            egglog!(
-                *parser,
-                (rule () ((union #(hlir_match2.clone()) #(metal_op2.clone())) (subsume #hlir_match2) (set (dtype #metal_op2) (F32))) :ruleset kernel_lower)
-            )
-            .expect("MetalAdd kernel-lowering rule should parse"),
+            rule(
+                (source, eq(dt, inp_a.dtype())),
+                (
+                    union(source, replacement),
+                    subsume(source),
+                    set(replacement.dtype(), dt),
+                ),
+            ),
+            rule(
+                source,
+                (
+                    union(source, replacement),
+                    subsume(source),
+                    set(replacement.dtype(), DType::F32()),
+                ),
+            ),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                output_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
-        )
+impl MetalAdd {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList, a_strides: &EList, b_strides: &EList, out_strides: &EList| {
+                    crate::typed_rules::metal_add(shape, a_strides, b_strides, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            a_strides: decoded_a_strides,
+            b_strides: decoded_b_strides,
+            output_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -563,43 +591,66 @@ pub struct MetalMul {
     output_strides: Vec<Expression>,
 }
 
-impl EgglogOp for MetalMul {
-    fn sort(&self) -> SortDef {
-        binary_sort("MetalMul")
-    }
+pub(crate) mod metal_mul {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![binary_dtype_rewrite(parser, &Mul::default().sort(), &self.sort())]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                output_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inp_a: &Ir,
+        inp_b: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Mul(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        let replacement = &Ir::Op(
+            metal_mul(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        rule(
+            (source, eq(dt, inp_a.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
         )
+    }
+}
+
+impl MetalMul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList, a_strides: &EList, b_strides: &EList, out_strides: &EList| {
+                    crate::typed_rules::metal_mul(shape, a_strides, b_strides, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            a_strides: decoded_a_strides,
+            b_strides: decoded_b_strides,
+            output_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -708,43 +759,66 @@ pub struct MetalMod {
     output_strides: Vec<Expression>,
 }
 
-impl EgglogOp for MetalMod {
-    fn sort(&self) -> SortDef {
-        binary_sort("MetalMod")
-    }
+pub(crate) mod metal_mod {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![binary_dtype_rewrite(parser, &Mod::default().sort(), &self.sort())]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                output_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inp_a: &Ir,
+        inp_b: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Mod(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        let replacement = &Ir::Op(
+            metal_mod(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        rule(
+            (source, eq(dt, inp_a.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
         )
+    }
+}
+
+impl MetalMod {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList, a_strides: &EList, b_strides: &EList, out_strides: &EList| {
+                    crate::typed_rules::metal_mod(shape, a_strides, b_strides, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            a_strides: decoded_a_strides,
+            b_strides: decoded_b_strides,
+            output_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -849,46 +923,66 @@ pub struct MetalLessThan {
     output_strides: Vec<Expression>,
 }
 
-impl EgglogOp for MetalLessThan {
-    fn sort(&self) -> SortDef {
-        binary_sort("MetalLessThan")
-    }
+pub(crate) mod metal_less_than {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![binary_dtype_rewrite(
-            &LessThan::default().sort(),
-            &self.sort(),
-        )]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                output_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        a_strides: &EList,
+        b_strides: &EList,
+        out_strides: &EList,
+        inp_a: &Ir,
+        inp_b: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::LessThan(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        let replacement = &Ir::Op(
+            metal_less_than(shape, a_strides, b_strides, out_strides),
+            [inp_a, inp_b],
+        );
+        rule(
+            (source, eq(dt, inp_a.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
         )
+    }
+}
+
+impl MetalLessThan {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_a_strides, field_b_strides, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList, a_strides: &EList, b_strides: &EList, out_strides: &EList| {
+                    crate::typed_rules::metal_less_than(shape, a_strides, b_strides, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_a_strides = context.expressions(&field_a_strides)?;
+        let decoded_b_strides = context.expressions(&field_b_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            a_strides: decoded_a_strides,
+            b_strides: decoded_b_strides,
+            output_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -1001,48 +1095,70 @@ pub struct MetalSumReduce {
     out_stride: Vec<Expression>,
 }
 
-impl EgglogOp for MetalSumReduce {
-    fn sort(&self) -> SortDef {
-        reduce_sort("MetalSum")
-    }
+pub(crate) mod metal_sum {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![unary_dtype_rewrite(
-            &SumReduce::default().sort(),
-            &self.sort(),
-        )]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr;
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                in_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        iters: &DimExpr,
+        strides: &EList,
+        iter_stride: &DimExpr,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Sum(shape, iters, strides, iter_stride, out_strides),
+            [inp],
+        );
+        let replacement = &Ir::Op(
+            metal_sum(shape, iters, strides, iter_stride, out_strides),
+            [inp],
+        );
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
         )
+    }
+}
+
+impl MetalSumReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_iters, field_strides, field_iter_stride, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList,
+                 iters: &DimExpr,
+                 strides: &EList,
+                 iter_stride: &DimExpr,
+                 out_strides: &EList| {
+                    crate::typed_rules::metal_sum(shape, iters, strides, iter_stride, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            iters: context.expression(&field_iters)?,
+            in_stride: decoded_strides,
+            iter_stride: context.expression(&field_iter_stride)?,
+            out_stride: decoded_out_strides,
+        }))))
     }
 }
 
@@ -1175,48 +1291,70 @@ pub struct MetalMaxReduce {
     out_stride: Vec<Expression>,
 }
 
-impl EgglogOp for MetalMaxReduce {
-    fn sort(&self) -> SortDef {
-        reduce_sort("MetalMax")
-    }
+pub(crate) mod metal_max {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![unary_dtype_rewrite(
-            &MaxReduce::default().sort(),
-            &self.sort(),
-        )]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr;
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                in_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        shape: &EList,
+        iters: &DimExpr,
+        strides: &EList,
+        iter_stride: &DimExpr,
+        out_strides: &EList,
+        inp: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            OpKind::Max(shape, iters, strides, iter_stride, out_strides),
+            [inp],
+        );
+        let replacement = &Ir::Op(
+            metal_max(shape, iters, strides, iter_stride, out_strides),
+            [inp],
+        );
+        rule(
+            (source, eq(dt, inp.dtype())),
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dt),
+            ),
         )
+    }
+}
+
+impl MetalMaxReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_iters, field_strides, field_iter_stride, field_out_strides)) =
+            typed::get_args(
+                kind,
+                |shape: &EList,
+                 iters: &DimExpr,
+                 strides: &EList,
+                 iter_stride: &DimExpr,
+                 out_strides: &EList| {
+                    crate::typed_rules::metal_max(shape, iters, strides, iter_stride, out_strides)
+                },
+            )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            out_shape: decoded_shape,
+            iters: context.expression(&field_iters)?,
+            in_stride: decoded_strides,
+            iter_stride: context.expression(&field_iter_stride)?,
+            out_stride: decoded_out_strides,
+        }))))
     }
 }
 
@@ -1343,203 +1481,284 @@ pub struct MPSMatmul {
     pub transpose_rhs: bool,
 }
 
-impl EgglogOp for MPSMatmul {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MPSMatmul",
-            &[
-                ("m", EXPRESSION),
-                ("n", EXPRESSION),
-                ("k", EXPRESSION),
-                ("lhs", IR),
-                ("lhs_row_stride", EXPRESSION),
-                ("rhs", IR),
-                ("rhs_row_stride", EXPRESSION),
-                ("out_row_stride", EXPRESSION),
-                ("transpose_lhs", I64),
-                ("transpose_rhs", I64),
-            ],
-        )
-    }
+pub(crate) mod m_p_s_matmul {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let zero = num(lit_i64(0));
-        let z = iter();
-        let expr_list = |terms: Vec<EggTerm>| {
-            terms
-                .into_iter()
-                .rev()
-                .fold(nil(), |tail, head| cons(head, tail))
-        };
-
-        let matmul_rule = |name: &'static str,
-                           lhs_layout: MPSMatrixLayout,
-                           rhs_layout: MPSMatrixLayout,
-                           transpose_lhs: i64,
-                           transpose_rhs: i64| {
-            let m = v("?m");
-            let n = v("?n");
-            let k = v("?k");
-            let lhs = v("?lhs");
-            let rhs = v("?rhs");
-            let lhs_row_stride = match lhs_layout {
-                MPSMatrixLayout::RowMajor => mul(k.clone(), z.clone()),
-                MPSMatrixLayout::TransposedRowMajor => mul(m.clone(), z.clone()),
-            };
-            let rhs_row_stride = match rhs_layout {
-                MPSMatrixLayout::RowMajor => mul(n.clone(), z.clone()),
-                MPSMatrixLayout::TransposedRowMajor => mul(k.clone(), z.clone()),
-            };
-            let lhs_strides = match lhs_layout {
-                MPSMatrixLayout::RowMajor => vec![lhs_row_stride.clone(), zero.clone(), z.clone()],
-                MPSMatrixLayout::TransposedRowMajor => {
-                    vec![z.clone(), zero.clone(), lhs_row_stride.clone()]
-                }
-            };
-            let rhs_strides = match rhs_layout {
-                MPSMatrixLayout::RowMajor => vec![zero.clone(), z.clone(), rhs_row_stride.clone()],
-                MPSMatrixLayout::TransposedRowMajor => {
-                    vec![zero.clone(), rhs_row_stride.clone(), z.clone()]
-                }
-            };
-            let out_row_stride = mul(n.clone(), z.clone());
-            let mul_output_strides = v("?mul_output_strides");
-
-            let mul_op = op_term(
-                MetalMul {
-                    shape: vec![],
-                    a_strides: vec![],
-                    b_strides: vec![],
-                    output_strides: vec![],
-                }
-                .sort()
-                .call([
-                    (
-                        "shape",
-                        cons(m.clone(), cons(n.clone(), cons(k.clone(), nil()))),
-                    ),
-                    ("a_strides", expr_list(lhs_strides)),
-                    ("b_strides", expr_list(rhs_strides)),
-                    ("out_strides", mul_output_strides.clone()),
-                ]),
-                ilist(vec![lhs.clone(), rhs.clone()]),
-            );
-            let sum_op = op_term(
-                MetalSumReduce::default().sort().call([
-                    ("shape", cons(m.clone(), cons(n.clone(), nil()))),
-                    ("iters", k.clone()),
-                    ("strides", v("?sum_in_strides")),
-                    ("iter_stride", z.clone()),
-                    (
-                        "out_strides",
-                        cons(out_row_stride.clone(), cons(z.clone(), nil())),
-                    ),
-                ]),
-                ilist(vec![mul_op.clone()]),
-            );
-            let mps_op = MPSMatmul::default().sort().call([
-                ("m", m),
-                ("n", n),
-                ("k", k),
-                ("lhs", lhs),
-                ("lhs_row_stride", lhs_row_stride),
-                ("rhs", rhs),
-                ("rhs_row_stride", rhs_row_stride),
-                ("out_row_stride", out_row_stride),
-                ("transpose_lhs", lit_i64(transpose_lhs)),
-                ("transpose_rhs", lit_i64(transpose_rhs)),
-            ]);
-            let dt = v(format!("?{}_dt", name.replace('-', "_")));
-
-            egglog!(
-                *parser,
-                (rule ((= #(dt.clone()) (dtype #(sum_op.clone())))) ((union #sum_op #(mps_op.clone())) (set (dtype #mps_op) #dt)) :ruleset kernel_lower)
-            )
-            .expect("Metal MPS-sum kernel-lowering rule should parse")
-                .name(name)
-        };
-
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        m: &DimExpr,
+        n: &DimExpr,
+        k: &DimExpr,
+        sum_in_strides: &EList,
+        mul_output_strides: &EList,
+        lhs: &Ir,
+        rhs: &Ir,
+        dt: &DType,
+    ) -> Vec<Rule> {
+        let row_row = &Ir::Op(
+            metal_sum(
+                [m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [&(n * DimExpr::MIter()), &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [m, n, k],
+                    [
+                        &(k * DimExpr::MIter()),
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                    ],
+                    [
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                        &(n * DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let mps_row_row = &Ir::Op(
+            mps_matmul(
+                m,
+                n,
+                k,
+                k * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                0_i64,
+                0_i64,
+            ),
+            [lhs, rhs],
+        );
+        let row_col = &Ir::Op(
+            metal_sum(
+                [m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [&(n * DimExpr::MIter()), &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [m, n, k],
+                    [
+                        &(k * DimExpr::MIter()),
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                    ],
+                    [
+                        &(DimExpr::MNum(0)),
+                        &(k * DimExpr::MIter()),
+                        &(DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let mps_row_col = &Ir::Op(
+            mps_matmul(
+                m,
+                n,
+                k,
+                k * DimExpr::MIter(),
+                k * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                0_i64,
+                1_i64,
+            ),
+            [lhs, rhs],
+        );
+        let col_row = &Ir::Op(
+            metal_sum(
+                [m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [&(n * DimExpr::MIter()), &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [m, n, k],
+                    [
+                        &(DimExpr::MIter()),
+                        &(DimExpr::MNum(0)),
+                        &(m * DimExpr::MIter()),
+                    ],
+                    [
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                        &(n * DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let mps_col_row = &Ir::Op(
+            mps_matmul(
+                m,
+                n,
+                k,
+                m * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                1_i64,
+                0_i64,
+            ),
+            [lhs, rhs],
+        );
+        let col_col = &Ir::Op(
+            metal_sum(
+                [m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [&(n * DimExpr::MIter()), &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [m, n, k],
+                    [
+                        &(DimExpr::MIter()),
+                        &(DimExpr::MNum(0)),
+                        &(m * DimExpr::MIter()),
+                    ],
+                    [
+                        &(DimExpr::MNum(0)),
+                        &(k * DimExpr::MIter()),
+                        &(DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let mps_col_col = &Ir::Op(
+            mps_matmul(
+                m,
+                n,
+                k,
+                m * DimExpr::MIter(),
+                k * DimExpr::MIter(),
+                n * DimExpr::MIter(),
+                1_i64,
+                1_i64,
+            ),
+            [lhs, rhs],
+        );
         vec![
-            matmul_rule(
-                "mps-matmul-row-row",
-                MPSMatrixLayout::RowMajor,
-                MPSMatrixLayout::RowMajor,
-                0,
-                0,
-            ),
-            matmul_rule(
-                "mps-matmul-row-transposed-rhs",
-                MPSMatrixLayout::RowMajor,
-                MPSMatrixLayout::TransposedRowMajor,
-                0,
-                1,
-            ),
-            matmul_rule(
-                "mps-matmul-transposed-lhs-row",
-                MPSMatrixLayout::TransposedRowMajor,
-                MPSMatrixLayout::RowMajor,
-                1,
-                0,
-            ),
-            matmul_rule(
-                "mps-matmul-transposed-lhs-transposed-rhs",
-                MPSMatrixLayout::TransposedRowMajor,
-                MPSMatrixLayout::TransposedRowMajor,
-                1,
-                1,
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
-                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (= ?sum (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
-                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
-                    :ruleset cleanup
-                    :name \"delete-broadcast-mul-sum-when-mps-matmul-exists\"
-                )",
-            ),
+            rule(
+                (row_row, eq(dt, row_row.dtype())),
+                (union(row_row, mps_row_row), set(mps_row_row.dtype(), dt)),
+            )
+            .label("mps-matmul-row-row"),
+            rule(
+                (row_col, eq(dt, row_col.dtype())),
+                (union(row_col, mps_row_col), set(mps_row_col.dtype(), dt)),
+            )
+            .label("mps-matmul-row-transposed-rhs"),
+            rule(
+                (col_row, eq(dt, col_row.dtype())),
+                (union(col_row, mps_col_row), set(mps_col_row.dtype(), dt)),
+            )
+            .label("mps-matmul-transposed-lhs-row"),
+            rule(
+                (col_col, eq(dt, col_col.dtype())),
+                (union(col_col, mps_col_col), set(mps_col_col.dtype(), dt)),
+            )
+            .label("mps-matmul-transposed-lhs-transposed-rhs"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr;
-        let extract_flag = |node: &'a ENodeId| -> bool {
-            match egraph.enodes[node].0.as_str() {
-                "0" => false,
-                "1" => true,
-                other => panic!("invalid MPSMatmul transpose flag {other}"),
-            }
-        };
-
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                m: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                n: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                k: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                lhs_row_stride: extract_expr(egraph, kind_children[4], expr_cache).unwrap(),
-                rhs_row_stride: extract_expr(egraph, kind_children[6], expr_cache).unwrap(),
-                out_row_stride: extract_expr(egraph, kind_children[7], expr_cache).unwrap(),
-                transpose_lhs: extract_flag(kind_children[8]),
-                transpose_rhs: extract_flag(kind_children[9]),
-            })),
-            vec![kind_children[3], kind_children[5]],
+    #[ruleset]
+    pub(crate) fn cleanup(inputs: &IList, mul: &Ir, sum: &Ir, lhs: &Ir, rhs: &Ir) -> Rule {
+        let source = &Ir::Op(MetalMulArgs::fresh(), inputs);
+        let reduction = &Ir::Op(MetalSumArgs::fresh(), [mul]);
+        rule(
+            (
+                eq(mul, source),
+                eq(sum, reduction),
+                eq(sum, Ir::Op(MPSMatmulArgs::fresh(), [lhs, rhs])),
+            ),
+            (delete(reduction), delete(source)),
         )
+        .label("delete-broadcast-mul-sum-when-mps-matmul-exists")
+    }
+}
+
+impl MPSMatmul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_m,
+            field_n,
+            field_k,
+            field_lhs_row_stride,
+            field_rhs_row_stride,
+            field_out_row_stride,
+            field_transpose_lhs,
+            field_transpose_rhs,
+        )) = typed::get_args(
+            kind,
+            |m: &DimExpr,
+             n: &DimExpr,
+             k: &DimExpr,
+             lhs_row_stride: &DimExpr,
+             rhs_row_stride: &DimExpr,
+             out_row_stride: &DimExpr,
+             transpose_lhs: &egg::I64,
+             transpose_rhs: &egg::I64| {
+                crate::typed_rules::mps_matmul(
+                    m,
+                    n,
+                    k,
+                    lhs_row_stride,
+                    rhs_row_stride,
+                    out_row_stride,
+                    transpose_lhs,
+                    transpose_rhs,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            m: context.expression(&field_m)?,
+            n: context.expression(&field_n)?,
+            k: context.expression(&field_k)?,
+            lhs_row_stride: context.expression(&field_lhs_row_stride)?,
+            rhs_row_stride: context.expression(&field_rhs_row_stride)?,
+            out_row_stride: context.expression(&field_out_row_stride)?,
+            transpose_lhs: match i64::try_from(&field_transpose_lhs)? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(TypedError::Decode(format!(
+                        "invalid transpose flag {value}"
+                    )));
+                }
+            },
+            transpose_rhs: match i64::try_from(&field_transpose_rhs)? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(TypedError::Decode(format!(
+                        "invalid transpose flag {value}"
+                    )));
+                }
+            },
+        }))))
     }
 }
 
@@ -1720,245 +1939,330 @@ pub struct MPSBatchedMatmul {
     pub transpose_rhs: bool,
 }
 
-impl EgglogOp for MPSBatchedMatmul {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MPSBatchedMatmul",
-            &[
-                ("batch", EXPRESSION),
-                ("m", EXPRESSION),
-                ("n", EXPRESSION),
-                ("k", EXPRESSION),
-                ("lhs", IR),
-                ("lhs_batch_stride", EXPRESSION),
-                ("lhs_row_stride", EXPRESSION),
-                ("rhs", IR),
-                ("rhs_batch_stride", EXPRESSION),
-                ("rhs_row_stride", EXPRESSION),
-                ("out_batch_stride", EXPRESSION),
-                ("out_row_stride", EXPRESSION),
-                ("transpose_lhs", I64),
-                ("transpose_rhs", I64),
-            ],
-        )
-    }
+pub(crate) mod m_p_s_batched_matmul {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let zero = num(lit_i64(0));
-        let z = iter();
-        let expr_list = |terms: Vec<EggTerm>| {
-            terms
-                .into_iter()
-                .rev()
-                .fold(nil(), |tail, head| cons(head, tail))
-        };
-
-        let batched_rule = |name: &'static str,
-                            rhs_layout: MPSMatrixLayout,
-                            lhs_inner_stride: EggTerm,
-                            transpose_rhs: i64| {
-            let batch = v("?batch");
-            let m = v("?m");
-            let n = v("?n");
-            let k = v("?k");
-            let lhs = v("?lhs");
-            let rhs = v("?rhs");
-            let lhs_batch_stride = v(format!("?{name}_lhs_batch_stride").replace('-', "_"));
-            let lhs_row_stride = v(format!("?{name}_lhs_row_stride").replace('-', "_"));
-            let rhs_batch_stride = v(format!("?{name}_rhs_batch_stride").replace('-', "_"));
-            let rhs_row_stride = v(format!("?{name}_rhs_row_stride").replace('-', "_"));
-            let out_batch_stride = v(format!("?{name}_out_batch_stride").replace('-', "_"));
-            let out_row_stride = v(format!("?{name}_out_row_stride").replace('-', "_"));
-            let mul_output_strides = v(format!("?{name}_mul_output_strides").replace('-', "_"));
-
-            let rhs_strides = match rhs_layout {
-                MPSMatrixLayout::RowMajor => vec![
-                    rhs_batch_stride.clone(),
-                    zero.clone(),
-                    z.clone(),
-                    rhs_row_stride.clone(),
-                ],
-                MPSMatrixLayout::TransposedRowMajor => vec![
-                    rhs_batch_stride.clone(),
-                    zero.clone(),
-                    rhs_row_stride.clone(),
-                    z.clone(),
-                ],
-            };
-            let mul_op = op_term(
-                MetalMul {
-                    shape: vec![],
-                    a_strides: vec![],
-                    b_strides: vec![],
-                    output_strides: vec![],
-                }
-                .sort()
-                .call([
-                    (
-                        "shape",
-                        cons(
-                            batch.clone(),
-                            cons(m.clone(), cons(n.clone(), cons(k.clone(), nil()))),
-                        ),
-                    ),
-                    (
-                        "a_strides",
-                        expr_list(vec![
-                            lhs_batch_stride.clone(),
-                            lhs_row_stride.clone(),
-                            zero.clone(),
-                            lhs_inner_stride,
-                        ]),
-                    ),
-                    ("b_strides", expr_list(rhs_strides)),
-                    ("out_strides", mul_output_strides),
-                ]),
-                ilist(vec![lhs.clone(), rhs.clone()]),
-            );
-            let sum_op = op_term(
-                MetalSumReduce::default().sort().call([
-                    (
-                        "shape",
-                        cons(batch.clone(), cons(m.clone(), cons(n.clone(), nil()))),
-                    ),
-                    ("iters", k.clone()),
-                    (
-                        "strides",
-                        v(format!("?{name}_sum_in_strides").replace('-', "_")),
-                    ),
-                    ("iter_stride", z.clone()),
-                    (
-                        "out_strides",
-                        cons(
-                            out_batch_stride.clone(),
-                            cons(out_row_stride.clone(), cons(z.clone(), nil())),
-                        ),
-                    ),
-                ]),
-                ilist(vec![mul_op.clone()]),
-            );
-            let rhs_cols = match rhs_layout {
-                MPSMatrixLayout::RowMajor => n.clone(),
-                MPSMatrixLayout::TransposedRowMajor => k.clone(),
-            };
-            let mps_matrix_row_byte_guards = vec![
-                eq(lhs_row_stride.clone(), mul(k.clone(), z.clone())),
-                eq(rhs_row_stride.clone(), mul(rhs_cols, z.clone())),
-                eq(out_row_stride.clone(), mul(n.clone(), z.clone())),
-            ];
-            let mps_op = MPSBatchedMatmul::default().sort().call([
-                ("batch", batch),
-                ("m", m),
-                ("n", n),
-                ("k", k),
-                ("lhs", lhs),
-                ("lhs_batch_stride", lhs_batch_stride),
-                ("lhs_row_stride", lhs_row_stride),
-                ("rhs", rhs),
-                ("rhs_batch_stride", rhs_batch_stride),
-                ("rhs_row_stride", rhs_row_stride),
-                ("out_batch_stride", out_batch_stride),
-                ("out_row_stride", out_row_stride),
-                ("transpose_lhs", lit_i64(0)),
-                ("transpose_rhs", lit_i64(transpose_rhs)),
-            ]);
-            let dt = v(format!("?{}_dt", name.replace('-', "_")));
-
-            egglog!(
-                *parser,
-                (rule ((= #(dt.clone()) (dtype #(sum_op.clone()))) #..mps_matrix_row_byte_guards) ((union #sum_op #(mps_op.clone())) (set (dtype #mps_op) #dt)) :ruleset kernel_lower)
-            )
-            .expect("Metal MPS-sum (row-guarded) kernel-lowering rule should parse")
-                .name(name)
-        };
-
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        batch: &DimExpr,
+        m: &DimExpr,
+        n: &DimExpr,
+        k: &DimExpr,
+        sum_in_strides: &EList,
+        out_batch_stride: &DimExpr,
+        out_row_stride: &DimExpr,
+        lhs_batch_stride: &DimExpr,
+        lhs_row_stride: &DimExpr,
+        rhs_batch_stride: &DimExpr,
+        rhs_row_stride: &DimExpr,
+        mul_output_strides: &EList,
+        lhs: &Ir,
+        rhs: &Ir,
+        dt: &DType,
+    ) -> Vec<Rule> {
+        let row_source = &Ir::Op(
+            metal_sum(
+                [batch, m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [out_batch_stride, out_row_stride, &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [batch, m, n, k],
+                    [
+                        lhs_batch_stride,
+                        lhs_row_stride,
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                    ],
+                    [
+                        rhs_batch_stride,
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                        rhs_row_stride,
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let row_matmul = &Ir::Op(
+            mps_batched_matmul(
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                lhs_row_stride,
+                rhs_batch_stride,
+                rhs_row_stride,
+                out_batch_stride,
+                out_row_stride,
+                0_i64,
+                0_i64,
+            ),
+            [lhs, rhs],
+        );
+        let transposed_source = &Ir::Op(
+            metal_sum(
+                [batch, m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [out_batch_stride, out_row_stride, &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [batch, m, n, k],
+                    [
+                        lhs_batch_stride,
+                        lhs_row_stride,
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                    ],
+                    [
+                        rhs_batch_stride,
+                        &(DimExpr::MNum(0)),
+                        rhs_row_stride,
+                        &(DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let transposed_matmul = &Ir::Op(
+            mps_batched_matmul(
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                lhs_row_stride,
+                rhs_batch_stride,
+                rhs_row_stride,
+                out_batch_stride,
+                out_row_stride,
+                0_i64,
+                1_i64,
+            ),
+            [lhs, rhs],
+        );
+        let wrapped_row_source = &Ir::Op(
+            metal_sum(
+                [batch, m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [out_batch_stride, out_row_stride, &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [batch, m, n, k],
+                    [
+                        lhs_batch_stride,
+                        lhs_row_stride,
+                        &(DimExpr::MNum(0)),
+                        &((((DimExpr::MIter() / k) * k) * m) + (DimExpr::MIter() % k)),
+                    ],
+                    [
+                        rhs_batch_stride,
+                        &(DimExpr::MNum(0)),
+                        &(DimExpr::MIter()),
+                        rhs_row_stride,
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let wrapped_transposed_source = &Ir::Op(
+            metal_sum(
+                [batch, m, n],
+                k,
+                sum_in_strides,
+                DimExpr::MIter(),
+                [out_batch_stride, out_row_stride, &(DimExpr::MIter())],
+            ),
+            [&(Ir::Op(
+                metal_mul(
+                    [batch, m, n, k],
+                    [
+                        lhs_batch_stride,
+                        lhs_row_stride,
+                        &(DimExpr::MNum(0)),
+                        &((((DimExpr::MIter() / k) * k) * m) + (DimExpr::MIter() % k)),
+                    ],
+                    [
+                        rhs_batch_stride,
+                        &(DimExpr::MNum(0)),
+                        rhs_row_stride,
+                        &(DimExpr::MIter()),
+                    ],
+                    mul_output_strides,
+                ),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
         vec![
-            batched_rule(
-                "mps-batched-matmul-row-row",
-                MPSMatrixLayout::RowMajor,
-                z.clone(),
-                0,
-            ),
-            batched_rule(
-                "mps-batched-matmul-row-transposed-rhs",
-                MPSMatrixLayout::TransposedRowMajor,
-                z.clone(),
-                1,
-            ),
-            batched_rule(
-                "mps-batched-matmul-row-row-wrapped-inner",
-                MPSMatrixLayout::RowMajor,
-                add(
-                    mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
-                    modd(z.clone(), v("?k")),
+            rule(
+                (
+                    row_source,
+                    eq(dt, row_source.dtype()),
+                    eq(lhs_row_stride, k * DimExpr::MIter()),
+                    eq(rhs_row_stride, n * DimExpr::MIter()),
+                    eq(out_row_stride, n * DimExpr::MIter()),
                 ),
-                0,
-            ),
-            batched_rule(
-                "mps-batched-matmul-row-transposed-rhs-wrapped-inner",
-                MPSMatrixLayout::TransposedRowMajor,
-                add(
-                    mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
-                    modd(z.clone(), v("?k")),
+                (union(row_source, row_matmul), set(row_matmul.dtype(), dt)),
+            )
+            .label("mps-batched-matmul-row-row"),
+            rule(
+                (
+                    transposed_source,
+                    eq(dt, transposed_source.dtype()),
+                    eq(lhs_row_stride, k * DimExpr::MIter()),
+                    eq(rhs_row_stride, k * DimExpr::MIter()),
+                    eq(out_row_stride, n * DimExpr::MIter()),
                 ),
-                1,
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
-                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (= ?sum (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
-                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
-                    :ruleset cleanup
-                    :name \"delete-broadcast-mul-sum-when-mps-batched-matmul-exists\"
-                )",
-            ),
+                (
+                    union(transposed_source, transposed_matmul),
+                    set(transposed_matmul.dtype(), dt),
+                ),
+            )
+            .label("mps-batched-matmul-row-transposed-rhs"),
+            rule(
+                (
+                    wrapped_row_source,
+                    eq(dt, wrapped_row_source.dtype()),
+                    eq(lhs_row_stride, k * DimExpr::MIter()),
+                    eq(rhs_row_stride, n * DimExpr::MIter()),
+                    eq(out_row_stride, n * DimExpr::MIter()),
+                ),
+                (
+                    union(wrapped_row_source, row_matmul),
+                    set(row_matmul.dtype(), dt),
+                ),
+            )
+            .label("mps-batched-matmul-row-row-wrapped-inner"),
+            rule(
+                (
+                    wrapped_transposed_source,
+                    eq(dt, wrapped_transposed_source.dtype()),
+                    eq(lhs_row_stride, k * DimExpr::MIter()),
+                    eq(rhs_row_stride, k * DimExpr::MIter()),
+                    eq(out_row_stride, n * DimExpr::MIter()),
+                ),
+                (
+                    union(wrapped_transposed_source, transposed_matmul),
+                    set(transposed_matmul.dtype(), dt),
+                ),
+            )
+            .label("mps-batched-matmul-row-transposed-rhs-wrapped-inner"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr;
-        let extract_flag = |node: &'a ENodeId| -> bool {
-            match egraph.enodes[node].0.as_str() {
-                "0" => false,
-                "1" => true,
-                other => panic!("invalid MPSBatchedMatmul transpose flag {other}"),
-            }
-        };
-
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                batch: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                m: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                n: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                k: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                lhs_batch_stride: extract_expr(egraph, kind_children[5], expr_cache).unwrap(),
-                lhs_row_stride: extract_expr(egraph, kind_children[6], expr_cache).unwrap(),
-                rhs_batch_stride: extract_expr(egraph, kind_children[8], expr_cache).unwrap(),
-                rhs_row_stride: extract_expr(egraph, kind_children[9], expr_cache).unwrap(),
-                out_batch_stride: extract_expr(egraph, kind_children[10], expr_cache).unwrap(),
-                out_row_stride: extract_expr(egraph, kind_children[11], expr_cache).unwrap(),
-                transpose_lhs: extract_flag(kind_children[12]),
-                transpose_rhs: extract_flag(kind_children[13]),
-            })),
-            vec![kind_children[4], kind_children[7]],
+    #[ruleset]
+    pub(crate) fn cleanup(inputs: &IList, mul: &Ir, sum: &Ir, lhs: &Ir, rhs: &Ir) -> Rule {
+        let source = &Ir::Op(MetalMulArgs::fresh(), inputs);
+        let reduction = &Ir::Op(MetalSumArgs::fresh(), [mul]);
+        rule(
+            (
+                eq(mul, source),
+                eq(sum, reduction),
+                eq(sum, Ir::Op(MPSBatchedMatmulArgs::fresh(), [lhs, rhs])),
+            ),
+            (delete(reduction), delete(source)),
         )
+        .label("delete-broadcast-mul-sum-when-mps-batched-matmul-exists")
+    }
+}
+
+impl MPSBatchedMatmul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_batch,
+            field_m,
+            field_n,
+            field_k,
+            field_lhs_batch_stride,
+            field_lhs_row_stride,
+            field_rhs_batch_stride,
+            field_rhs_row_stride,
+            field_out_batch_stride,
+            field_out_row_stride,
+            field_transpose_lhs,
+            field_transpose_rhs,
+        )) = typed::get_args(
+            kind,
+            |batch: &DimExpr,
+             m: &DimExpr,
+             n: &DimExpr,
+             k: &DimExpr,
+             lhs_batch_stride: &DimExpr,
+             lhs_row_stride: &DimExpr,
+             rhs_batch_stride: &DimExpr,
+             rhs_row_stride: &DimExpr,
+             out_batch_stride: &DimExpr,
+             out_row_stride: &DimExpr,
+             transpose_lhs: &egg::I64,
+             transpose_rhs: &egg::I64| {
+                crate::typed_rules::mps_batched_matmul(
+                    batch,
+                    m,
+                    n,
+                    k,
+                    lhs_batch_stride,
+                    lhs_row_stride,
+                    rhs_batch_stride,
+                    rhs_row_stride,
+                    out_batch_stride,
+                    out_row_stride,
+                    transpose_lhs,
+                    transpose_rhs,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            batch: context.expression(&field_batch)?,
+            m: context.expression(&field_m)?,
+            n: context.expression(&field_n)?,
+            k: context.expression(&field_k)?,
+            lhs_batch_stride: context.expression(&field_lhs_batch_stride)?,
+            lhs_row_stride: context.expression(&field_lhs_row_stride)?,
+            rhs_batch_stride: context.expression(&field_rhs_batch_stride)?,
+            rhs_row_stride: context.expression(&field_rhs_row_stride)?,
+            out_batch_stride: context.expression(&field_out_batch_stride)?,
+            out_row_stride: context.expression(&field_out_row_stride)?,
+            transpose_lhs: match i64::try_from(&field_transpose_lhs)? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(TypedError::Decode(format!(
+                        "invalid transpose flag {value}"
+                    )));
+                }
+            },
+            transpose_rhs: match i64::try_from(&field_transpose_rhs)? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(TypedError::Decode(format!(
+                        "invalid transpose flag {value}"
+                    )));
+                }
+            },
+        }))))
     }
 }
 
@@ -2119,133 +2423,131 @@ pub struct GenericMatmul {
     pub out_strides: Vec<Expression>,
 }
 
-impl EgglogOp for GenericMatmul {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "GenericMatmul",
-            &[
-                ("out_shape", ELIST),
-                ("mul_shape", ELIST),
-                ("k", EXPRESSION),
-                ("lhs", IR),
-                ("lhs_strides", ELIST),
-                ("rhs", IR),
-                ("rhs_strides", ELIST),
-                ("sum_input_strides", ELIST),
-                ("sum_iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-            ],
-        )
-    }
+pub(crate) mod generic_matmul {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let mul_shape = v("?generic_matmul_mul_shape");
-        let out_shape = v("?generic_matmul_out_shape");
-        let k = v("?generic_matmul_k");
-        let lhs = v("?generic_matmul_lhs");
-        let rhs = v("?generic_matmul_rhs");
-        let lhs_strides = v("?generic_matmul_lhs_strides");
-        let rhs_strides = v("?generic_matmul_rhs_strides");
-        let mul_output_strides = v("?generic_matmul_mul_output_strides");
-        let sum_input_strides = v("?generic_matmul_sum_input_strides");
-        let sum_iter_stride = v("?generic_matmul_sum_iter_stride");
-        let out_strides = v("?generic_matmul_out_strides");
-
-        let mul_op = op_term(
-            MetalMul::default().sort().call([
-                ("shape", mul_shape.clone()),
-                ("a_strides", lhs_strides.clone()),
-                ("b_strides", rhs_strides.clone()),
-                ("out_strides", mul_output_strides),
-            ]),
-            ilist(vec![lhs.clone(), rhs.clone()]),
-        );
-        let sum_op = op_term(
-            MetalSumReduce::default().sort().call([
-                ("shape", out_shape.clone()),
-                ("iters", k.clone()),
-                ("strides", sum_input_strides.clone()),
-                ("iter_stride", sum_iter_stride.clone()),
-                ("out_strides", out_strides.clone()),
-            ]),
-            ilist(vec![mul_op.clone()]),
-        );
-        let generic_op = GenericMatmul::default().sort().call([
-            ("out_shape", out_shape),
-            ("mul_shape", mul_shape),
-            ("k", k),
-            ("lhs", lhs),
-            ("lhs_strides", lhs_strides),
-            ("rhs", rhs),
-            ("rhs_strides", rhs_strides),
-            ("sum_input_strides", sum_input_strides),
-            ("sum_iter_stride", sum_iter_stride),
-            ("out_strides", out_strides),
-        ]);
-        let dt = v("?generic_matmul_dt");
-
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #(dt.clone()) (dtype #(sum_op.clone())))) ((union #sum_op #(generic_op.clone())) (set (dtype #generic_op) #dt)) :ruleset matmul_backend)
-            )
-            .expect("Metal MPS generic-matmul rule should parse")
-                .name("generic-matmul-metal-mul-sum"),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
-                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
-                    :ruleset cleanup
-                    :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
-                )",
+    #[ruleset]
+    pub(crate) fn matmul_backend(
+        out_shape: &EList,
+        k: &DimExpr,
+        sum_iter_stride: &DimExpr,
+        out_strides: &EList,
+        mul_shape: &EList,
+        lhs_strides: &EList,
+        rhs_strides: &EList,
+        lhs: &Ir,
+        rhs: &Ir,
+        dt: &DType,
+        sum_input_strides: &EList,
+        mul_output_strides: &EList,
+    ) -> Rule {
+        let source = &Ir::Op(
+            metal_sum(
+                out_shape,
+                k,
+                sum_input_strides,
+                sum_iter_stride,
+                out_strides,
             ),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::{extract_expr, extract_expr_list};
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                mul_shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                k: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                lhs_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                rhs_strides: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
-                    .unwrap(),
-                sum_input_strides: extract_expr_list(
-                    egraph,
-                    kind_children[7],
-                    list_cache,
-                    expr_cache,
-                )
-                .unwrap(),
-                sum_iter_stride: extract_expr(egraph, kind_children[8], expr_cache).unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[9], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            vec![kind_children[3], kind_children[5]],
+            [&(Ir::Op(
+                metal_mul(mul_shape, lhs_strides, rhs_strides, mul_output_strides),
+                IList::ICons(lhs, IList::ICons(rhs, IList::INil())),
+            ))],
+        );
+        let replacement = &Ir::Op(
+            generic_matmul(
+                out_shape,
+                mul_shape,
+                k,
+                lhs_strides,
+                rhs_strides,
+                sum_input_strides,
+                sum_iter_stride,
+                out_strides,
+            ),
+            [lhs, rhs],
+        );
+        rule(
+            (source, eq(dt, source.dtype())),
+            (union(source, replacement), set(replacement.dtype(), dt)),
         )
+        .label("generic-matmul-metal-mul-sum")
+    }
+
+    #[ruleset]
+    pub(crate) fn cleanup(inputs: &IList, mul: &Ir, sum: &Ir, lhs: &Ir, rhs: &Ir) -> Rule {
+        let source = &Ir::Op(MetalMulArgs::fresh(), inputs);
+        let reduction = &Ir::Op(MetalSumArgs::fresh(), [mul]);
+        rule(
+            (
+                eq(mul, source),
+                eq(sum, reduction),
+                eq(sum, Ir::Op(GenericMatmulArgs::fresh(), [lhs, rhs])),
+            ),
+            (delete(reduction), delete(source)),
+        )
+        .label("delete-broadcast-mul-sum-when-generic-matmul-exists")
+    }
+}
+
+impl GenericMatmul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_out_shape,
+            field_mul_shape,
+            field_k,
+            field_lhs_strides,
+            field_rhs_strides,
+            field_sum_input_strides,
+            field_sum_iter_stride,
+            field_out_strides,
+        )) = typed::get_args(
+            kind,
+            |out_shape: &EList,
+             mul_shape: &EList,
+             k: &DimExpr,
+             lhs_strides: &EList,
+             rhs_strides: &EList,
+             sum_input_strides: &EList,
+             sum_iter_stride: &DimExpr,
+             out_strides: &EList| {
+                crate::typed_rules::generic_matmul(
+                    out_shape,
+                    mul_shape,
+                    k,
+                    lhs_strides,
+                    rhs_strides,
+                    sum_input_strides,
+                    sum_iter_stride,
+                    out_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let decoded_mul_shape = context.expressions(&field_mul_shape)?;
+        let decoded_lhs_strides = context.expressions(&field_lhs_strides)?;
+        let decoded_rhs_strides = context.expressions(&field_rhs_strides)?;
+        let decoded_sum_input_strides = context.expressions(&field_sum_input_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+            mul_shape: decoded_mul_shape,
+            k: context.expression(&field_k)?,
+            lhs_strides: decoded_lhs_strides,
+            rhs_strides: decoded_rhs_strides,
+            sum_input_strides: decoded_sum_input_strides,
+            sum_iter_stride: context.expression(&field_sum_iter_stride)?,
+            out_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -2404,48 +2706,42 @@ pub struct MetalConstant {
     value: f32,
 }
 
-impl EgglogOp for MetalConstant {
-    fn sort(&self) -> SortDef {
-        sort(IR, "MetalConstant", &[("value", F64)])
-    }
+pub(crate) mod metal_constant {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (args, const_match) = new_op_call(&Constant::default().sort(), &[]);
-        let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![
-            egglog!(
-                *parser,
-                (rule () ((union #(const_match.clone()) #(metal_op.clone())) (subsume #const_match) (set (dtype #metal_op) (F32))) :ruleset kernel_lower)
-            )
-            .expect("MetalConstant kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                value: egraph.enodes[children[0]]
-                    .0
-                    .replace("\"", "")
-                    .parse::<f32>()
-                    .unwrap(),
-            })),
-            vec![],
+    #[ruleset]
+    pub(crate) fn kernel_lower(value: &egg::F64) -> Rule {
+        let source = &Ir::Op(OpKind::Constant(value), IList::INil());
+        let replacement = &Ir::Op(metal_constant(value), IList::INil());
+        rule(
+            source,
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), DType::F32()),
+            ),
         )
+    }
+}
+
+impl MetalConstant {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        _context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_value,)) = typed::get_args(kind, |value: &egg::F64| {
+            crate::typed_rules::metal_constant(value)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            value: f64::try_from(&field_value)? as f32,
+        }))))
     }
 }
 
@@ -2516,50 +2812,43 @@ pub struct MetalIota {
     range: Expression,
 }
 
-impl EgglogOp for MetalIota {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MetalIota",
-            &[("expr", EXPRESSION), ("range", EXPRESSION)],
+pub(crate) mod metal_iota {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(expr: &DimExpr, range: &DimExpr) -> Rule {
+        let source = &Ir::Op(OpKind::Iota(expr, range), IList::INil());
+        let replacement = &Ir::Op(metal_iota(expr, range), IList::INil());
+        rule(
+            source,
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), DType::Int()),
+            ),
         )
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (args, iota_match) = new_op_call(&Iota::default().sort(), &[]);
-        let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![
-            egglog!(
-                *parser,
-                (rule () ((union #(iota_match.clone()) #(metal_op.clone())) (subsume #iota_match) (set (dtype #metal_op) (Int))) :ruleset kernel_lower)
-            )
-            .expect("MetalIota kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                expr: extract_expr(egraph, children[0], expr_cache).unwrap(),
-                range: extract_expr(egraph, children[1], expr_cache).unwrap(),
-            })),
-            vec![],
-        )
+impl MetalIota {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_expr, field_range)) =
+            typed::get_args(kind, |expr: &DimExpr, range: &DimExpr| {
+                crate::typed_rules::metal_iota(expr, range)
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            expr: context.expression(&field_expr)?,
+            range: context.expression(&field_range)?,
+        }))))
     }
 }
 
@@ -2638,83 +2927,89 @@ pub struct MetalGather {
     out_stride: Vec<Expression>,
 }
 
-impl EgglogOp for MetalGather {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MetalGather",
-            &[
-                ("out_shape", ELIST),
-                ("indexes", IR),
-                ("index_strides", ELIST),
-                ("data", IR),
-                ("data_shape", ELIST),
-                ("data_strides", ELIST),
-                ("out_strides", ELIST),
-            ],
+pub(crate) mod metal_gather {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        index_shape: &EList,
+        index_strides: &EList,
+        data_shape: &EList,
+        data_strides: &EList,
+        indexes: &Ir,
+        data: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            metal_gather(
+                index_shape,
+                index_strides,
+                data_shape,
+                data_strides,
+                EList::RowMajor(index_shape),
+            ),
+            [indexes, data],
+        );
+        let replacement = &Ir::Op(
+            OpKind::Gather(index_shape, index_strides, data_shape, data_strides),
+            [indexes, data],
+        );
+        rule(
+            (replacement, eq(dt, data.dtype())),
+            (
+                union(replacement, source),
+                subsume(replacement),
+                set(source.dtype(), dt),
+            ),
         )
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (gather_args, gather_match) =
-            new_op_call(&Gather::default().sort(), &["indexes", "data"]);
-        let out_strides = SORTS
-            .row_major
-            .call([("list".to_string(), gather_args["index_shape"].clone())]);
-        let dt = v("?__dt");
-        let metal_args = [
-            ("out_shape".to_string(), gather_args["index_shape"].clone()),
-            ("indexes".to_string(), gather_args["indexes"].clone()),
-            (
-                "index_strides".to_string(),
-                gather_args["index_strides"].clone(),
-            ),
-            ("data".to_string(), gather_args["data"].clone()),
-            ("data_shape".to_string(), gather_args["data_shape"].clone()),
-            (
-                "data_strides".to_string(),
-                gather_args["data_strides"].clone(),
-            ),
-            ("out_strides".to_string(), out_strides),
-        ];
-        let metal_op = self.sort().call(metal_args);
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #(dt.clone()) (dtype #(gather_args["data"].clone())))) ((union #(gather_match.clone()) #(metal_op.clone())) (subsume #gather_match) (set (dtype #metal_op) #dt)) :ruleset kernel_lower)
-            )
-            .expect("MetalGather kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, children[0], list_cache, expr_cache).unwrap(),
-                index_stride: extract_expr_list(egraph, children[2], list_cache, expr_cache)
-                    .unwrap(),
-                data_shape: extract_expr_list(egraph, children[4], list_cache, expr_cache).unwrap(),
-                data_stride: extract_expr_list(egraph, children[5], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, children[6], list_cache, expr_cache).unwrap(),
-            })),
-            vec![children[1], children[3]],
-        )
+impl MetalGather {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_out_shape,
+            field_index_strides,
+            field_data_shape,
+            field_data_strides,
+            field_out_strides,
+        )) = typed::get_args(
+            kind,
+            |out_shape: &EList,
+             index_strides: &EList,
+             data_shape: &EList,
+             data_strides: &EList,
+             out_strides: &EList| {
+                crate::typed_rules::metal_gather(
+                    out_shape,
+                    index_strides,
+                    data_shape,
+                    data_strides,
+                    out_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_data_shape = context.expressions(&field_data_shape)?;
+        let decoded_data_strides = context.expressions(&field_data_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+            index_stride: decoded_index_strides,
+            data_shape: decoded_data_shape,
+            data_stride: decoded_data_strides,
+            out_stride: decoded_out_strides,
+        }))))
     }
 }
 
@@ -2851,98 +3146,104 @@ impl Default for MetalScatter {
     }
 }
 
-impl EgglogOp for MetalScatter {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MetalScatter",
-            &[
-                ("dest_shape", ELIST),
-                ("dest_strides", ELIST),
-                ("dest", IR),
-                ("indexes", IR),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("src", IR),
-                ("src_strides", ELIST),
-                ("out_strides", ELIST),
-            ],
+pub(crate) mod metal_scatter {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(
+        dest_shape: &EList,
+        dest_strides: &EList,
+        index_shape: &EList,
+        index_strides: &EList,
+        src_strides: &EList,
+        dest: &Ir,
+        indexes: &Ir,
+        src: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let source = &Ir::Op(
+            metal_scatter(
+                dest_shape,
+                dest_strides,
+                index_shape,
+                index_strides,
+                src_strides,
+                EList::RowMajor(dest_shape),
+            ),
+            [dest, indexes, src],
+        );
+        let replacement = &Ir::Op(
+            OpKind::Scatter(
+                dest_shape,
+                dest_strides,
+                index_shape,
+                index_strides,
+                src_strides,
+            ),
+            [dest, indexes, src],
+        );
+        rule(
+            (replacement, eq(dt, src.dtype())),
+            (
+                union(replacement, source),
+                subsume(replacement),
+                set(source.dtype(), dt),
+            ),
         )
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (scatter_args, scatter_match) =
-            new_op_call(&Scatter::default().sort(), &["dest", "indexes", "src"]);
-        let out_strides = SORTS
-            .row_major
-            .call([("list".to_string(), scatter_args["dest_shape"].clone())]);
-        let dt = v("?__dt");
-        let metal_args = [
-            ("dest_shape".to_string(), scatter_args["dest_shape"].clone()),
-            (
-                "dest_strides".to_string(),
-                scatter_args["dest_strides"].clone(),
-            ),
-            ("dest".to_string(), scatter_args["dest"].clone()),
-            ("indexes".to_string(), scatter_args["indexes"].clone()),
-            (
-                "index_shape".to_string(),
-                scatter_args["index_shape"].clone(),
-            ),
-            (
-                "index_strides".to_string(),
-                scatter_args["index_strides"].clone(),
-            ),
-            ("src".to_string(), scatter_args["src"].clone()),
-            (
-                "src_strides".to_string(),
-                scatter_args["src_strides"].clone(),
-            ),
-            ("out_strides".to_string(), out_strides),
-        ];
-        let metal_op = self.sort().call(metal_args);
-        vec![
-            egglog!(
-                *parser,
-                (rule ((= #(dt.clone()) (dtype #(scatter_args["src"].clone())))) ((union #(scatter_match.clone()) #(metal_op.clone())) (subsume #scatter_match) (set (dtype #metal_op) #dt)) :ruleset kernel_lower)
-            )
-            .expect("MetalScatter kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                dest_shape: extract_expr_list(egraph, children[0], list_cache, expr_cache).unwrap(),
-                dest_strides: extract_expr_list(egraph, children[1], list_cache, expr_cache)
-                    .unwrap(),
-                index_shape: extract_expr_list(egraph, children[4], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, children[5], list_cache, expr_cache)
-                    .unwrap(),
-                src_strides: extract_expr_list(egraph, children[7], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, children[8], list_cache, expr_cache)
-                    .unwrap(),
-                copy_pipeline: std::sync::OnceLock::new(),
-            })),
-            vec![children[2], children[3], children[6]], // dest, indexes, src
-        )
+impl MetalScatter {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_dest_shape,
+            field_dest_strides,
+            field_index_shape,
+            field_index_strides,
+            field_src_strides,
+            field_out_strides,
+        )) = typed::get_args(
+            kind,
+            |dest_shape: &EList,
+             dest_strides: &EList,
+             index_shape: &EList,
+             index_strides: &EList,
+             src_strides: &EList,
+             out_strides: &EList| {
+                crate::typed_rules::metal_scatter(
+                    dest_shape,
+                    dest_strides,
+                    index_shape,
+                    index_strides,
+                    src_strides,
+                    out_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_dest_shape = context.expressions(&field_dest_shape)?;
+        let decoded_dest_strides = context.expressions(&field_dest_strides)?;
+        let decoded_index_shape = context.expressions(&field_index_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_src_strides = context.expressions(&field_src_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            dest_shape: decoded_dest_shape,
+            dest_strides: decoded_dest_strides,
+            index_shape: decoded_index_shape,
+            index_strides: decoded_index_strides,
+            src_strides: decoded_src_strides,
+            out_strides: decoded_out_strides,
+            copy_pipeline: std::sync::OnceLock::new(),
+        }))))
     }
 }
 
@@ -3126,138 +3427,195 @@ pub struct MetalScatterNoCopy {
     out_strides: Vec<Expression>,
 }
 
-impl EgglogOp for MetalScatterNoCopy {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "MetalScatterNoCopy",
-            &[
-                ("dest_shape", ELIST),
-                ("dest_strides", ELIST),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("src_strides", ELIST),
-                ("out_strides", ELIST),
-            ],
-        )
-    }
+pub(crate) mod metal_scatter_no_copy {
+    #[relation]
+    pub(crate) fn consumed_buffer_ilist_contains(a0: IList, a1: Ir);
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn ir_defs(&self) -> Vec<String> {
-        vec!["(ConsumedBuffer IR)".to_string()]
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+    #[ruleset]
+    pub(crate) fn cleanup(
+        head: &Ir,
+        tail: &IList,
+        list: &IList,
+        item: &Ir,
+        a: &Ir,
+        cb: &Ir,
+        k1: &OpKind,
+        ilist1: &IList,
+        k2: &OpKind,
+        ilist2: &IList,
+    ) -> Vec<Rule> {
+        let op1 = &Ir::Op(k1, ilist1);
+        let op2 = &Ir::Op(k2, ilist2);
         vec![
-            raw_rules(parser, "(relation consumed_buffer_ilist_contains (IList IR))"),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?list (ICons ?head ?tail)))
-                    ((consumed_buffer_ilist_contains ?list ?head))
-                    :ruleset cleanup
-                    :name \"metal-consumed-buffer-ilist-contains-head\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?list (ICons ?head ?tail))
-                     (consumed_buffer_ilist_contains ?tail ?item))
-                    ((consumed_buffer_ilist_contains ?list ?item))
-                    :ruleset cleanup
-                    :name \"metal-consumed-buffer-ilist-contains-tail\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?scatter (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os))
-                     (= ?dst ?os)
-                     (= ?dt (dtype ?src)))
-                    ((let ?consumed (ConsumedBuffer ?dest))
-                     (let ?nocopy (Op (MetalScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os)
-                         (ICons ?consumed (ICons ?indexes (ICons ?src (INil))))))
-                     (union ?scatter ?nocopy)
-                     (set (dtype ?nocopy) ?dt))
-                    :ruleset buffer_reuse
-                    :name \"metal-scatter-to-scatter-no-copy\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?a))
-                     (= ?dt (dtype ?a)))
-                    ((set (dtype ?cb) ?dt))
-                    :ruleset dtype_prop
-                    :name \"metal-consumed-buffer-dtype\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?a))
-                     (= ?op1 (Op ?k1 ?ilist1))
-                     (consumed_buffer_ilist_contains ?ilist1 ?cb)
-                     (= ?op2 (Op ?k2 ?ilist2))
-                     (!= ?op1 ?op2)
-                     (consumed_buffer_ilist_contains ?ilist2 ?a))
-                    ((delete (ConsumedBuffer ?a)))
-                    :ruleset cleanup
-                    :name \"metal-consumed-buffer-cleanup-shared-op-use\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?dest))
-                     (= ?scatter (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os))
-                     (= ?nocopy (Op (MetalScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os)
-                         (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
-                    ((subsume (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os)))
-                    :ruleset post_cleanup
-                    :name \"metal-scatter-no-copy-dominates-valid-consumed-buffer\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?a)))
-                    ((union ?cb ?a)
-                     (delete (ConsumedBuffer ?a)))
-                    :ruleset base_cleanup
-                    :name \"metal-consumed-buffer-resolve\"
-                )",
-            ),
+            rule(
+                (eq(list, IList::ICons(head, tail)),),
+                (consumed_buffer_ilist_contains(list, head),),
+            )
+            .label("metal-consumed-buffer-ilist-contains-head"),
+            rule(
+                (
+                    eq(list, IList::ICons(head, tail)),
+                    Fact::from(consumed_buffer_ilist_contains(tail, item)),
+                ),
+                (consumed_buffer_ilist_contains(list, item),),
+            )
+            .label("metal-consumed-buffer-ilist-contains-tail"),
+            rule(
+                (
+                    eq(cb, consumed_buffer(a)),
+                    Fact::from(consumed_buffer_ilist_contains(ilist1, cb)),
+                    ne(op1, op2),
+                    Fact::from(consumed_buffer_ilist_contains(ilist2, a)),
+                ),
+                (delete(consumed_buffer(a)),),
+            )
+            .label("metal-consumed-buffer-cleanup-shared-op-use"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::extract_expr_list;
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                dest_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                dest_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                index_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                src_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[5], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn buffer_reuse(
+        ds: &EList,
+        dst: &EList,
+        dest: &Ir,
+        indexes: &Ir,
+        is: &EList,
+        istr: &EList,
+        src: &Ir,
+        ss: &EList,
+        os: &EList,
+        scatter: &Ir,
+        dt: &DType,
+    ) -> Rule {
+        let consumed = &consumed_buffer(dest);
+        let nocopy = &Ir::Op(
+            metal_scatter_no_copy(ds, dst, is, istr, ss, os),
+            [consumed, indexes, src],
+        );
+        rule(
+            (
+                eq(
+                    scatter,
+                    Ir::Op(
+                        metal_scatter(ds, dst, is, istr, ss, os),
+                        [dest, indexes, src],
+                    ),
+                ),
+                eq(dst, os),
+                eq(dt, src.dtype()),
+            ),
+            (
+                consumed,
+                nocopy,
+                union(scatter, nocopy),
+                set(nocopy.dtype(), dt),
+            ),
         )
+        .label("metal-scatter-to-scatter-no-copy")
+    }
+
+    #[ruleset]
+    pub(crate) fn dtype_prop(a: &Ir, cb: &Ir, dt: &DType) -> Rule {
+        rule(
+            (eq(cb, consumed_buffer(a)), eq(dt, a.dtype())),
+            (set(cb.dtype(), dt),),
+        )
+        .label("metal-consumed-buffer-dtype")
+    }
+
+    #[ruleset]
+    pub(crate) fn post_cleanup(
+        dest: &Ir,
+        cb: &Ir,
+        ds: &EList,
+        dst: &EList,
+        indexes: &Ir,
+        is: &EList,
+        istr: &EList,
+        src: &Ir,
+        ss: &EList,
+        os: &EList,
+        scatter: &Ir,
+    ) -> Rule {
+        let source = &Ir::Op(
+            metal_scatter(ds, dst, is, istr, ss, os),
+            [dest, indexes, src],
+        );
+        rule(
+            (
+                eq(cb, consumed_buffer(dest)),
+                eq(scatter, source),
+                Ir::Op(
+                    metal_scatter_no_copy(ds, dst, is, istr, ss, os),
+                    [cb, indexes, src],
+                ),
+            ),
+            (subsume(source),),
+        )
+        .label("metal-scatter-no-copy-dominates-valid-consumed-buffer")
+    }
+
+    #[ruleset]
+    pub(crate) fn base_cleanup(a: &Ir, cb: &Ir) -> Rule {
+        rule(
+            (eq(cb, consumed_buffer(a)),),
+            (union(cb, a), delete(consumed_buffer(a))),
+        )
+        .label("metal-consumed-buffer-resolve")
+    }
+}
+
+impl MetalScatterNoCopy {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_dest_shape,
+            field_dest_strides,
+            field_index_shape,
+            field_index_strides,
+            field_src_strides,
+            field_out_strides,
+        )) = typed::get_args(
+            kind,
+            |dest_shape: &EList,
+             dest_strides: &EList,
+             index_shape: &EList,
+             index_strides: &EList,
+             src_strides: &EList,
+             out_strides: &EList| {
+                crate::typed_rules::metal_scatter_no_copy(
+                    dest_shape,
+                    dest_strides,
+                    index_shape,
+                    index_strides,
+                    src_strides,
+                    out_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_dest_shape = context.expressions(&field_dest_shape)?;
+        let decoded_dest_strides = context.expressions(&field_dest_strides)?;
+        let decoded_index_shape = context.expressions(&field_index_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_src_strides = context.expressions(&field_src_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            dest_shape: decoded_dest_shape,
+            dest_strides: decoded_dest_strides,
+            index_shape: decoded_index_shape,
+            index_strides: decoded_index_strides,
+            src_strides: decoded_src_strides,
+            out_strides: decoded_out_strides,
+        }))))
     }
 }
 
@@ -3391,50 +3749,45 @@ pub struct MetalCast {
     target_dtype: DType,
 }
 
-impl EgglogOp for MetalCast {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "MetalCast",
-            &[("inp", IR), ("size", EXPRESSION), ("dtype", DTYPE)],
+pub(crate) mod metal_cast {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn kernel_lower(size: &DimExpr, dtype: &DType, inp: &Ir) -> Rule {
+        let source = &Ir::Op(OpKind::Cast(size, dtype), [inp]);
+        let replacement = &Ir::Op(metal_cast(size, dtype), [inp]);
+        rule(
+            source,
+            (
+                union(source, replacement),
+                subsume(source),
+                set(replacement.dtype(), dtype),
+            ),
         )
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        let (args, cast_match) = new_op_call(&Cast::default().sort(), &["inp"]);
-        let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![
-            egglog!(
-                *parser,
-                (rule () ((union #(cast_match.clone()) #(metal_op.clone())) (subsume #cast_match) (set (dtype #metal_op) #(args["dtype"].clone()))) :ruleset kernel_lower)
-            )
-            .expect("MetalCast kernel-lowering rule should parse"),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::{extract_dtype, extract_expr};
-        (
-            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                size: extract_expr(egraph, children[1], _expr_cache).unwrap(),
-                target_dtype: extract_dtype(egraph, children[2]),
-            })),
-            vec![children[0]],
-        )
+impl MetalCast {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_size, field_dtype)) = typed::get_args(
+            kind,
+            |size: &DimExpr, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::metal_cast(size, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+            size: context.expression(&field_size)?,
+            target_dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

@@ -1,20 +1,115 @@
 use candle_core::{Device, Tensor, WithDType};
 use cudarc::driver::CudaContext;
+use egglog_experimental::typed::{
+    EgglogValue, FrozenEClass, FrozenENode, FrozenValueView, get_args,
+};
 use half::{bf16, f16};
 use itertools::Itertools;
+use luminal::egglog_utils::SearchSpace;
 use luminal::egglog_utils::{
-    EGraphChoiceSet, egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
-    validate_choice_set,
+    EGraphChoiceSet, extract_reachable_generation, hash_choice_set, random_initial_choice,
+    reconstruct, validate_choice_set,
 };
 use luminal::prelude::{
     petgraph::{Direction, algo::toposort, visit::EdgeRef},
     *,
 };
+use luminal::typed_reference::schema::{IList, Ir, OpKind};
 use num_traits::{Num, Signed};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
 use crate::runtime::{CudaRuntime, ToCudaInput};
+
+/// Find every admissible operation, preserving the original global test scope.
+/// Forcing a candidate selects both its IR node and exact OpKind producer.
+pub fn op_candidates<'f>(
+    space: &'f SearchSpace,
+    matches: impl Fn(&OpKind) -> bool,
+) -> Vec<[(FrozenEClass<'f>, FrozenENode<'f>); 2]> {
+    let alternatives = space.alternatives().expect("admissible typed alternatives");
+    let mut found = Vec::new();
+    for (&class, nodes) in &alternatives {
+        if class.sort() != Ir::sort_ref() {
+            continue;
+        }
+        for &node in nodes {
+            let ir = space.frozen.typed_node::<Ir>(node).unwrap();
+            if let Some((kind, _)) =
+                get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs)).unwrap()
+            {
+                let FrozenValueView::EClass(kind) = space.frozen.as_view(&kind).unwrap().view()
+                else {
+                    unreachable!()
+                };
+                if let Some(kinds) = alternatives.get(&kind) {
+                    for &producer in kinds {
+                        if matches(&space.frozen.typed_node::<OpKind>(producer).unwrap()) {
+                            found.push([(class, node), (kind, producer)]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn forced_candidates_preserve_global_scope_and_exact_kind_producers() {
+    use egglog_experimental::typed::{EGraph, EGraphOptions, constructor, let_, union};
+
+    #[constructor]
+    fn metadata_holder(hidden: Ir) -> OpKind;
+
+    let first_kind = OpKind::Constant(1.0);
+    let second_kind = OpKind::Constant(2.0);
+    let data = Ir::Op(&first_kind, IList::INil());
+    let hidden = Ir::Op(OpKind::Constant(9.0), IList::INil());
+    let root = let_("root", Ir::Op(metadata_holder(hidden), [&data, &data]));
+    let mut live = EGraph::new(EGraphOptions::default());
+    live.register((&root, union(first_kind, second_kind)))
+        .unwrap();
+    let space = SearchSpace::from_frozen(live.freeze().unwrap(), &[root]).unwrap();
+    let candidates = op_candidates(&space, |kind| {
+        luminal::typed_reference::schema::ConstantArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    });
+    // Include metadata-only operations, as the original global assertions did.
+    // Both exact kind alternatives remain forceable within the shared IR class.
+    assert_eq!(candidates.len(), 3);
+    let mut counts = FxHashMap::default();
+    for candidate in &candidates {
+        *counts.entry(candidate[0]).or_insert(0) += 1;
+    }
+    let mut multiplicities: Vec<_> = counts.into_values().collect();
+    multiplicities.sort_unstable();
+    assert_eq!(multiplicities, [1, 2]);
+    assert!(candidates.iter().all(|candidate| {
+        luminal::typed_reference::schema::ConstantArgs::get_args(
+            &space.frozen.typed_node::<OpKind>(candidate[1].1).unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    }));
+    assert_eq!(
+        space
+            .frozen
+            .eclasses()
+            .filter(|class| class.sort() == OpKind::sort_ref())
+            .flat_map(|class| class.nodes())
+            .filter(
+                |&node| luminal::typed_reference::schema::ConstantArgs::get_args(
+                    &space.frozen.typed_node::<OpKind>(node).unwrap()
+                )
+                .unwrap()
+                .is_some()
+            )
+            .count(),
+        3
+    );
+}
 
 /// Safety factor multiplied with epsilon for tolerance calculations
 pub const TOLERANCE_SAFETY_FACTOR: f32 = 2.0;
@@ -346,7 +441,9 @@ pub fn fuzz_cuda_search_space_equivalence(
     cx.build_search_space::<CudaRuntime>(config.build_options);
 
     let egraph = cx.egraph().expect("search space should be built");
-    let ops = cx.egglog_ops().expect("search ops should be built");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
     let seed = if reference_runtime_outputs.is_some() {
         config.seed.wrapping_add(0xC0DA_C0DA)
     } else {
@@ -354,7 +451,7 @@ pub fn fuzz_cuda_search_space_equivalence(
     };
     let mut rng = StdRng::seed_from_u64(seed);
     let mut prev_selected = FxHashSet::default();
-    let mut base = random_initial_choice(egraph, &mut rng);
+    let mut base = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     prev_selected.insert(hash_choice_set(&base));
 
     let mut skipped_invalid = 0usize;
@@ -372,7 +469,7 @@ pub fn fuzz_cuda_search_space_equivalence(
                         config.max_attempts
                     );
                 }
-                if validate_choice_set(egraph, &base, ops).is_err() {
+                if validate_choice_set(egraph, &alternatives, &base).is_err() {
                     skipped_invalid += 1;
                 } else {
                     let hash = hash_choice_set(&base);
@@ -381,7 +478,7 @@ pub fn fuzz_cuda_search_space_equivalence(
                         Err(err) => panic!("reference candidate hash={hash} failed: {err}"),
                     }
                 }
-                base = random_initial_choice(egraph, &mut rng);
+                base = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
                 prev_selected.insert(hash_choice_set(&base));
             };
             (
@@ -395,8 +492,9 @@ pub fn fuzz_cuda_search_space_equivalence(
     let mut attempts = 0usize;
     while tested < config.samples && attempts < config.max_attempts {
         attempts += 1;
-        let mut candidates = extract_generation(
+        let mut candidates = extract_reachable_generation(
             egraph,
+            &alternatives,
             &base,
             config.generation_size,
             config.mutations,
@@ -404,7 +502,7 @@ pub fn fuzz_cuda_search_space_equivalence(
             &mut rng,
         );
         if candidates.is_empty() {
-            let next = random_initial_choice(egraph, &mut rng);
+            let next = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
             prev_selected.insert(hash_choice_set(&next));
             candidates.push(next);
         }
@@ -417,7 +515,7 @@ pub fn fuzz_cuda_search_space_equivalence(
             if reference_is_cuda && candidate_hash == reference_hash {
                 continue;
             }
-            if validate_choice_set(egraph, &candidate, ops).is_err() {
+            if validate_choice_set(egraph, &alternatives, &candidate).is_err() {
                 skipped_invalid += 1;
                 continue;
             }
@@ -457,18 +555,9 @@ fn run_choice_outputs<'a>(
     choices: &EGraphChoiceSet<'a>,
 ) -> Result<ChoiceRun, String> {
     let egraph = cx.egraph().ok_or("search space was not built")?;
-    let ops = cx.egglog_ops().ok_or("search ops were not built")?;
-    let mut list_cache = FxHashMap::default();
-    let mut expr_cache = FxHashMap::default();
-    let mut llir_graph = egglog_to_llir(
-        egraph,
-        choices.clone(),
-        ops,
-        &cx.custom_ops,
-        &mut list_cache,
-        &mut expr_cache,
-        None,
-    );
+    let ops = cx.decoders.as_ref().ok_or("search ops were not built")?;
+    let (mut llir_graph, _) =
+        reconstruct(egraph, choices, ops, &cx.custom_ops).map_err(|error| error.to_string())?;
     unroll_loops_in_llir(&mut llir_graph);
     let llir_summary = summarize_llir(&llir_graph);
 
@@ -929,16 +1018,22 @@ pub fn fuzz_genomes<T: TestDType>(
     let Some(egraph) = cx.egraph() else {
         return;
     };
-    let Some(ops) = cx.egglog_ops() else {
+    let Some(ops) = cx.decoders.as_ref() else {
         return;
     };
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
 
     // Check if there are alternative genomes to explore
-    let mutable_eclasses: usize = egraph
-        .eclasses
+    let mutable_eclasses = alternatives
         .iter()
-        .filter(|(_, (label, enodes))| {
-            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        .filter(|(class, nodes)| {
+            let sort = class.sort();
+            (sort == luminal::typed_reference::schema::Ir::sort_ref()
+                || sort == luminal::typed_reference::schema::IList::sort_ref()
+                || sort == luminal::typed_reference::schema::OpKind::sort_ref())
+                && nodes.len() > 1
         })
         .count();
     if mutable_eclasses == 0 {
@@ -949,35 +1044,33 @@ pub fn fuzz_genomes<T: TestDType>(
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(7777));
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
 
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     prev_selected.insert(hash_choice_set(&initial));
 
     let mut base = initial;
     let mut tested = 0;
 
     for _ in 0..100 {
-        let offspring = extract_generation(egraph, &base, 10, 2, &mut prev_selected, &mut rng);
+        let offspring = extract_reachable_generation(
+            egraph,
+            &alternatives,
+            &base,
+            10,
+            2,
+            &mut prev_selected,
+            &mut rng,
+        );
 
         if offspring.is_empty() {
             break;
         }
 
         for genome in offspring {
-            if validate_choice_set(egraph, &genome, ops).is_err() {
+            if validate_choice_set(egraph, &alternatives, &genome).is_err() {
                 continue;
             }
-
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let mut llir_graph = egglog_to_llir(
-                egraph,
-                genome.clone(),
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
+            let (mut llir_graph, _) = reconstruct(egraph, &genome, ops, &cx.custom_ops)
+                .expect("selected CUDA candidate should reconstruct");
             // Same finalization as `Graph::search` performs on the chosen
             // best LLIR: collapse the rolled body's loop markers into a
             // fully-unrolled LLIR. The runtime cannot execute LoopStart /

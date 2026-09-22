@@ -1,13 +1,9 @@
 use crate::egglog_utils::{
-    count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation, hash_choice_set,
-    hlir_to_egglog, log_channel_enabled, random_initial_choice,
-    run_egglog_with_late_passes_interval_analysis_and_log,
+    Alternatives, PhaseRules, SearchSpace, count_choice_sets_up_to, extract_reachable_generation,
+    hash_choice_set, log_channel_enabled, random_initial_choice, reconstruct, run_schedule,
 };
+use crate::op::{DecodeFn, LLIROp};
 use crate::shape::{DimInterval, DynDimIntervals};
-use crate::{
-    egglog_utils::SerializedEGraph,
-    op::{EgglogOp, IntoEgglogOp, LLIROp},
-};
 use crate::{hlir::CustomOpKind, op::*, prelude::*};
 use colored::Colorize;
 use itertools::Itertools;
@@ -19,11 +15,9 @@ use petgraph::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
-    any::TypeId,
     fmt::{Debug, Write as FmtWrite},
     io::Write,
     ops::{Deref, DerefMut},
-    sync::Arc,
 };
 use tracing;
 
@@ -393,7 +387,8 @@ fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir:
 }
 
 fn random_choice_generation<'a, G: rand::Rng>(
-    egraph: &'a SerializedEGraph,
+    frozen: &'a egglog_experimental::typed::FrozenEGraph,
+    alternatives: &Alternatives<'a>,
     generation_size: usize,
     prev_selected: &mut FxHashSet<u64>,
     rng: &mut G,
@@ -404,7 +399,7 @@ fn random_choice_generation<'a, G: rand::Rng>(
 
     while generation.len() < generation_size && attempts < max_attempts {
         attempts += 1;
-        let genome = random_initial_choice(egraph, rng);
+        let genome = random_initial_choice(frozen, alternatives, rng);
         if prev_selected.insert(hash_choice_set(&genome)) {
             generation.push(genome);
         }
@@ -433,10 +428,10 @@ pub struct Graph {
     pub graph: HLIRGraph,
     /// E-Graph search spaces. Bucketed compilation stores one egraph per
     /// bucket combination; unbucketed compilation stores one egraph.
-    egraphs: Vec<SerializedEGraph>,
+    egraphs: Vec<SearchSpace>,
     egraph_contexts: Vec<SearchSpaceContext>,
-    /// Available ops
-    pub ops: Option<Vec<Arc<Box<dyn EgglogOp>>>>,
+    /// Backend expression converters followed by core fallbacks.
+    pub decoders: Option<Vec<DecodeFn>>,
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
     /// Bucket definitions used by the currently built search space.
@@ -1233,37 +1228,73 @@ impl Graph {
 
     #[tracing::instrument(skip_all)]
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self, options: CompileOptions) {
-        self.run_auto_loop_rolling_prepass(&options);
-        let mut ops = Rt::Ops::into_vec();
-        ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
-        let dim_buckets = options.dim_buckets.clone();
-        let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
-        let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
-        let extra_egglog = Rt::extra_egglog();
+        self.install_search_spaces::<Rt>(options, Rt::rules);
+    }
 
-        let (program, root) = hlir_to_egglog(self);
+    /// Build using exactly the supplied recipe, without invoking backend defaults.
+    /// Start with `Runtime::rules()` or `base_phase_rules()` to include every
+    /// scheduling boundary; an empty ruleset disables a phase. Actions execute
+    /// in order before the captured roots. Decoders are independent of this recipe.
+    #[tracing::instrument(skip_all)]
+    pub fn build_search_space_with_rules<Rt: Runtime + 'static>(
+        &mut self,
+        options: CompileOptions,
+        phases: PhaseRules,
+        actions: Vec<egglog_experimental::typed::Action>,
+    ) {
+        self.install_search_spaces::<Rt>(options, || (phases, actions));
+    }
+
+    fn install_search_spaces<Rt: Runtime + 'static>(
+        &mut self,
+        options: CompileOptions,
+        recipe: impl FnOnce() -> (PhaseRules, Vec<egglog_experimental::typed::Action>),
+    ) {
+        self.run_auto_loop_rolling_prepass(&options);
+        let dim_buckets = options.dim_buckets.clone();
         let contexts = self.search_space_contexts(&dim_buckets);
+        let roots =
+            crate::typed_reference::capture_graph(self).expect("typed graph capture failed");
+        let (phases, actions) = recipe();
+        use egglog_experimental::typed::{EGraph, EGraphOptions, TypedError};
         self.egraphs = contexts
             .iter()
-            .map(|context| {
-                let (contextual_program, use_interval_analysis) =
-                    self.egglog_program_with_interval_facts(&program, &context.intervals);
-                run_egglog_with_late_passes_interval_analysis_and_log(
-                    &contextual_program,
-                    &root,
-                    &ops,
-                    cleanup_hlir,
-                    &late_passes,
-                    &extra_egglog,
-                    use_interval_analysis,
+            .map(|context| -> Result<SearchSpace, TypedError> {
+                let full_start = std::time::Instant::now();
+                let mut egraph = EGraph::new(EGraphOptions::default());
+                run_schedule(
+                    &mut egraph,
+                    full_start,
+                    &phases,
+                    !context.intervals.is_empty(),
                     options.egglog_log_enabled(),
-                )
-                .unwrap()
+                    |egraph| {
+                        egraph.register(crate::typed_reference::interval_actions(
+                            &context.intervals,
+                            [],
+                        ))?;
+                        egraph.register(&actions)?;
+                        egraph.register(&roots)
+                    },
+                )?;
+                let mut space = SearchSpace::from_frozen(egraph.freeze()?, &roots)?;
+                crate::egglog_utils::trace_frozen_shape(&space, options.egglog_log_enabled());
+                space.cleanup_ignored = Rt::cleanup_ignored;
+                space.clean_hlir =
+                    std::any::TypeId::of::<Rt>() != std::any::TypeId::of::<ReferenceRuntime>();
+                space.alternatives()?;
+                Ok(space)
             })
-            .collect();
+            .collect::<Result<_, _>>()
+            .expect("typed search-space construction failed");
         self.egraph_contexts = contexts;
-        self.ops = Some(ops);
+        self.decoders = Some(
+            Rt::DECODERS
+                .iter()
+                .chain(crate::hlir::DECODERS)
+                .copied()
+                .collect(),
+        );
         self.search_space_dim_buckets = dim_buckets;
     }
 
@@ -1311,71 +1342,9 @@ impl Graph {
             .collect()
     }
 
-    fn egglog_program_with_interval_facts(
-        &self,
-        program: &str,
-        intervals: &DynDimIntervals,
-    ) -> (String, bool) {
-        let facts = crate::egglog_utils::base::interval_facts_egglog(intervals, []);
-        if facts.is_empty() {
-            (program.to_string(), false)
-        } else {
-            (format!("{facts}\n{program}"), true)
-        }
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
-        &mut self,
-        options: CompileOptions,
-    ) {
-        self.run_auto_loop_rolling_prepass(&options);
-        let exclude_ops = Ex::into_vec()
-            .into_iter()
-            .map(|e| e.sort().name)
-            .collect::<FxHashSet<_>>();
-        let mut ops = Rt::Ops::into_vec();
-        ops.retain(|o| !exclude_ops.contains(&o.sort().name));
-        ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
-        let dim_buckets = options.dim_buckets.clone();
-        let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
-        let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
-        let extra_egglog = Rt::extra_egglog();
-
-        let (program, root) = hlir_to_egglog(self);
-        let contexts = self.search_space_contexts(&dim_buckets);
-        self.egraphs = contexts
-            .iter()
-            .map(|context| {
-                let (contextual_program, use_interval_analysis) =
-                    self.egglog_program_with_interval_facts(&program, &context.intervals);
-                run_egglog_with_late_passes_interval_analysis_and_log(
-                    &contextual_program,
-                    &root,
-                    &ops,
-                    cleanup_hlir,
-                    &late_passes,
-                    &extra_egglog,
-                    use_interval_analysis,
-                    options.egglog_log_enabled(),
-                )
-                .unwrap()
-            })
-            .collect();
-        self.egraph_contexts = contexts;
-        self.ops = Some(ops);
-        self.search_space_dim_buckets = dim_buckets;
-    }
-
     /// Get a reference to the first e-graph search space (if built)
-    pub fn egraph(&self) -> Option<&SerializedEGraph> {
+    pub fn egraph(&self) -> Option<&SearchSpace> {
         self.egraphs.first()
-    }
-
-    /// Get a reference to the available ops (if search space is built)
-    pub fn egglog_ops(&self) -> Option<&Vec<Arc<Box<dyn EgglogOp>>>> {
-        self.ops.as_ref()
     }
 
     /// Build the search space and search it with one shared set of options.
@@ -1517,19 +1486,6 @@ impl Graph {
         combos
     }
 
-    fn late_pass_dyn_map(
-        &self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-    ) -> FxHashMap<char, usize> {
-        let mut dyn_map = self.dyn_map.clone();
-        for (&dim, buckets) in dim_buckets {
-            if let Some(max) = buckets.iter().map(|bucket| bucket.max).max() {
-                dyn_map.insert(dim, max);
-            }
-        }
-        dyn_map
-    }
-
     /// Format a human-readable label for a bucket combination.
     fn format_bucket_label(
         &self,
@@ -1576,9 +1532,12 @@ impl Graph {
             profile_dyn_map.insert(dim, value);
         }
         let limit = options.limit;
-        let ops = self.ops.as_ref().unwrap();
+        let decoders = self.decoders.as_ref().unwrap();
         let egraph = &self.egraphs[egraph_index];
-        let search_limit = count_choice_sets_up_to(egraph, limit);
+        let alternatives = egraph
+            .alternatives()
+            .expect("search space has no admissible roots");
+        let search_limit = count_choice_sets_up_to(&alternatives, limit);
         let start = std::time::Instant::now();
         let search_log = options.search_log_enabled();
 
@@ -1621,8 +1580,6 @@ impl Graph {
             };
 
         let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
         runtime.clear_intermediate_buffers();
         let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
         // `profile_start.elapsed()` wraps the whole compile+run, so this is the
@@ -1651,31 +1608,27 @@ impl Graph {
                 .max(10_000);
 
             loop {
-                let mut generation = random_choice_generation(egraph, 1, &mut prev_selected, rng);
+                let mut generation = random_choice_generation(
+                    &egraph.frozen,
+                    &alternatives,
+                    1,
+                    &mut prev_selected,
+                    rng,
+                );
                 let Some(genome) = generation.pop() else {
                     panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
                 };
 
-                list_cache.clear();
-                expr_cache.clear();
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut graph = egglog_to_llir(
-                        egraph,
-                        genome.clone(),
-                        ops,
-                        &self.custom_ops,
-                        &mut list_cache,
-                        &mut expr_cache,
-                        None,
-                    );
+                    let mut graph = reconstruct(egraph, &genome, decoders, &self.custom_ops)?.0;
                     // Collapse the rolled body to a single iteration before
                     // profiling — one transformer block instead of N×block, so
                     // per-candidate profile time scales with body size, not the
                     // unrolled graph size.
                     collapse_loops_to_first_iter(&mut graph);
-                    graph
+                    Ok::<_, egglog_experimental::typed::TypedError>(graph)
                 }));
-                let Ok(graph) = graph_result else {
+                let Ok(Ok(graph)) = graph_result else {
                     invalid_attempts += 1;
                     if invalid_attempts > max_invalid_attempts {
                         panic!(
@@ -1805,7 +1758,13 @@ impl Graph {
             // Generate offspring from all parents, dividing budget evenly
             let budget = (search_limit - n_graphs).min(options.generation_size);
             let all_offspring = if resample_generation {
-                random_choice_generation(egraph, budget, &mut prev_selected, rng)
+                random_choice_generation(
+                    &egraph.frozen,
+                    &alternatives,
+                    budget,
+                    &mut prev_selected,
+                    rng,
+                )
             } else {
                 let per_parent = budget.div_ceil(parents.len());
                 let mut offspring = Vec::new();
@@ -1816,6 +1775,7 @@ impl Graph {
                     }
                     offspring.extend(extract_reachable_generation(
                         egraph,
+                        &alternatives,
                         parent_genome,
                         per_parent.min(remaining),
                         options.mutations,
@@ -1835,25 +1795,16 @@ impl Graph {
                 if search_time_limit_reached() {
                     break;
                 }
-                list_cache.clear();
-                expr_cache.clear();
 
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut llir_graph = egglog_to_llir(
-                        egraph,
-                        genome.clone(),
-                        ops,
-                        &self.custom_ops,
-                        &mut list_cache,
-                        &mut expr_cache,
-                        None,
-                    );
+                    let mut llir_graph =
+                        reconstruct(egraph, &genome, decoders, &self.custom_ops)?.0;
                     // Collapse the rolled body to a single iteration
                     // before profiling — see initial-genome path.
                     collapse_loops_to_first_iter(&mut llir_graph);
-                    llir_graph
+                    Ok::<_, egglog_experimental::typed::TypedError>(llir_graph)
                 }));
-                let Ok(llir_graph) = graph_result else {
+                let Ok(Ok(llir_graph)) = graph_result else {
                     if search_log {
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -2032,15 +1983,9 @@ impl Graph {
         // single-iteration collapse, then run the real loop unroll. The
         // resulting LLIR is the full N-iteration graph the runtime executes;
         // the per-candidate collapsed form was used only for ranking.
-        let mut stitched = egglog_to_llir(
-            egraph,
-            best_genome,
-            ops,
-            &self.custom_ops,
-            &mut FxHashMap::default(),
-            &mut FxHashMap::default(),
-            None,
-        );
+        let mut stitched = reconstruct(egraph, &best_genome, decoders, &self.custom_ops)
+            .expect("winning selected graph must reconstruct")
+            .0;
         if std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some() {
             let dump_label = bucket_progress
                 .map(|(bucket_idx, n_buckets)| {
@@ -3156,7 +3101,6 @@ fn compact_llir_preserving_input_order(old: &LLIRGraph) -> LLIRGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egglog_utils::hash_egglog_normalized;
 
     // A rolling candidate is only collapsible if every non-state boundary input
     // is fed from OUTSIDE the candidate's occurrences. A non-state input produced
@@ -3199,7 +3143,6 @@ mod tests {
     }
 
     impl Runtime for TestFilterRuntime {
-        type Ops = ();
         type CompileArg = ();
         type ExecReturn = ();
         type ProfileMetric = usize;
@@ -3236,6 +3179,9 @@ mod tests {
     }
 
     static PROFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static RULE_CONFIG_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     #[derive(Default)]
     struct CountingRuntime {
@@ -3243,7 +3189,11 @@ mod tests {
     }
 
     impl Runtime for CountingRuntime {
-        type Ops = ();
+        fn rules() -> (PhaseRules, Vec<egglog_experimental::typed::Action>) {
+            RULE_CONFIG_CALLS.set(RULE_CONFIG_CALLS.get() + 1);
+            (crate::egglog_utils::base_phase_rules(), Vec::new())
+        }
+
         type CompileArg = ();
         type ExecReturn = ();
         type ProfileMetric = usize;
@@ -3328,6 +3278,30 @@ mod tests {
 
         cx.build_search_space::<TestFilterRuntime>(CompileOptions::default());
         assert_eq!(cx.egraphs.len(), 1);
+
+        let configured = RULE_CONFIG_CALLS.get();
+        cx.build_search_space::<CountingRuntime>(CompileOptions::default());
+        assert_eq!(RULE_CONFIG_CALLS.get(), configured + 1);
+
+        let capture = egglog_experimental::typed::let_(
+            "custom-initialization",
+            egglog_experimental::typed::builtins::I64::from(7),
+        );
+        let mut phases = crate::egglog_utils::base_phase_rules();
+        for group in phases.values_mut() {
+            *group = egglog_experimental::typed::ruleset(());
+        }
+        cx.build_search_space_with_rules::<CountingRuntime>(
+            CompileOptions::default(),
+            phases,
+            vec![(&capture).into()],
+        );
+        assert_eq!(RULE_CONFIG_CALLS.get(), configured + 1);
+        assert_eq!(cx.egraphs.len(), 1);
+        assert_eq!(
+            i64::try_from(cx.egraphs[0].frozen.lookup(&capture).unwrap()).unwrap(),
+            7,
+        );
     }
 
     #[test]
@@ -3415,94 +3389,6 @@ mod tests {
                 &[DimBucket::new(1, 1), DimBucket::new(2, 4).representative(4)],
             ),
             &mut rng,
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_same_structure() {
-        // Two egglog texts differing only in Input node indices and labels
-        let text_a = r#"(let t0 (Input 42 "boundary" (F32)))
-(let t1 (Input 100 "layers.0.wq.weight" (F32)))
-(let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
-(let t3 (Output t2 42))
-"#;
-        let text_b = r#"(let t0 (Input 84 "boundary" (F32)))
-(let t1 (Input 200 "layers.1.wq.weight" (F32)))
-(let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
-(let t3 (Output t2 84))
-"#;
-        assert_eq!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "Structurally identical chunks should hash the same"
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_different_structure() {
-        let text_a = r#"(let t0 (Input 42 "boundary" (F32)))
-(let t1 (Add (ECons 128 (ENil)) t0 (ECons 1 (ENil)) t0 (ECons 1 (ENil)) (ECons 1 (ENil))))
-"#;
-        let text_b = r#"(let t0 (Input 42 "boundary" (F32)))
-(let t1 (Mul (ECons 128 (ENil)) t0 (ECons 1 (ENil)) t0 (ECons 1 (ENil)) (ECons 1 (ENil))))
-"#;
-        assert_ne!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "Different op types should produce different hashes"
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_different_dtypes() {
-        let text_a = "(let t0 (Input 42 \"boundary\" (F32)))\n";
-        let text_b = "(let t0 (Input 42 \"boundary\" (F16)))\n";
-        assert_ne!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "Different dtypes should produce different hashes"
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_output_join_not_normalized() {
-        // OutputJoin lines should be hashed verbatim, not treated as Output
-        let text_a = "(let t0 (OutputJoin t1 t2))\n";
-        let text_b = "(let t0 (OutputJoin t3 t4))\n";
-        assert_ne!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "OutputJoin lines should be hashed verbatim"
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_custom_op_id() {
-        // CustomOpKind lines differ only in the integer ID (layer index)
-        let text_a = r#"(let t0 (Input 441 "boundary" (F32)))
-(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
-(let t2 (Output t1 585))
-"#;
-        let text_b = r#"(let t0 (Input 585 "boundary" (F32)))
-(let t1 (Op (CustomOpKind 2 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
-(let t2 (Output t1 729))
-"#;
-        assert_eq!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "CustomOpKind with different IDs should hash the same"
-        );
-    }
-
-    #[test]
-    fn test_hash_egglog_normalized_custom_op_different_structure() {
-        // CustomOpKind lines with different input lists should hash differently
-        let text_a = "(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (INil)))))\n";
-        let text_b = "(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t99 (INil)))))\n";
-        assert_ne!(
-            hash_egglog_normalized(text_a),
-            hash_egglog_normalized(text_b),
-            "CustomOpKind with different input lists should hash differently"
         );
     }
 

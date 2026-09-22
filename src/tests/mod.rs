@@ -1,3 +1,5 @@
+use crate::typed_reference::schema::{IList, Ir, OpKind};
+use egglog_experimental::typed::EgglogValue;
 use std::fmt::Debug;
 
 use crate::egglog_utils::{
@@ -178,7 +180,7 @@ pub fn random_vec_rng<R: Rng>(n: usize, rng: &mut R) -> Vec<f32> {
 /// validating each one, and checking that extraction doesn't panic.
 #[test]
 fn fuzz_test_genome_validity() {
-    use crate::egglog_utils::egglog_to_llir;
+    use crate::egglog_utils::reconstruct;
 
     // Build a moderately complex graph to test
     let mut cx = Graph::new();
@@ -195,48 +197,41 @@ fn fuzz_test_genome_validity() {
     // Build search space
     cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
-    let ops = cx.egglog_ops().unwrap();
+    let alternatives = egraph.alternatives().unwrap();
+    let decoders = cx.decoders.as_ref().unwrap();
 
     // Debug: count eclasses with choices
-    let mutable_eclasses: usize = egraph
-        .eclasses
+    let mutable_eclasses = alternatives
         .iter()
-        .filter(|(_, (label, enodes))| {
-            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        .filter(|(class, nodes)| {
+            nodes.len() > 1
+                && [Ir::sort_ref(), IList::sort_ref(), OpKind::sort_ref()].contains(&class.sort())
         })
         .count();
     println!(
         "Search space: {} total eclasses, {} mutable (have >1 enode)",
-        egraph.eclasses.len(),
+        alternatives.len(),
         mutable_eclasses
     );
 
-    let mut rng = rand::rng();
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
-    let mut list_cache = FxHashMap::default();
-    let mut expr_cache = FxHashMap::default();
 
     // Test initial random choice
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     println!("Initial choice has {} entries", initial.len());
     prev_selected.insert(hash_choice_set(&initial));
 
     // Validate initial choice
-    if let Err(e) = validate_choice_set(egraph, &initial, ops) {
+    if let Err(e) = validate_choice_set(egraph, &alternatives, &initial) {
         panic!("Initial choice is invalid: {}", e);
     }
     println!("Initial choice validated successfully");
 
     // Test extraction doesn't panic
-    let _graph = egglog_to_llir(
-        egraph,
-        initial.clone(),
-        ops,
-        &cx.custom_ops,
-        &mut list_cache,
-        &mut expr_cache,
-        None,
-    );
+    let _graph = reconstruct(egraph, &initial, decoders, &cx.custom_ops)
+        .unwrap()
+        .0;
     println!(
         "Initial extraction successful, graph has {} nodes",
         _graph.node_count()
@@ -250,7 +245,8 @@ fn fuzz_test_genome_validity() {
 
     for generation in 0..20 {
         let offspring = extract_generation(
-            egraph,
+            &egraph.frozen,
+            &alternatives,
             &base,
             10, // generation size
             2,  // mutations per offspring
@@ -274,20 +270,14 @@ fn fuzz_test_genome_validity() {
             total_count += 1;
 
             // Validate the choice set
-            if let Err(e) = validate_choice_set(egraph, &genome, ops) {
+            if let Err(e) = validate_choice_set(egraph, &alternatives, &genome) {
                 panic!("Generation {} produced invalid genome: {}", generation, e);
             }
 
             // Test extraction doesn't panic
-            let graph = egglog_to_llir(
-                egraph,
-                genome.clone(),
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
+            let graph = reconstruct(egraph, &genome, decoders, &cx.custom_ops)
+                .unwrap()
+                .0;
 
             // Basic sanity check on extracted graph
             assert!(graph.node_count() > 0, "Extracted graph has no nodes");
@@ -328,7 +318,7 @@ fn fuzz_test_genome_validity() {
 /// More extensive fuzz test with execution validation
 #[test]
 fn fuzz_test_genome_execution() {
-    use crate::egglog_utils::egglog_to_llir;
+    use crate::egglog_utils::reconstruct;
 
     // Build a simple graph where we can verify correctness
     let mut cx = Graph::new();
@@ -338,13 +328,14 @@ fn fuzz_test_genome_execution() {
 
     cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
-    let ops = cx.egglog_ops().unwrap();
+    let alternatives = egraph.alternatives().unwrap();
+    let decoders = cx.decoders.as_ref().unwrap();
 
-    let mut rng = rand::rng();
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
 
     // Generate and test multiple genomes
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     prev_selected.insert(hash_choice_set(&initial));
 
     let test_input_a = vec![1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0];
@@ -358,8 +349,16 @@ fn fuzz_test_genome_execution() {
     let mut base = initial;
     let mut tested = 0;
 
-    for _generation in 0..10 {
-        let offspring = extract_generation(egraph, &base, 5, 2, &mut prev_selected, &mut rng);
+    for _ in 0..10 {
+        let offspring = extract_generation(
+            &egraph.frozen,
+            &alternatives,
+            &base,
+            5,
+            2,
+            &mut prev_selected,
+            &mut rng,
+        );
 
         if offspring.is_empty() {
             break;
@@ -367,22 +366,14 @@ fn fuzz_test_genome_execution() {
 
         for genome in offspring {
             // Validate
-            if let Err(e) = validate_choice_set(egraph, &genome, ops) {
+            if let Err(e) = validate_choice_set(egraph, &alternatives, &genome) {
                 panic!("Invalid genome: {}", e);
             }
 
             // Extract and execute
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let llir_graph = egglog_to_llir(
-                egraph,
-                genome.clone(),
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
+            let llir_graph = reconstruct(egraph, &genome, decoders, &cx.custom_ops)
+                .unwrap()
+                .0;
 
             let mut rt = ReferenceRuntime::default();
             rt.load_llir(&llir_graph);
@@ -407,11 +398,11 @@ fn fuzz_test_genome_execution() {
     }
 
     // Count mutable eclasses
-    let mutable_eclasses: usize = egraph
-        .eclasses
+    let mutable_eclasses = alternatives
         .iter()
-        .filter(|(_, (label, enodes))| {
-            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        .filter(|(class, nodes)| {
+            nodes.len() > 1
+                && [Ir::sort_ref(), IList::sort_ref(), OpKind::sort_ref()].contains(&class.sort())
         })
         .count();
 

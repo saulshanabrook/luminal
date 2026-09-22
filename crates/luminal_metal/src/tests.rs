@@ -1,7 +1,10 @@
+use crate::typed_rules::{GenericMatmulArgs, MPSBatchedMatmulArgs, MPSMatmulArgs};
 use crate::{kernel::lower_expression_for_metal, runtime::MetalRuntime};
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
+use egglog_experimental::typed::EgglogValue;
 use half::{bf16, f16};
 use luminal::prelude::*;
+use luminal::typed_reference::schema::OpKind;
 use proptest::prelude::*;
 use rand::{SeedableRng, rngs::StdRng};
 use safetensors::{Dtype, tensor::TensorView};
@@ -48,21 +51,30 @@ fn search_candidates(cx: &mut Graph, rt: MetalRuntime, limit: usize) -> MetalRun
     )
 }
 
-fn egraph_has_op(cx: &Graph, op_name: &str) -> bool {
-    cx.egraph()
-        .expect("search space should be built")
-        .enodes
-        .values()
-        .any(|(label, _)| label == op_name)
+fn egraph_has_op(cx: &Graph, matches: impl Fn(&OpKind) -> bool) -> bool {
+    let space = cx.egraph().expect("search space should be built");
+    space
+        .alternatives()
+        .expect("search space alternatives should be valid")
+        .iter()
+        .filter(|(class, _)| class.sort() == OpKind::sort_ref())
+        .flat_map(|(_, nodes)| nodes)
+        .any(|&node| matches(&space.frozen.typed_node::<OpKind>(node).unwrap()))
 }
 
-fn assert_matmul_options(cx: &Graph, mps_op_name: &str) {
+fn assert_matmul_options(cx: &Graph, batched: bool) {
     assert!(
-        egraph_has_op(cx, mps_op_name),
-        "expected {mps_op_name} rewrite option in e-graph"
+        egraph_has_op(cx, |kind| if batched {
+            MPSBatchedMatmulArgs::get_args(kind).unwrap().is_some()
+        } else {
+            MPSMatmulArgs::get_args(kind).unwrap().is_some()
+        }),
+        "expected MPS matmul rewrite option in e-graph (batched={batched})"
     );
     assert!(
-        egraph_has_op(cx, "GenericMatmul"),
+        egraph_has_op(cx, |kind| GenericMatmulArgs::get_args(kind)
+            .unwrap()
+            .is_some()),
         "expected GenericMatmul rewrite option in e-graph"
     );
 }
@@ -532,6 +544,31 @@ fn metal_simple_sin() {
 }
 
 #[test]
+fn metal_sin_reuses_prepared_dynamic_strided_kernel() {
+    let mut cx = Graph::default();
+    cx.set_dim('s', 1);
+    let input = cx.tensor(('s', 2));
+    let output = input.t().sin().output();
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &[0.0, 1.0]);
+    rt = search_candidates(&mut cx, rt, 1);
+
+    // Reuse the compiled pipeline, including its dynamic strided index programs.
+    for size in [1, 3, 2] {
+        cx.set_dim('s', size);
+        let values: Vec<f32> = (0..size * 2).map(|i| i as f32 * 0.25 - 0.5).collect();
+        let expected: Vec<f32> = (0..2)
+            .flat_map(|column| (0..size).map(move |row| row * 2 + column))
+            .map(|index| values[index].sin())
+            .collect();
+        rt.set_data(input, values);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(output), &expected, 0.001);
+    }
+}
+
+#[test]
 fn metal_simple_sqrt() {
     let mut cx = Graph::default();
     let input = cx.tensor(4);
@@ -728,7 +765,7 @@ fn metal_regular_tiled_matmul_path() {
     let output = a.matmul(b).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSMatmul");
+    assert_matmul_options(&cx, false);
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.4, -0.2);
@@ -763,7 +800,7 @@ fn metal_mps_matmul_transposed_rhs_weight_layout() {
     let output = a.matmul(weight.t()).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSMatmul");
+    assert_matmul_options(&cx, false);
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.35, -0.17);
@@ -798,7 +835,7 @@ fn metal_mps_matmul_transposed_lhs_layout() {
     let output = lhs_storage.t().matmul(rhs).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSMatmul");
+    assert_matmul_options(&cx, false);
     let mut rt = MetalRuntime::initialize(());
 
     let lhs_data = seeded_data(k * m, 0.31, -0.12);
@@ -837,7 +874,7 @@ fn metal_mps_batched_matmul_row_row_layout() {
     let output = a.matmul(b).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSBatchedMatmul");
+    assert_matmul_options(&cx, true);
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(batch * m * k, 0.17, -0.08);
@@ -882,7 +919,9 @@ fn metal_generic_matmul_covers_noncontiguous_merged_head_projection() {
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_op(&cx, "GenericMatmul"),
+        egraph_has_op(&cx, |kind| GenericMatmulArgs::get_args(kind)
+            .unwrap()
+            .is_some()),
         "expected GenericMatmul rewrite option in e-graph"
     );
     let mut rt = MetalRuntime::initialize(());
@@ -940,7 +979,7 @@ fn metal_mps_batched_matmul_transposed_rhs_layout() {
     let output = a.matmul(weight.permute((0, 2, 1))).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSBatchedMatmul");
+    assert_matmul_options(&cx, true);
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(batch * m * k, 0.13, -0.06);
@@ -981,7 +1020,7 @@ fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
     let output = a.matmul(weight.t()).cast(DType::F32).output();
 
     cx.build_search_space::<MetalRuntime>(CompileOptions::default());
-    assert_matmul_options(&cx, "MPSMatmul");
+    assert_matmul_options(&cx, false);
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.22, -0.07);

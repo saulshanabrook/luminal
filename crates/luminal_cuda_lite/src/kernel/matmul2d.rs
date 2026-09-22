@@ -1,8 +1,7 @@
 //! Direct 2D matmul kernel — bypasses egglog rewrites, used as a custom op
 //! for matmul shapes where the cublaslt egg rules don't reliably fire.
 //!
-//! The cublaslt 2D rules in `host/cublaslt/cublaslt_*Cm_rewrite.egg` /
-//! `cublaslt_Rm*_rewrite.egg` are *supposed* to match any 2D matmul whose
+//! The cublaslt 2D rules in `host/cublaslt/*_rewrite.rs` are *supposed* to match any 2D matmul whose
 //! Mul + SumReduce broadcast lowering has the expected stride patterns,
 //! and the conditional matmul cleanup is *supposed* to delete the
 //! elementwise Mul + KernelSumReduce fallback whenever a cublaslt alternative

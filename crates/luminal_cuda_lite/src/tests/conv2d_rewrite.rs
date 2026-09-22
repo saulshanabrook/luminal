@@ -1,9 +1,6 @@
-use luminal::{
-    egglog_utils::{
-        NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
-    },
-    prelude::*,
-};
+use super::utilities::op_candidates;
+use luminal::egglog_utils::{random_initial_choice, reconstruct, validate_choice_set};
+use luminal::prelude::*;
 use rand::{SeedableRng, rngs::StdRng};
 
 use crate::{kernel::KernelOp, runtime::CudaRuntime};
@@ -136,11 +133,21 @@ fn generic_conv2d_rewrite_matches_unfold_matmul_bias() {
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
-        !op_ir_nodes(egraph, "KernelConv2D").is_empty(),
+        !op_candidates(egraph, |kind| {
+            crate::typed_rules::KernelConv2DArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        })
+        .is_empty(),
         "expected generic conv2d rewrite candidate"
     );
     assert!(
-        op_ir_nodes(egraph, "Add").is_empty(),
+        op_candidates(egraph, |kind| {
+            luminal::typed_reference::schema::AddArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        },)
+        .is_empty(),
         "generic conv2d cleanup should prune the final bias Add fallback"
     );
 }
@@ -152,7 +159,12 @@ fn generic_conv2d_rewrite_matches_conv1x1_matmul_bias() {
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
-        !op_ir_nodes(egraph, "KernelConv2D").is_empty(),
+        !op_candidates(egraph, |kind| {
+            crate::typed_rules::KernelConv2DArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        })
+        .is_empty(),
         "expected generic conv2d rewrite candidate for 1x1 conv"
     );
 }
@@ -169,7 +181,12 @@ fn generic_conv2d_rewrite_requires_conv_output_shape() {
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
-        op_ir_nodes(egraph, "KernelConv2D").is_empty(),
+        op_candidates(egraph, |kind| {
+            crate::typed_rules::KernelConv2DArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        })
+        .is_empty(),
         "matmul+bias without [C_out,H_out,W_out] conv output shape should not match KernelConv2D"
     );
 }
@@ -413,9 +430,17 @@ fn reference_conv2d(input: &[f32], weight: &[f32], bias: &[f32], case: ConvCase)
 fn extract_forced_kernel_llir(cx: &mut Graph, kernel_name: &str) -> LLIRGraph {
     let egraph = cx.egraph().expect("search space should have an e-graph");
     let ops = cx
-        .egglog_ops()
+        .decoders
+        .as_ref()
         .expect("search space should have registered egglog ops");
-    let kernel_nodes = op_ir_nodes(egraph, "KernelConv2D");
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
+    let kernel_nodes = op_candidates(egraph, |kind| {
+        crate::typed_rules::KernelConv2DArgs::get_args(kind)
+            .unwrap()
+            .is_some()
+    });
     assert!(
         !kernel_nodes.is_empty(),
         "expected at least one {kernel_name} candidate"
@@ -423,25 +448,14 @@ fn extract_forced_kernel_llir(cx: &mut Graph, kernel_name: &str) -> LLIRGraph {
 
     for (idx, kernel_node) in kernel_nodes.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(0xC0_2D00 + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let kernel_class = &egraph.node_to_class[*kernel_node];
-        choices.insert(kernel_class, kernel_node);
+        let mut choices = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
+        choices.extend(*kernel_node);
 
-        if validate_choice_set(egraph, &choices, ops).is_err() {
+        if validate_choice_set(egraph, &alternatives, &choices).is_err() {
             continue;
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let (llir, _) = reconstruct(egraph, &choices, ops, &cx.custom_ops)
+            .expect("selected CUDA candidate should reconstruct");
         if llir_kernel_names(&llir).contains(&kernel_name) {
             return llir;
         }
@@ -456,27 +470,6 @@ fn llir_kernel_names(llir: &LLIRGraph) -> Vec<&'static str> {
             llir[node]
                 .to_dialect::<dyn KernelOp>()
                 .map(|kernel| kernel.kernel_name())
-        })
-        .collect()
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == kind_label)
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
         })
         .collect()
 }

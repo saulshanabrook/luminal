@@ -205,7 +205,7 @@ pub(crate) fn build_compile_units(
             }
         }
 
-        // Canonical orders for interior + FS nodes. `egglog_to_llir`
+        // Canonical orders for interior + FS nodes. Typed reconstruction
         // reissues NodeIndexes for every search candidate, so any
         // NodeIndex-driven order (like the previous global-toposort
         // filter) renumbers the kernel's inputs and locals across
@@ -623,7 +623,7 @@ pub(crate) fn region_kernel_source(
     // Body: read FS leaves, then walk elementwise nodes in topo order emitting a
     // local per op, then write FE output. Every node gets a local keyed
     // by a position-in-region index so the kernel string is invariant
-    // under NodeIndex churn (each `egglog_to_llir` reissues NodeIndexes,
+    // under NodeIndex churn (each typed reconstruction reissues NodeIndexes,
     // so naming locals by `n.index()` would invalidate the kernel
     // string cache on every search candidate). Indices: FS leaves get
     // 0..fs_nodes.len(), elementwise nodes get fs_nodes.len()..(+ elementwise_topo.len()).

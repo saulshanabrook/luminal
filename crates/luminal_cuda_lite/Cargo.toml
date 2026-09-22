@@ -8,11 +8,9 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental", rev = "ab9915c1cbf0bbcf013c9548d9ba413f831e7001", default-features = false, features = ["typed"] }
 luminal = { path = "../.." }
 luminal_tracing = { path = "../luminal_tracing" }
-# Needed so the `egglog!` quasiquote (which expands to `::egglog::…`) resolves
-# when used in rule generators here.
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "9d58d2e4922b28c12aeb032420d09bae1df69718" }
 cudarc = {version="0.19.4", features=["cuda-version-from-build-system", "fallback-latest"]}
 anyhow = "1.0"
 as-any = "0.3.2"

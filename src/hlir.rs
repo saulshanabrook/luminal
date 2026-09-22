@@ -1,257 +1,68 @@
+pub use crate::typed_reference::dynamic_rules::binary_unroll_rules as binary_op_unroll_rules;
+
 use std::fmt::Display;
 use std::{fmt::Debug, sync::Arc};
 
-use crate::egglog_utils::{
-    api::{SortDef, sort},
-    base::*,
-    *,
-};
+use crate::egglog_utils::DecodeContext;
 use crate::op::*;
 use crate::prelude::*;
-use egglog::ast::{Command, Parser};
-use egglog::prelude::egglog;
+use crate::typed_reference::{
+    lower::{dimension, dimensions},
+    schema::{self, DimExpr, EList, Ir, OpKind},
+};
+use egglog_experimental::typed::{TypedError, builtins as egg, get_args};
 
 use as_any::AsAny;
 use itertools::Itertools;
-
-// --- Dtype helpers for direct IR variants (Input, Output) ---
-
-/// Helper: build a dtype propagation rule for a direct IR op.
-/// Matches the op, reads dtype from the named IR source field, and sets it on the op.
-/// `#kind` / `:#dtype_source` splice the op's runtime constructor + field names;
-/// `...` binds the fields we don't read to fresh vars (expanded at parse time).
-fn dtype_propagation_rule(parser: &mut Parser, sort: &SortDef, dtype_source: &str) -> Vec<Command> {
-    let kind = sort.name.as_str();
-    egglog!(
-        *parser,
-        (rule ((= ?__e (#kind :#dtype_source ?__src ...))
-               (= ?__dty (dtype ?__src)))
-              ((set (dtype ?__e) ?__dty))
-            :ruleset dtype_prop)
-    )
-    .expect("dtype propagation rule should parse")
-}
-
-/// Helper: build a dtype-from-field rule for a direct IR op.
-fn dtype_from_field_rule(parser: &mut Parser, sort: &SortDef, dtype_field: &str) -> Vec<Command> {
-    let kind = sort.name.as_str();
-    egglog!(
-        *parser,
-        (rule ((= ?__e (#kind :#dtype_field ?__d ...)))
-              ((set (dtype ?__e) ?__d))
-            :ruleset dtype_prop)
-    )
-    .expect("dtype-from-field rule should parse")
-}
-
-// --- Dtype helpers for normalized ops (Op OpKind IList) ---
-
-/// Dtype propagation for a normalized op: inherits from first IList input.
-fn dtype_propagation_op(parser: &mut Parser, kind_sort: &SortDef) -> Vec<Command> {
-    let kind = kind_sort.name.as_str();
-    egglog!(
-        *parser,
-        // (Op (<Kind> ...) (ICons ?__first_inp ?__tail)) — kind fields ignored.
-        (rule ((= ?__e (Op (#kind ...) (ICons ?__first_inp ?__tail)))
-               (= ?__dty (dtype ?__first_inp)))
-              ((set (dtype ?__e) ?__dty))
-            :ruleset dtype_prop)
-    )
-    .expect("dtype propagation op rule should parse")
-}
-
-/// Dtype from a field on the OpKind (e.g., Cast's dtype field).
-fn dtype_from_kind_field(parser: &mut Parser, kind_sort: &SortDef, field_name: &str) -> Vec<Command> {
-    let kind = kind_sort.name.as_str();
-    egglog!(
-        *parser,
-        // (Op (<Kind> :<field_name> ?__d ...) ?__inputs)
-        (rule ((= ?__e (Op (#kind :#field_name ?__d ...) ?__inputs)))
-              ((set (dtype ?__e) ?__d))
-            :ruleset dtype_prop)
-    )
-    .expect("dtype-from-kind-field rule should parse")
-}
-
-/// Fixed dtype for a normalized op (e.g., Iota always Int).
-fn dtype_fixed_op(parser: &mut Parser, kind_sort: &SortDef, dtype_sort: &SortDef) -> Vec<Command> {
-    let kind = kind_sort.name.as_str();
-    let dt = dtype_sort.name.as_str();
-    egglog!(
-        *parser,
-        // (Op (<Kind> ...) ?__inputs) — match the kind, ignore all its fields.
-        (rule ((= ?__e (Op (#kind ...) ?__inputs)))
-              ((set (dtype ?__e) (#dt)))
-            :ruleset dtype_prop)
-    )
-    .expect("dtype fixed op rule should parse")
-}
-
-/// Build an IList egglog string from input variable names.
-fn ilist_egglog(inputs: &[&str]) -> String {
-    list_to_egglog(inputs, "ICons", "INil")
-}
 use num_traits::Float;
 use petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::info_span;
 
-// --- Convenience sort builders for common op patterns ---
+// Core dtype, loop, unroll, and dimension rules are installed once by the
+// common driver. Backends run before these ordered fallback decoders.
+pub const DECODERS: &[DecodeFn] = &[
+    LoopInput::decode,
+    LoopInputStatic::decode,
+    LoopOutput::decode,
+    LoopOutputSelect::decode,
+    Constant::decode,
+    Cast::decode,
+    Iota::decode,
+    Exp2::decode,
+    Log2::decode,
+    Sin::decode,
+    Recip::decode,
+    Sqrt::decode,
+    Add::decode,
+    Mul::decode,
+    Mod::decode,
+    LessThan::decode,
+    Gather::decode,
+    Scatter::decode,
+    SumReduce::decode,
+    MaxReduce::decode,
+];
 
-/// Unary op kind: (shape: EList, strides: EList, out_strides: EList), IList: [inp]
-pub fn unary_sort(name: &str) -> SortDef {
-    sort(
-        OP_KIND,
-        name,
-        &[("shape", ELIST), ("strides", ELIST), ("out_strides", ELIST)],
-    )
+/// Core alternatives removable when another eligible implementation survives.
+pub fn cleanup(kind: &OpKind) -> Result<bool, TypedError> {
+    Ok(schema::ConstantArgs::get_args(kind)?.is_some()
+        || schema::CastArgs::get_args(kind)?.is_some()
+        || schema::IotaArgs::get_args(kind)?.is_some()
+        || schema::Exp2Args::get_args(kind)?.is_some()
+        || schema::Log2Args::get_args(kind)?.is_some()
+        || schema::SinArgs::get_args(kind)?.is_some()
+        || schema::RecipArgs::get_args(kind)?.is_some()
+        || schema::SqrtArgs::get_args(kind)?.is_some()
+        || schema::AddArgs::get_args(kind)?.is_some()
+        || schema::MulArgs::get_args(kind)?.is_some()
+        || schema::ModArgs::get_args(kind)?.is_some()
+        || schema::LessThanArgs::get_args(kind)?.is_some()
+        || schema::GatherArgs::get_args(kind)?.is_some()
+        || schema::ScatterArgs::get_args(kind)?.is_some()
+        || schema::SumArgs::get_args(kind)?.is_some()
+        || schema::MaxArgs::get_args(kind)?.is_some())
 }
-
-/// Binary op kind: (shape: EList, a_strides: EList, b_strides: EList, out_strides: EList), IList: [inp_a, inp_b]
-pub fn binary_sort(name: &str) -> SortDef {
-    sort(
-        OP_KIND,
-        name,
-        &[
-            ("shape", ELIST),
-            ("a_strides", ELIST),
-            ("b_strides", ELIST),
-            ("out_strides", ELIST),
-        ],
-    )
-}
-
-/// Generate egglog rewrite rules that union a small rolled `body=1, trips=N`
-/// single-binary-op loop with its fully-unrolled equivalent in the same
-/// eclass. Both representations coexist; the cost-based extractor picks
-/// whichever one downstream patterns prefer — the unrolled form when fusions
-/// (e.g. GLUMoE GemmaGELU, CUDA elementwise exp fusion) match through
-/// the flat chain, the rolled form otherwise. Without these unions, rolling
-/// a tiny chain blocks the fusion entirely and the extracted graph is
-/// strictly worse than not rolling.
-///
-/// Register these in `EgglogOp::rewrites()`. The driver feeds this normal
-/// rewrite set into the single egglog run, so the unrolled chain is visible to
-/// fusion patterns (GLUMoE) and kernel rewrites (`direct-exp-fusion`).
-///
-/// Generates 2 rules per iter count (state at body input position 0 vs 1)
-/// for every `n_iters` in `2..=max_trips`. Larger trips stay rolled-only —
-/// real transformer-block rolls are body ≫ 1 anyway, and carrying both
-/// forms beyond a small N adds search-time cost without an upside.
-///
-/// Each rule matches the rolled shape `LoopEnd(body)` where `body` is the
-/// binary op consuming `LoopStart(initial)` and `LoopInput(s0..s_{N-1})`,
-/// and unions `LoopEnd` with the chain
-///   `u0 = <kind>(initial, s0); u1 = <kind>(u0, s1); … u_{N-1}`.
-/// (or symmetric for state at position 1.)
-pub fn binary_op_unroll_rules(
-    parser: &mut Parser,
-    op_kind: &str,
-    max_trips: usize,
-) -> Vec<Command> {
-    let mut cmds = Vec::new();
-    for n_iters in 2..=max_trips {
-        for state_pos in 0..2 {
-            cmds.extend(raw_rules(
-                parser,
-                &binary_op_unroll_rule(op_kind, n_iters, state_pos),
-            ));
-        }
-    }
-    cmds
-}
-
-fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> String {
-    // Swap (state, per_iter) → (input0, input1) by `state_pos`. Both the
-    // body match pattern and the unrolled chain bodies follow this mapping
-    // so a/b stride positions stay aligned.
-    debug_assert!(state_pos < 2);
-    let order = |state: &str, per_iter: &str| -> String {
-        if state_pos == 0 {
-            format!("(ICons {state} (ICons {per_iter} (INil)))")
-        } else {
-            format!("(ICons {per_iter} (ICons {state} (INil)))")
-        }
-    };
-    let li_sources = (0..n_iters).rev().fold(String::from("(INil)"), |acc, i| {
-        format!("(ICons ?s{i} {acc})")
-    });
-    let chain = (0..n_iters)
-        .map(|i| {
-            let prev = if i == 0 {
-                "?initial".to_string()
-            } else {
-                format!("?u{}", i - 1)
-            };
-            format!(
-                "                (let ?u{i} (Op ({op_kind} ?sh ?as ?bs ?os) {}))",
-                order(&prev, &format!("?s{i}"))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "(rule
-            (
-                (= ?ls (LoopStart ?initial ?loop_id ?slot_idx (MNum {n_iters}) ?dt))
-                (= ?li (Op (LoopInput ?loop_id ?stream ?dt) {li_sources}))
-                (= ?body (Op ({op_kind} ?sh ?as ?bs ?os) {body_pat}))
-                (= ?le (LoopEnd ?body ?loop_id ?slot_idx ?dt))
-            )
-            (
-{chain}
-                (union ?le ?u{last})
-            )
-            :ruleset expr
-            :name \"unroll {op_kind} body trips={n_iters} state={state_pos}\"
-        )",
-        body_pat = order("?ls", "?li"),
-        last = n_iters - 1,
-    )
-}
-
-/// Reduce op kind: (shape: EList, iters: Expression, strides: EList, iter_stride: Expression, out_strides: EList), IList: [inp]
-pub fn reduce_sort(name: &str) -> SortDef {
-    sort(
-        OP_KIND,
-        name,
-        &[
-            ("shape", ELIST),
-            ("iters", EXPRESSION),
-            ("strides", ELIST),
-            ("iter_stride", EXPRESSION),
-            ("out_strides", ELIST),
-        ],
-    )
-}
-
-pub type HLIROps = (
-    Input,
-    Output,
-    CustomOpKind,
-    LoopStart,
-    LoopEnd,
-    LoopInput,
-    LoopInputStatic,
-    LoopOutput,
-    LoopOutputSelect,
-    Constant,
-    Cast,
-    Iota,
-    Exp2,
-    Log2,
-    Sin,
-    Recip,
-    Sqrt,
-    Add,
-    Mul,
-    Mod,
-    LessThan,
-    Gather,
-    Scatter,
-    SumReduce,
-    MaxReduce,
-);
 
 #[derive(Default, Debug, Clone)]
 pub struct Input {
@@ -275,54 +86,9 @@ impl Display for Input {
     }
 }
 
-impl EgglogOp for Input {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "Input",
-            &[("node", I64), ("label", STRING), ("dtype", DTYPE)],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_field_rule(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let node = egraph.enodes[kind_children[0]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let label = egraph.enodes[kind_children[1]].0.replace("\"", "");
-        (
-            LLIROp::new::<Input>(Box::new(Self {
-                node,
-                label,
-                dtype: extract_dtype(egraph, kind_children[2]),
-            })),
-            vec![],
-        )
-    }
-}
-
 impl HLIROp for Input {
-    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Input {} \"{}\" ({:?}))",
-            self.node, self.label, self.dtype
-        )
+    fn to_ir(&self, _: &[&Ir]) -> Ir {
+        Ir::Input(self.node as i64, self.label.as_str(), self.dtype)
     }
 }
 
@@ -343,43 +109,9 @@ impl Display for Output {
     }
 }
 
-impl EgglogOp for Output {
-    fn sort(&self) -> SortDef {
-        sort(IR, "Output", &[("inp", IR), ("node", I64)])
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_rule(parser, &self.sort(), "inp")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<Output>(Box::new(Self {
-                node: egraph.enodes[kind_children[1]]
-                    .0
-                    .replace("\"", "")
-                    .parse::<usize>()
-                    .unwrap(),
-            })),
-            vec![kind_children[0]],
-        )
-    }
-}
-
 impl HLIROp for Output {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!("(Output {} {})", inp[0].1, self.node)
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Output(inputs[0], self.node as i64)
     }
 }
 
@@ -401,28 +133,9 @@ impl Display for CustomOpKind {
     }
 }
 
-impl EgglogOp for CustomOpKind {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "CustomOpKind", &[("id", I64), ("dtype", DTYPE)])
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_kind_field(parser, &self.sort(), "dtype")
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-}
-
 impl HLIROp for CustomOpKind {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (CustomOpKind {} ({:?})) {})",
-            self.id,
-            self.dtype,
-            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
-        )
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(OpKind::CustomOpKind(self.id as i64, self.dtype), inputs)
     }
 }
 
@@ -469,69 +182,13 @@ impl Display for LoopStart {
     }
 }
 
-impl EgglogOp for LoopStart {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "LoopStart",
-            &[
-                ("inp", IR),
-                ("loop_id", I64),
-                ("slot_idx", I64),
-                ("iters", EXPRESSION),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_field_rule(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let slot_idx = egraph.enodes[kind_children[2]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let iters = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-        let dtype = extract_dtype(egraph, kind_children[4]);
-        (
-            LLIROp::new::<LoopStart>(Box::new(Self {
-                loop_id,
-                slot_idx,
-                iters,
-                dtype,
-            })),
-            vec![kind_children[0]],
-        )
-    }
-}
-
 impl HLIROp for LoopStart {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(LoopStart {} {} {} {} ({:?}))",
-            inp[0].1,
-            self.loop_id,
-            self.slot_idx,
-            self.iters.to_egglog(),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::LoopStart(
+            inputs[0],
+            self.loop_id as i64,
+            self.slot_idx as i64,
+            dimension(&self.iters, true),
             self.dtype,
         )
     }
@@ -560,63 +217,13 @@ impl Display for LoopEnd {
     }
 }
 
-impl EgglogOp for LoopEnd {
-    fn sort(&self) -> SortDef {
-        sort(
-            IR,
-            "LoopEnd",
-            &[
-                ("inp", IR),
-                ("loop_id", I64),
-                ("slot_idx", I64),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_field_rule(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let slot_idx = egraph.enodes[kind_children[2]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let dtype = extract_dtype(egraph, kind_children[3]);
-        (
-            LLIROp::new::<LoopEnd>(Box::new(Self {
-                loop_id,
-                slot_idx,
-                dtype,
-            })),
-            vec![kind_children[0]],
-        )
-    }
-}
-
 impl HLIROp for LoopEnd {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(LoopEnd {} {} {} ({:?}))",
-            inp[0].1, self.loop_id, self.slot_idx, self.dtype,
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::LoopEnd(
+            inputs[0],
+            self.loop_id as i64,
+            self.slot_idx as i64,
+            self.dtype,
         )
     }
 }
@@ -644,106 +251,37 @@ impl Display for LoopInput {
     }
 }
 
-impl EgglogOp for LoopInput {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "LoopInput",
-            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        // Declare the `identical_inputs` relation and the three-way unification
-        // chain between `LoopInput`, `LoopInputStatic`, and an inlined source.
-        // Running alongside fusion rules (e.g. GLUMoE) so that fusion patterns
-        // that expect raw op kinds at boundary positions can match via the
-        // unioned eclass.
-        let mut cmds = dtype_from_kind_field(parser, &self.sort(), "dtype");
-        cmds.extend(raw_rules(
-            parser,
-            r#"
-            (relation identical_inputs (IList))
-
-            ; All four rules live in the `expr` ruleset, which the schedule
-            ; saturates each iteration. Default-ruleset scheduling only runs
-            ; each rule once per outer step, which is not enough to propagate
-            ; `identical_inputs` through an N-element IList.
-
-            ; Base: single-element list is trivially identical.
-            (rule ((= ?l (ICons ?x (INil))))
-                  ((identical_inputs ?l))
-                  :ruleset expr
-                  :name "identical_inputs base")
-
-            ; Inductive: head equals next-head, and the tail starting at next-head is identical.
-            (rule ((= ?l (ICons ?x (ICons ?x ?tail)))
-                   (identical_inputs (ICons ?x ?tail)))
-                  ((identical_inputs ?l))
-                  :ruleset expr
-                  :name "identical_inputs ind")
-
-            ; LoopInput with an identical IList is equivalent to LoopInputStatic over a single copy.
-            (rule ((= ?e (Op (LoopInput ?id ?stream ?dt) (ICons ?x ?cont)))
-                   (identical_inputs (ICons ?x ?cont)))
-                  ((let ?static (Op (LoopInputStatic ?id ?stream ?dt) (ICons ?x (INil))))
-                   (union ?e ?static))
-                  :ruleset expr
-                  :name "LoopInput to LoopInputStatic")
-
-            ; LoopInputStatic is equivalent to its single inner value — collapses the boundary
-            ; wrapper for pattern-matching and extraction purposes.
-            (rule ((= ?e (Op (LoopInputStatic ?id ?stream ?dt) (ICons ?x (INil)))))
-                  ((union ?e ?x))
-                  :ruleset expr
-                  :name "LoopInputStatic inline")
-            "#,
-        ));
-        cmds
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[0]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let stream_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let dtype = extract_dtype(egraph, kind_children[2]);
-        (
-            LLIROp::new::<LoopInput>(Box::new(Self {
-                loop_id,
-                stream_id,
-                dtype,
-            })),
-            input_enodes,
-        )
+impl LoopInput {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((loop_id, stream_id, dtype)) = get_args(
+            kind,
+            |loop_id: &egg::I64, stream_id: &egg::I64, dtype: &schema::DType| {
+                OpKind::LoopInput(loop_id, stream_id, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<LoopInput>(Box::new(Self {
+            loop_id: usize::try_from(i64::try_from(loop_id)?)
+                .map_err(|_| TypedError::Decode("LoopInput loop_id must be nonnegative".into()))?,
+            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+                TypedError::Decode("LoopInput stream_id must be nonnegative".into())
+            })?,
+            dtype: context.dtype(&dtype)?,
+        }))))
     }
 }
 
 impl HLIROp for LoopInput {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (LoopInput {} {} ({:?})) {})",
-            self.loop_id,
-            self.stream_id,
-            self.dtype,
-            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::LoopInput(self.loop_id as i64, self.stream_id as i64, self.dtype),
+            inputs,
         )
     }
 }
@@ -779,61 +317,38 @@ impl Display for LoopInputStatic {
     }
 }
 
-impl EgglogOp for LoopInputStatic {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "LoopInputStatic",
-            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_kind_field(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[0]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let stream_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let dtype = extract_dtype(egraph, kind_children[2]);
-        (
-            LLIROp::new::<LoopInputStatic>(Box::new(Self {
-                loop_id,
-                stream_id,
-                dtype,
-            })),
-            input_enodes,
-        )
+impl LoopInputStatic {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((loop_id, stream_id, dtype)) = get_args(
+            kind,
+            |loop_id: &egg::I64, stream_id: &egg::I64, dtype: &schema::DType| {
+                OpKind::LoopInputStatic(loop_id, stream_id, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<LoopInputStatic>(Box::new(Self {
+            loop_id: usize::try_from(i64::try_from(loop_id)?).map_err(|_| {
+                TypedError::Decode("LoopInputStatic loop_id must be nonnegative".into())
+            })?,
+            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+                TypedError::Decode("LoopInputStatic stream_id must be nonnegative".into())
+            })?,
+            dtype: context.dtype(&dtype)?,
+        }))))
     }
 }
 
 impl HLIROp for LoopInputStatic {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (LoopInputStatic {} {} ({:?})) {})",
-            self.loop_id,
-            self.stream_id,
-            self.dtype,
-            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::LoopInputStatic(self.loop_id as i64, self.stream_id as i64, self.dtype),
+            inputs,
         )
     }
 }
@@ -866,61 +381,37 @@ impl Display for LoopOutput {
     }
 }
 
-impl EgglogOp for LoopOutput {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "LoopOutput",
-            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_kind_field(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[0]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let stream_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let dtype = extract_dtype(egraph, kind_children[2]);
-        (
-            LLIROp::new::<LoopOutput>(Box::new(Self {
-                loop_id,
-                stream_id,
-                dtype,
-            })),
-            input_enodes,
-        )
+impl LoopOutput {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((loop_id, stream_id, dtype)) = get_args(
+            kind,
+            |loop_id: &egg::I64, stream_id: &egg::I64, dtype: &schema::DType| {
+                OpKind::LoopOutput(loop_id, stream_id, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<LoopOutput>(Box::new(Self {
+            loop_id: usize::try_from(i64::try_from(loop_id)?)
+                .map_err(|_| TypedError::Decode("LoopOutput loop_id must be nonnegative".into()))?,
+            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+                TypedError::Decode("LoopOutput stream_id must be nonnegative".into())
+            })?,
+            dtype: context.dtype(&dtype)?,
+        }))))
     }
 }
 
 impl HLIROp for LoopOutput {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (LoopOutput {} {} ({:?})) {})",
-            self.loop_id,
-            self.stream_id,
-            self.dtype,
-            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::LoopOutput(self.loop_id as i64, self.stream_id as i64, self.dtype),
+            inputs,
         )
     }
 }
@@ -955,73 +446,46 @@ impl Display for LoopOutputSelect {
     }
 }
 
-impl EgglogOp for LoopOutputSelect {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "LoopOutputSelect",
-            &[
-                ("loop_id", I64),
-                ("stream_id", I64),
-                ("iter", I64),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_kind_field(parser, &self.sort(), "dtype")
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let loop_id = egraph.enodes[kind_children[0]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let stream_id = egraph.enodes[kind_children[1]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let iter = egraph.enodes[kind_children[2]]
-            .0
-            .replace("\"", "")
-            .parse::<usize>()
-            .unwrap();
-        let dtype = extract_dtype(egraph, kind_children[3]);
-        (
-            LLIROp::new::<LoopOutputSelect>(Box::new(Self {
-                loop_id,
-                stream_id,
-                iter,
-                dtype,
-            })),
-            input_enodes,
-        )
+impl LoopOutputSelect {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((loop_id, stream_id, iter, dtype)) = get_args(
+            kind,
+            |loop_id: &egg::I64, stream_id: &egg::I64, iter: &egg::I64, dtype: &schema::DType| {
+                OpKind::LoopOutputSelect(loop_id, stream_id, iter, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<LoopOutputSelect>(Box::new(Self {
+            loop_id: usize::try_from(i64::try_from(loop_id)?).map_err(|_| {
+                TypedError::Decode("LoopOutputSelect loop_id must be nonnegative".into())
+            })?,
+            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+                TypedError::Decode("LoopOutputSelect stream_id must be nonnegative".into())
+            })?,
+            iter: usize::try_from(i64::try_from(iter)?).map_err(|_| {
+                TypedError::Decode("LoopOutputSelect iter must be nonnegative".into())
+            })?,
+            dtype: context.dtype(&dtype)?,
+        }))))
     }
 }
 
 impl HLIROp for LoopOutputSelect {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (LoopOutputSelect {} {} {} ({:?})) {})",
-            self.loop_id,
-            self.stream_id,
-            self.iter,
-            self.dtype,
-            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::LoopOutputSelect(
+                self.loop_id as i64,
+                self.stream_id as i64,
+                self.iter as i64,
+                self.dtype,
+            ),
+            inputs,
         )
     }
 }
@@ -1048,40 +512,31 @@ impl Display for Constant {
 }
 
 impl HLIROp for Constant {
-    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
-        format!("(Op (Constant {:.6}) (INil))", self.0)
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        // Widening the f32 is exact. Scaling by 10^6 needs at most 38
+        // significand bits, so ties-to-even matches six-decimal formatting.
+        // Formatting and parsing canonicalized every NaN payload and sign.
+        let value = if self.0.is_nan() {
+            f64::NAN
+        } else {
+            (f64::from(self.0) * 1_000_000.0).round_ties_even() / 1_000_000.0
+        };
+        Ir::Op(OpKind::Constant(value), inputs)
     }
 }
 
-impl EgglogOp for Constant {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "Constant", &[("value", F64)])
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_fixed_op(parser, &self.sort(), &SORTS.f32_dt)
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        _: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
-                egraph.enodes[kind_children[0]]
-                    .0
-                    .replace("\"", "")
-                    .parse::<f32>()
-                    .unwrap(),
-            ))),
-            vec![],
-        )
+impl Constant {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        _context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((value,)) = get_args(kind, |value: &egg::F64| OpKind::Constant(value))? else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
+            f64::try_from(value)? as f32,
+        )))))
     }
 }
 
@@ -1099,45 +554,29 @@ impl Display for Iota {
     }
 }
 impl HLIROp for Iota {
-    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Iota {} {}) (INil))",
-            self.0.to_egglog(),
-            self.1.to_egglog()
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Iota(dimension(&self.0, true), dimension(&self.1, true)),
+            inputs,
         )
     }
 }
-impl EgglogOp for Iota {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "Iota",
-            &[("expr", EXPRESSION), ("range", EXPRESSION)],
-        )
-    }
-
-    fn cleanup(&self) -> bool {
-        true
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_fixed_op(parser, &self.sort(), &SORTS.int_dt)
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        _input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
-                extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-                extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-            ))),
-            vec![],
-        )
+impl Iota {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((expr, range)) = get_args(kind, |expr: &DimExpr, range: &DimExpr| {
+            OpKind::Iota(expr, range)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
+            context.expression(&expr)?,
+            context.expression(&range)?,
+        )))))
     }
 }
 impl ReferenceOp for Iota {
@@ -1160,46 +599,26 @@ impl Display for Cast {
     }
 }
 impl HLIROp for Cast {
-    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Cast {} ({:?})) (ICons {} (INil)))",
-            self.0.to_egglog(),
-            self.1,
-            inp[0].1,
-        )
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(OpKind::Cast(dimension(&self.0, true), self.1), inputs)
     }
 }
-impl EgglogOp for Cast {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "Cast", &[("size", EXPRESSION), ("dtype", DTYPE)])
-    }
-
-    fn cleanup(&self) -> bool {
-        true
-    }
-
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_from_kind_field(parser, &self.sort(), "dtype")
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        ec: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
-                extract_expr(egraph, kind_children[0], ec).unwrap(),
-                extract_dtype(egraph, kind_children[1]),
-            ))),
-            input_enodes,
-        )
+impl Cast {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((size, dtype)) = get_args(kind, |size: &DimExpr, dtype: &schema::DType| {
+            OpKind::Cast(size, dtype)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
+            context.expression(&size)?,
+            context.dtype(&dtype)?,
+        )))))
     }
 }
 impl ReferenceOp for Cast {
@@ -1335,46 +754,39 @@ impl Display for Log2 {
     }
 }
 impl HLIROp for Log2 {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Log2 {} {} {}) {})",
-            elist_to_egglog(&self.input_shape.dims),
-            elist_to_egglog(&self.input_shape.strides),
-            elist_to_egglog(&self.input_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Log2(
+                dimensions(&self.input_shape.dims),
+                dimensions(&self.input_shape.strides),
+                dimensions(&self.input_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
-impl EgglogOp for Log2 {
-    fn sort(&self) -> SortDef {
-        unary_sort("Log2")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Log2 {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, strides: &EList, _out_strides: &EList| {
+                OpKind::Log2(shape, strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Log2 {
@@ -1407,46 +819,39 @@ impl Display for Exp2 {
     }
 }
 impl HLIROp for Exp2 {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Exp2 {} {} {}) {})",
-            elist_to_egglog(&self.input_shape.dims),
-            elist_to_egglog(&self.input_shape.strides),
-            elist_to_egglog(&self.input_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Exp2(
+                dimensions(&self.input_shape.dims),
+                dimensions(&self.input_shape.strides),
+                dimensions(&self.input_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
-impl EgglogOp for Exp2 {
-    fn sort(&self) -> SortDef {
-        unary_sort("Exp2")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Exp2 {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, strides: &EList, _out_strides: &EList| {
+                OpKind::Exp2(shape, strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Exp2 {
@@ -1479,47 +884,40 @@ impl Display for Sin {
     }
 }
 impl HLIROp for Sin {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Sin {} {} {}) {})",
-            elist_to_egglog(&self.input_shape.dims),
-            elist_to_egglog(&self.input_shape.strides),
-            elist_to_egglog(&self.input_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Sin(
+                dimensions(&self.input_shape.dims),
+                dimensions(&self.input_shape.strides),
+                dimensions(&self.input_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Sin {
-    fn sort(&self) -> SortDef {
-        unary_sort("Sin")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Sin {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, strides: &EList, _out_strides: &EList| {
+                OpKind::Sin(shape, strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Sin {
@@ -1552,47 +950,40 @@ impl Display for Recip {
     }
 }
 impl HLIROp for Recip {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Recip {} {} {}) {})",
-            elist_to_egglog(&self.input_shape.dims),
-            elist_to_egglog(&self.input_shape.strides),
-            elist_to_egglog(&self.input_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Recip(
+                dimensions(&self.input_shape.dims),
+                dimensions(&self.input_shape.strides),
+                dimensions(&self.input_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Recip {
-    fn sort(&self) -> SortDef {
-        unary_sort("Recip")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Recip {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, strides: &EList, _out_strides: &EList| {
+                OpKind::Recip(shape, strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Recip {
@@ -1625,47 +1016,40 @@ impl Display for Sqrt {
     }
 }
 impl HLIROp for Sqrt {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Sqrt {} {} {}) {})",
-            elist_to_egglog(&self.input_shape.dims),
-            elist_to_egglog(&self.input_shape.strides),
-            elist_to_egglog(&self.input_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Sqrt(
+                dimensions(&self.input_shape.dims),
+                dimensions(&self.input_shape.strides),
+                dimensions(&self.input_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Sqrt {
-    fn sort(&self) -> SortDef {
-        unary_sort("Sqrt")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Sqrt {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, strides: &EList, _out_strides: &EList| {
+                OpKind::Sqrt(shape, strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Sqrt {
@@ -1759,52 +1143,43 @@ impl Display for Add {
     }
 }
 impl HLIROp for Add {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Add {} {} {} {}) {})",
-            elist_to_egglog(&self.input_shapes[0].dims),
-            elist_to_egglog(&self.input_shapes[0].strides),
-            elist_to_egglog(&self.input_shapes[1].strides),
-            elist_to_egglog(&self.input_shapes[0].contiguous().strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Add(
+                dimensions(&self.input_shapes[0].dims),
+                dimensions(&self.input_shapes[0].strides),
+                dimensions(&self.input_shapes[1].strides),
+                dimensions(&self.input_shapes[0].contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Add {
-    fn sort(&self) -> SortDef {
-        binary_sort("Add")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        2
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let mut cmds = dtype_propagation_op(parser, &self.sort());
-        cmds.extend(binary_op_unroll_rules(parser, "Add", 4));
-        cmds
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Add {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, a_strides, b_strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, a_strides: &EList, b_strides: &EList, _out_strides: &EList| {
+                OpKind::Add(shape, a_strides, b_strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let a_strides = context.expressions(&a_strides)?;
+        let b_strides = context.expressions(&b_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            a_strides,
+            b_strides,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -1859,52 +1234,43 @@ impl Display for Mul {
     }
 }
 impl HLIROp for Mul {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Mul {} {} {} {}) {})",
-            elist_to_egglog(&self.input_shapes[0].dims),
-            elist_to_egglog(&self.input_shapes[0].strides),
-            elist_to_egglog(&self.input_shapes[1].strides),
-            elist_to_egglog(&self.input_shapes[0].contiguous().strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Mul(
+                dimensions(&self.input_shapes[0].dims),
+                dimensions(&self.input_shapes[0].strides),
+                dimensions(&self.input_shapes[1].strides),
+                dimensions(&self.input_shapes[0].contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Mul {
-    fn sort(&self) -> SortDef {
-        binary_sort("Mul")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        2
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let mut cmds = dtype_propagation_op(parser, &self.sort());
-        cmds.extend(binary_op_unroll_rules(parser, "Mul", 4));
-        cmds
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Mul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, a_strides, b_strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, a_strides: &EList, b_strides: &EList, _out_strides: &EList| {
+                OpKind::Mul(shape, a_strides, b_strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let a_strides = context.expressions(&a_strides)?;
+        let b_strides = context.expressions(&b_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            a_strides,
+            b_strides,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -1959,52 +1325,43 @@ impl Display for Mod {
     }
 }
 impl HLIROp for Mod {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Mod {} {} {} {}) {})",
-            elist_to_egglog(&self.input_shapes[0].dims),
-            elist_to_egglog(&self.input_shapes[0].strides),
-            elist_to_egglog(&self.input_shapes[1].strides),
-            elist_to_egglog(&self.input_shapes[0].contiguous().strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Mod(
+                dimensions(&self.input_shapes[0].dims),
+                dimensions(&self.input_shapes[0].strides),
+                dimensions(&self.input_shapes[1].strides),
+                dimensions(&self.input_shapes[0].contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Mod {
-    fn sort(&self) -> SortDef {
-        binary_sort("Mod")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        2
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let mut cmds = dtype_propagation_op(parser, &self.sort());
-        cmds.extend(binary_op_unroll_rules(parser, "Mod", 4));
-        cmds
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Mod {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, a_strides, b_strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, a_strides: &EList, b_strides: &EList, _out_strides: &EList| {
+                OpKind::Mod(shape, a_strides, b_strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let a_strides = context.expressions(&a_strides)?;
+        let b_strides = context.expressions(&b_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            a_strides,
+            b_strides,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -2057,53 +1414,43 @@ impl Display for LessThan {
     }
 }
 impl HLIROp for LessThan {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (LessThan {} {} {} {}) {})",
-            elist_to_egglog(&self.input_shapes[0].dims),
-            elist_to_egglog(&self.input_shapes[0].strides),
-            elist_to_egglog(&self.input_shapes[1].strides),
-            elist_to_egglog(&self.input_shapes[0].contiguous().strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::LessThan(
+                dimensions(&self.input_shapes[0].dims),
+                dimensions(&self.input_shapes[0].strides),
+                dimensions(&self.input_shapes[1].strides),
+                dimensions(&self.input_shapes[0].contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for LessThan {
-    fn sort(&self) -> SortDef {
-        binary_sort("LessThan")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        2
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        // Comparisons output Bool, not the input dtype.
-        let mut cmds = dtype_fixed_op(parser, &self.sort(), &SORTS.bool_dt);
-        cmds.extend(binary_op_unroll_rules(parser, "LessThan", 4));
-        cmds
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl LessThan {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, a_strides, b_strides, _out_strides)) = get_args(
+            kind,
+            |shape: &EList, a_strides: &EList, b_strides: &EList, _out_strides: &EList| {
+                OpKind::LessThan(shape, a_strides, b_strides, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let a_strides = context.expressions(&a_strides)?;
+        let b_strides = context.expressions(&b_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            shape,
+            a_strides,
+            b_strides,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -2159,79 +1506,48 @@ impl Display for Gather {
     }
 }
 impl HLIROp for Gather {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Gather {} {} {} {}) {})",
-            elist_to_egglog(&self.input_shapes[0].dims),
-            elist_to_egglog(&self.input_shapes[0].strides),
-            elist_to_egglog(&self.input_shapes[1].dims),
-            elist_to_egglog(&self.input_shapes[1].strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Gather(
+                dimensions(&self.input_shapes[0].dims),
+                dimensions(&self.input_shapes[0].strides),
+                dimensions(&self.input_shapes[1].dims),
+                dimensions(&self.input_shapes[1].strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Gather {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "Gather",
-            &[
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("data_shape", ELIST),
-                ("data_strides", ELIST),
-            ],
-        )
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        2
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        // Gather inherits dtype from second input (data), not first (indexes).
-        // Use a custom rule instead of the generic first-input propagation.
-        // **Must be in `dtype_prop` ruleset** — without it, Gather dtype
-        // propagation only advances one Gather per `(run)` iteration of
-        // the schedule, so deep stacks of Gathers (e.g. YOLO's per-conv
-        // padding gathers + per-concat make_contiguous gathers) leave the
-        // outermost Gathers with no dtype set, which in turn blocks the
-        // KernelGather kernel-rewrite from firing.
-        let sort = self.sort();
-        let kind = sort.name.as_str();
-        egglog!(
-            *parser,
-            (rule ((= ?__e (Op (#kind ...) (ICons ?__indexes (ICons ?__data ?__tail))))
-                   (= ?__dty (dtype ?__data)))
-                  ((set (dtype ?__e) ?__dty))
-                :ruleset dtype_prop)
-        )
-        .expect("Gather dtype rule should parse")
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                index_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                data_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                data_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl Gather {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((index_shape, index_strides, data_shape, data_strides)) = get_args(
+            kind,
+            |index_shape: &EList,
+             index_strides: &EList,
+             data_shape: &EList,
+             data_strides: &EList| {
+                OpKind::Gather(index_shape, index_strides, data_shape, data_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let index_shape = context.expressions(&index_shape)?;
+        let index_strides = context.expressions(&index_strides)?;
+        let data_shape = context.expressions(&data_shape)?;
+        let data_strides = context.expressions(&data_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            index_shape,
+            index_strides,
+            data_shape,
+            data_strides,
+            ..Default::default()
+        }))))
     }
 }
 impl ReferenceOp for Gather {
@@ -2303,75 +1619,57 @@ impl Display for Scatter {
     }
 }
 impl HLIROp for Scatter {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        format!(
-            "(Op (Scatter {} {} {} {} {}) {})",
-            elist_to_egglog(&self.dest_shape),
-            elist_to_egglog(&self.dest_strides),
-            elist_to_egglog(&self.index_shape),
-            elist_to_egglog(&self.index_strides),
-            elist_to_egglog(&self.src_strides),
-            ilist_egglog(&[&inputs[0].1, &inputs[1].1, &inputs[2].1]),
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
+        Ir::Op(
+            OpKind::Scatter(
+                dimensions(&self.dest_shape),
+                dimensions(&self.dest_strides),
+                dimensions(&self.index_shape),
+                dimensions(&self.index_strides),
+                dimensions(&self.src_strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for Scatter {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "Scatter",
-            &[
-                ("dest_shape", ELIST),
-                ("dest_strides", ELIST),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("src_strides", ELIST),
-            ],
-        )
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        3
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        // Scatter inherits dtype from third input (src), not first (dest).
-        let sort = self.sort();
-        let kind = sort.name.as_str();
-        egglog!(
-            *parser,
-            (rule ((= ?__e (Op (#kind ...) (ICons ?__dest (ICons ?__indexes (ICons ?__src ?__tail)))))
-                   (= ?__dty (dtype ?__src)))
-                  ((set (dtype ?__e) ?__dty))
-                :ruleset dtype_prop)
-        )
-        .expect("Scatter dtype rule should parse")
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                dest_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                dest_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                index_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                src_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-            })),
-            input_enodes,
-        )
+impl Scatter {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((dest_shape, dest_strides, index_shape, index_strides, src_strides)) = get_args(
+            kind,
+            |dest_shape: &EList,
+             dest_strides: &EList,
+             index_shape: &EList,
+             index_strides: &EList,
+             src_strides: &EList| {
+                OpKind::Scatter(
+                    dest_shape,
+                    dest_strides,
+                    index_shape,
+                    index_strides,
+                    src_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let dest_shape = context.expressions(&dest_shape)?;
+        let dest_strides = context.expressions(&dest_strides)?;
+        let index_shape = context.expressions(&index_shape)?;
+        let index_strides = context.expressions(&index_strides)?;
+        let src_strides = context.expressions(&src_strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            dest_shape,
+            dest_strides,
+            index_shape,
+            index_strides,
+            src_strides,
+        }))))
     }
 }
 impl ReferenceOp for Scatter {
@@ -2431,74 +1729,53 @@ impl Display for SumReduce {
     }
 }
 impl HLIROp for SumReduce {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
         let mut reduced_shape = self.input_shape;
         reduced_shape.remove_dim(self.dim);
-        let reduced_dim = self.input_shape.dims[self.dim];
-        let reduced_stride = self.input_shape.strides[self.dim];
         let mut reduced_strides = self.input_shape.strides;
         reduced_strides.remove(self.dim);
-
-        format!(
-            "(Op (Sum {} {} {} {} {}) {})",
-            elist_to_egglog(&reduced_shape.dims),
-            reduced_dim.to_egglog(),
-            elist_to_egglog(&reduced_strides),
-            reduced_stride.to_egglog(),
-            elist_to_egglog(&reduced_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+        Ir::Op(
+            OpKind::Sum(
+                dimensions(&reduced_shape.dims),
+                dimension(&self.input_shape.dims[self.dim], true),
+                dimensions(&reduced_strides),
+                dimension(&self.input_shape.strides[self.dim], true),
+                dimensions(&reduced_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for SumReduce {
-    fn sort(&self) -> SortDef {
-        reduce_sort("Sum")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        // Batch-collapse rules: rewrite N-dim Mul+Sum → (N-1)-dim Mul+Sum
-        // so that 2D cuBLAS rules can match. Fires recursively.
-        let mut cmds = dtype_propagation_op(parser, &self.sort());
-        cmds.extend(raw_rules(
-            parser,
-            include_str!("egglog_utils/matmul_flattening/squeeze.egg"),
-        ));
-        cmds.extend(raw_rules(
-            parser,
-            include_str!("egglog_utils/matmul_flattening/batch_merge_a_contig.egg"),
-        ));
-        cmds.extend(raw_rules(
-            parser,
-            include_str!("egglog_utils/matmul_flattening/batch_merge_b_contig.egg"),
-        ));
-        cmds
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                dim: 0,
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl SumReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, iters, strides, iter_stride, _out_strides)) = get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             _out_strides: &EList| {
+                OpKind::Sum(shape, iters, strides, iter_stride, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            dim: 0,
+            shape,
+            iters: context.expression(&iters)?,
+            strides,
+            iter_stride: context.expression(&iter_stride)?,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -2584,58 +1861,53 @@ impl Display for MaxReduce {
     }
 }
 impl HLIROp for MaxReduce {
-    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+    fn to_ir(&self, inputs: &[&Ir]) -> Ir {
         let mut reduced_shape = self.input_shape;
         reduced_shape.remove_dim(self.dim);
-        let reduced_dim = self.input_shape.dims[self.dim];
-        let reduced_stride = self.input_shape.strides[self.dim];
         let mut reduced_strides = self.input_shape.strides;
         reduced_strides.remove(self.dim);
-        format!(
-            "(Op (Max {} {} {} {} {}) {})",
-            elist_to_egglog(&reduced_shape.dims),
-            reduced_dim.to_egglog(),
-            elist_to_egglog(&reduced_strides),
-            reduced_stride.to_egglog(),
-            elist_to_egglog(&reduced_shape.contiguous().strides),
-            ilist_egglog(&[&inputs[0].1]),
+        Ir::Op(
+            OpKind::Max(
+                dimensions(&reduced_shape.dims),
+                dimension(&self.input_shape.dims[self.dim], true),
+                dimensions(&reduced_strides),
+                dimension(&self.input_shape.strides[self.dim], true),
+                dimensions(&reduced_shape.contiguous().strides),
+            ),
+            inputs,
         )
     }
 }
 
-impl EgglogOp for MaxReduce {
-    fn sort(&self) -> SortDef {
-        reduce_sort("Max")
-    }
-    fn cleanup(&self) -> bool {
-        true
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        dtype_propagation_op(parser, &self.sort())
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
-                dim: 0,
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                ..Default::default()
-            })),
-            input_enodes,
-        )
+impl MaxReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((shape, iters, strides, iter_stride, _out_strides)) = get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             _out_strides: &EList| {
+                OpKind::Max(shape, iters, strides, iter_stride, _out_strides)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let shape = context.expressions(&shape)?;
+        let strides = context.expressions(&strides)?;
+        Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+            dim: 0,
+            shape,
+            iters: context.expression(&iters)?,
+            strides,
+            iter_stride: context.expression(&iter_stride)?,
+            ..Default::default()
+        }))))
     }
 }
 
@@ -2897,7 +2169,6 @@ impl ReferenceRuntime {
 }
 
 impl Runtime for ReferenceRuntime {
-    type Ops = ();
     type CompileArg = ();
     type ExecReturn = ();
     type ProfileMetric = usize;

@@ -1,3 +1,6 @@
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -8,16 +11,7 @@ use crate::{
     },
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
-        extract_dtype, extract_expr, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-    shape::flatten_strides,
-};
+use luminal::{op::*, prelude::*, shape::flatten_strides};
 
 #[derive(Default, Debug, Clone)]
 pub struct GenericMatmul {
@@ -32,136 +26,159 @@ pub struct GenericMatmul {
     dtype: DType,
 }
 
-impl EgglogOp for GenericMatmul {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "GenericMatmul",
-            &[
-                ("out_shape", ELIST),
-                ("mul_shape", ELIST),
-                ("k", EXPRESSION),
-                ("lhs_strides", ELIST),
-                ("rhs_strides", ELIST),
-                ("sum_input_strides", ELIST),
-                ("sum_iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod rewrites {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    #[ruleset]
+    pub(crate) fn matmul_backend(lhs: &Ir, rhs: &Ir, sum: &Ir, dt: &DType) -> Rule {
+        let product = MulArgs::fresh();
+        let reduction = SumArgs::fresh();
+        let generic = &Ir::Op(
+            generic_matmul(
+                &reduction.shape,
+                &product.shape,
+                &reduction.iters,
+                &product.a_strides,
+                &product.b_strides,
+                &reduction.strides,
+                &reduction.iter_stride,
+                &reduction.out_strides,
+                dt,
+            ),
+            [lhs, rhs],
+        );
+        let mul = &Ir::Op(product.clone(), [lhs, rhs]);
+        rule(
+            (
+                eq(sum, Ir::Op(reduction.clone(), [mul])),
+                eq(dt, sum.dtype()),
+            ),
+            (generic, union(sum, generic), set(generic.dtype(), dt)),
         )
+        .label("generic-matmul-cuda-mul-sum")
     }
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+    #[ruleset]
+    pub(crate) fn cleanup(
+        lhs: &Ir,
+        rhs: &Ir,
+        mul: &Ir,
+        out_shape: &EList,
+        k: &DimExpr,
+        sum_input_strides: &EList,
+        sum_iter_stride: &DimExpr,
+        out_strides: &EList,
+        sum: &Ir,
+        generic_inputs: &IList,
+        dt: &DType,
+        sum_inputs: &IList,
+        sum_node: &Ir,
+    ) -> Vec<Rule> {
+        let sum_source = &Ir::Op(
+            OpKind::Sum(
+                out_shape,
+                k,
+                sum_input_strides,
+                sum_iter_stride,
+                out_strides,
+            ),
+            [mul],
+        );
+        let kernel_sum_source = &Ir::Op(
+            kernel_sum(
+                out_shape,
+                k,
+                sum_input_strides,
+                sum_iter_stride,
+                out_strides,
+                dt,
+            ),
+            sum_inputs,
+        );
         vec![
-            raw_rules(parser,
-                "(rule
-                    (
-                        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
-                            (ICons ?lhs (ICons ?rhs (INil)))))
-                        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
-                            (ICons ?mul (INil))))
-                        (= ?dt (dtype ?sum))
-                    )
-                    (
-                        (let ?generic (Op (GenericMatmul
-                            ?out_shape
-                            ?mul_shape
-                            ?k
-                            ?lhs_strides
-                            ?rhs_strides
-                            ?sum_input_strides
-                            ?sum_iter_stride
-                            ?out_strides
-                            ?dt)
-                            (ICons ?lhs (ICons ?rhs (INil)))))
-                        (union ?sum ?generic)
-                        (set (dtype ?generic) ?dt)
-                    )
-                    :ruleset matmul_backend
-                    :name \"generic-matmul-cuda-mul-sum\"
-                )",
-            ),
-            raw_rules(parser,
-                "(rule
-                    (
-                        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
-                            (ICons ?lhs (ICons ?rhs (INil)))))
-                        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
-                            (ICons ?mul (INil))))
-                        (= ?sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
-                            ?generic_inputs))
-                    )
-                    (
-                        (delete (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
-                            (ICons ?mul (INil))))
-                    )
-                    :ruleset cleanup
-                    :name \"delete-sum-when-generic-matmul-exists\"
-                )",
-            ),
-            raw_rules(parser,
-                "(rule
-                    (
-                        (= ?kernel_sum (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
-                            ?sum_inputs))
-                        (= ?kernel_sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
-                            ?generic_inputs))
-                    )
-                    ((delete (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
-                        ?sum_inputs)))
-                    :ruleset cleanup
-                    :name \"delete-kernel-sum-when-generic-matmul-exists\"
-                )",
-            ),
+            rule(
+                (
+                    eq(mul, Ir::Op(MulArgs::fresh(), [lhs, rhs])),
+                    eq(sum, sum_source),
+                    eq(sum, Ir::Op(GenericMatmulArgs::fresh(), generic_inputs)),
+                ),
+                (delete(sum_source),),
+            )
+            .label("delete-sum-when-generic-matmul-exists"),
+            rule(
+                (
+                    eq(sum_node, kernel_sum_source),
+                    eq(sum_node, Ir::Op(GenericMatmulArgs::fresh(), generic_inputs)),
+                ),
+                (delete(kernel_sum_source),),
+            )
+            .label("delete-kernel-sum-when-generic-matmul-exists"),
         ]
-    };
-        __rules.into_iter().flatten().collect()
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                mul_shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                k: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                lhs_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                rhs_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                sum_input_strides: extract_expr_list(
-                    egraph,
-                    kind_children[5],
-                    list_cache,
-                    expr_cache,
+impl GenericMatmul {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_out_shape,
+            field_mul_shape,
+            field_k,
+            field_lhs_strides,
+            field_rhs_strides,
+            field_sum_input_strides,
+            field_sum_iter_stride,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |out_shape: &EList,
+             mul_shape: &EList,
+             k: &DimExpr,
+             lhs_strides: &EList,
+             rhs_strides: &EList,
+             sum_input_strides: &EList,
+             sum_iter_stride: &DimExpr,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::generic_matmul(
+                    out_shape,
+                    mul_shape,
+                    k,
+                    lhs_strides,
+                    rhs_strides,
+                    sum_input_strides,
+                    sum_iter_stride,
+                    out_strides,
+                    dtype,
                 )
-                .unwrap(),
-                sum_iter_stride: extract_expr(egraph, kind_children[6], expr_cache).unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[7], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[8]),
-            })),
-            input_enodes,
-        )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let decoded_mul_shape = context.expressions(&field_mul_shape)?;
+        let decoded_lhs_strides = context.expressions(&field_lhs_strides)?;
+        let decoded_rhs_strides = context.expressions(&field_rhs_strides)?;
+        let decoded_sum_input_strides = context.expressions(&field_sum_input_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+            mul_shape: decoded_mul_shape,
+            k: context.expression(&field_k)?,
+            lhs_strides: decoded_lhs_strides,
+            rhs_strides: decoded_rhs_strides,
+            sum_input_strides: decoded_sum_input_strides,
+            sum_iter_stride: context.expression(&field_sum_iter_stride)?,
+            out_strides: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

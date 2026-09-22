@@ -1,17 +1,16 @@
-pub mod find_indptrs;
+pub(crate) mod find_indptrs;
+pub(crate) mod flashinfer_attention;
+
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, Ir, OpKind};
 pub mod jit;
 
-use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use luminal::{
     dtype::DType,
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, EXPRESSION, F64, OP_KIND},
-        extract_dtype, extract_expr,
-    },
-    op::{EgglogOp, LLIROp},
+    op::LLIROp,
     prelude::{
         tracing::{Level, span},
         *,
@@ -210,89 +209,78 @@ impl Default for FlashInferAttention {
     }
 }
 
-impl EgglogOp for FlashInferAttention {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "FlashInferAttention",
-            &[
-                ("num_qo_heads", EXPRESSION),
-                ("num_kv_heads", EXPRESSION),
-                ("head_dim", EXPRESSION),
-                ("page_size", EXPRESSION),
-                ("batch_dim", EXPRESSION),
-                ("dtype", DTYPE),
-                ("sm_scale", F64),
-                ("window_left", F64),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        // Q, K_pool, V_pool, compact gather_idx. The egglog rules still use
-        // flat gather indices and masks as structural proof anchors, but
-        // extract() returns only the runtime inputs FlashInfer actually uses.
-        5
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // FlashInfer requires Ampere+ (sm_80; the kernels use cp.async /
-        // async-copy). On older arches — e.g. a T4 (sm_75) — emit no rules so
-        // the search never selects FlashInfer and attention stays on the HLIR
-        // chain. Without this the rule fires, the search picks it, and the
-        // JIT'd kernel's symbol is absent on launch (CUDA_ERROR_NOT_FOUND).
-        // All of this egg's relations (const_like, fi_*, flashinfer_*) are
-        // self-contained, so dropping it leaves no dangling references.
-        if crate::device_compute_major() < 8 {
-            return vec![];
+impl FlashInferAttention {
+    pub fn decode(
+        kind: &OpKind,
+        inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_num_qo_heads,
+            field_num_kv_heads,
+            field_head_dim,
+            field_page_size,
+            field_batch_dim,
+            field_dtype,
+            field_sm_scale,
+            field_window_left,
+        )) = typed::get_args(
+            kind,
+            |num_qo_heads: &DimExpr,
+             num_kv_heads: &DimExpr,
+             head_dim: &DimExpr,
+             page_size: &DimExpr,
+             batch_dim: &DimExpr,
+             dtype: &luminal::typed_reference::schema::DType,
+             sm_scale: &egg::F64,
+             window_left: &egg::F64| {
+                crate::typed_rules::flash_infer_attention(
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size,
+                    batch_dim,
+                    dtype,
+                    sm_scale,
+                    window_left,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let num_qo_heads = context
+            .expression(&field_num_qo_heads)?
+            .exec(&FxHashMap::default())
+            .ok_or_else(|| {
+                TypedError::Decode("FlashInfer query-head count must be constant".into())
+            })?;
+        let num_kv_heads = context
+            .expression(&field_num_kv_heads)?
+            .exec(&FxHashMap::default())
+            .ok_or_else(|| {
+                TypedError::Decode("FlashInfer KV-head count must be constant".into())
+            })?;
+        let head_dim = context
+            .expression(&field_head_dim)?
+            .exec(&FxHashMap::default())
+            .ok_or_else(|| {
+                TypedError::Decode("FlashInfer head dimension must be constant".into())
+            })?;
+        let page_size = context
+            .expression(&field_page_size)?
+            .exec(&FxHashMap::default())
+            .ok_or_else(|| TypedError::Decode("FlashInfer page size must be constant".into()))?;
+        let batch_dim = context.expression(&field_batch_dim)?;
+        let dtype = context.dtype(&field_dtype)?;
+        let sm_scale: f64 = f64::try_from(&field_sm_scale)?;
+        let window_left = f64::try_from(&field_window_left)?;
+        if FlashInferDType::from_dtype(dtype).is_none() {
+            return Err(TypedError::Decode(format!(
+                "FlashInferAttention extracted with unsupported dtype {dtype:?}"
+            )));
         }
-        vec![raw_rules(parser, include_str!["flashinfer_attention.egg"])]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a luminal::egglog_utils::SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let num_qo_heads = extract_expr(egraph, kind_children[0], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let num_kv_heads = extract_expr(egraph, kind_children[1], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let head_dim = extract_expr(egraph, kind_children[2], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let page_size = extract_expr(egraph, kind_children[3], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let batch_dim = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
-        let dtype = extract_dtype(egraph, kind_children[5]);
-        let sm_scale: f64 = egraph.enodes[kind_children[6]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
-        let window_left = egraph.enodes[kind_children[7]]
-            .0
-            .replace('"', "")
-            .parse::<f64>()
-            .unwrap()
-            .round() as i64;
-        assert!(
-            FlashInferDType::from_dtype(dtype).is_some(),
-            "FlashInferAttention extracted with unsupported dtype {dtype:?}"
-        );
+        let window_left = window_left.round() as i64;
 
         let extracted = Self {
             num_qo_heads,
@@ -312,22 +300,13 @@ impl EgglogOp for FlashInferAttention {
         // the candidate's measured runtime and make the GA reject FlashInfer.
         let _ = jit::ensure_compiled(head_dim, window_left >= 0);
 
-        let flat_idx_node = input_enodes[3];
-        let gather_idx = find_indptrs::try_find_compact_gather_idx(egraph, flat_idx_node)
+        let compact = find_indptrs::try_find_compact_gather_idx(context, &inputs[3])?
             .expect("FlashInferAttention matched a gather without recoverable compact gather_idx");
-        let final_inputs = vec![
-            input_enodes[0],
-            input_enodes[1],
-            input_enodes[2],
-            gather_idx,
-        ];
+        inputs[3] = compact;
+        inputs.truncate(4);
 
         let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
-        (op, final_inputs)
-    }
-
-    fn cleanup(&self) -> bool {
-        false
+        Ok(Some(op))
     }
 }
 
@@ -840,6 +819,9 @@ pub(crate) fn flashinfer_graph_plan_capacity(actual_c: usize, max_kv_pages: usiz
 }
 
 impl HostOp for FlashInferAttention {
+    fn n_inputs(&self) -> usize {
+        4
+    }
     fn execute(
         &self,
         stream: &Arc<CudaStream>,

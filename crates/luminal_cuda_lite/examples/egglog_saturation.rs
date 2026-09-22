@@ -1,39 +1,17 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
+use egglog_experimental::typed::{
+    EGraph, FrozenEGraph, Rule, Schedule, builtins as egg, delete, rule, ruleset, sequence,
+};
 use itertools::Itertools;
-use luminal::prelude::egglog::{ast::Span, prelude::RustSpan};
+use luminal::typed_reference::schema::{DType as EggDType, DimExpr, EList, IList, Ir, OpKind};
 use luminal::{
-    dtype::DType,
-    egglog_utils::{
-        base::{base_cleanup_egglog, base_expression_egglog},
-        hlir_to_egglog,
-    },
-    hlir::HLIROps,
-    op::{EgglogOp, IntoEgglogOp, Runtime},
-    prelude::*,
-    shape::Expression,
+    dtype::DType, egglog_utils::RewritePhase, op::Runtime, prelude::*, shape::Expression,
+    typed_reference::capture_graph,
 };
 use luminal_cuda_lite::runtime::CudaRuntime;
 
 const DEFAULT_PASSES: usize = 256;
-const EGGLOG_RULESETS: &[&str] = &[
-    "matmul_flatten",
-    "kernel_lower",
-    "direct_kernel",
-    "kernel_specialize",
-    "buffer_reuse",
-    "matmul_backend",
-    "glumoe",
-    "fusion_pair",
-    "fusion_grow",
-    "fusion_merge",
-    // One-shot structural-fusion rulesets (FlashInfer mask facts, RoPE/RMS
-    // cascades) that ops emit into. Declared so their rules register even
-    // though this measurement harness's schedule doesn't run the late phase.
-    "kernel_fuse_late_pre",
-    "kernel_fuse_late",
-    "kernel_fuse_late2",
-];
 const MOE_SEQ: usize = 2;
 const MOE_HIDDEN: usize = 16;
 const MOE_NUM_EXPERTS: usize = 8;
@@ -376,162 +354,46 @@ fn gemma_gelu(x: GraphTensor) -> GraphTensor {
     x * scaled.sigmoid()
 }
 
-fn op_defs_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
-    let mut ir_variants = Vec::new();
-    let mut opkind_variants = Vec::new();
-    for op in ops {
-        let sort = op.sort();
-        let variant = format!(
-            "({} {})",
-            sort.name,
-            sort.fields.iter().map(|field| &field.sort).join(" ")
-        );
-        match sort.class.as_str() {
-            "IR" => ir_variants.push(variant),
-            "OpKind" => opkind_variants.push(variant),
-            other => panic!("unknown sort class {other} for {}", sort.name),
-        }
-    }
-    let extra_ir = ops.iter().flat_map(|op| op.ir_defs()).unique().join("\n");
-    format!(
-        "
-(datatype*
-    (IR
-        (OutputJoin IR IR)
-        (Op OpKind IList)
-        {extra_ir}
-        {}
-    )
-    (OpKind
-        {}
-    )
-    (IList
-        (ICons IR IList)
-        (INil)
-    )
-)
-(function dtype (IR) DType :merge new)
-",
-        ir_variants.join("\n"),
-        opkind_variants.join("\n")
-    )
-}
-
-fn op_cleanups_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
-    ops.iter()
-        .filter(|op| op.cleanup())
-        .map(|op| {
-            let sort = op.sort();
-            let fields = (0..sort.fields.len())
-                .map(|i| (b'a' + i as u8) as char)
-                .join(" ");
-            if sort.class == "OpKind" {
-                format!(
-                    "(rule
-                       ((= ?m (Op ({} {fields}) ?__cleanup_inputs)))
-                       ((delete (Op ({} {fields}) ?__cleanup_inputs)))
-                       :ruleset cleanup)",
-                    sort.name, sort.name
-                )
-            } else {
-                format!(
-                    "(rule
-                       ((= ?m ({} {fields})))
-                       ((delete ({} {fields})))
-                       :ruleset cleanup)",
-                    sort.name, sort.name
-                )
-            }
-        })
-        .join("\n")
-}
-
-fn setup_program(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool) -> String {
-    let mut parser = luminal::egglog_utils::schema_parser(ops);
-    let rewrites = ops
-        .iter()
-        .flat_map(|op| op.rewrites_commands(&mut parser))
-        .map(|c| c.to_string())
-        .join("\n");
+fn split_cycle(phases: &luminal::egglog_utils::PhaseRules) -> [(&'static str, Schedule); 2] {
+    use RewritePhase::*;
     [
-        EGGLOG_RULESETS
-            .iter()
-            .map(|ruleset| format!("(ruleset {ruleset})"))
-            .join("\n"),
-        base_expression_egglog(),
-        op_defs_string(ops),
-        if cleanup {
-            op_cleanups_string(ops)
-        } else {
-            String::new()
-        },
-        base_cleanup_egglog(),
-        rewrites,
-        program.to_string(),
-    ]
-    .join("\n")
-}
-
-fn producer_schedule() -> String {
-    "(seq
-        (saturate expr)
-        (saturate dtype_prop)
-        (run matmul_flatten)
-        (run kernel_lower)
-        (run direct_kernel)
-        (run kernel_specialize)
-        (run buffer_reuse)
-        (run matmul_backend)
-        (run glumoe)
-        (run fusion_pair)
-    )"
-    .to_string()
-}
-
-fn fusion_schedule() -> String {
-    "(seq
-        (saturate expr)
-        (saturate dtype_prop)
-        (run fusion_grow)
-        (run fusion_merge)
-    )"
-    .to_string()
-}
-
-fn split_cycle() -> Vec<(&'static str, String)> {
-    vec![
-        ("producers", format!("(saturate {})", producer_schedule())),
-        ("fusion", format!("(saturate {})", fusion_schedule())),
+        (
+            "producers",
+            sequence((
+                phases[&Expr].saturate(),
+                phases[&DtypeProp].saturate(),
+                &phases[&MatmulFlatten],
+                &phases[&KernelLower],
+                &phases[&DirectKernel],
+                &phases[&KernelSpecialize],
+                &phases[&BufferReuse],
+                &phases[&MatmulBackend],
+                &phases[&Glumoe],
+                &phases[&FusionPair],
+            ))
+            .saturate(),
+        ),
+        (
+            "fusion",
+            sequence((
+                phases[&Expr].saturate(),
+                phases[&DtypeProp].saturate(),
+                &phases[&FusionGrow],
+                &phases[&FusionMerge],
+            ))
+            .saturate(),
+        ),
     ]
 }
 
-fn split_cycle_schedule() -> String {
-    format!(
-        "(seq
-            (saturate {})
-            (saturate {})
-        )",
-        producer_schedule(),
-        fusion_schedule()
-    )
-}
-
-fn phase(egraph: &mut egglog::EGraph, name: &str, schedule: &str) -> bool {
-    let before = egraph.num_tuples();
+fn phase(egraph: &mut EGraph, name: &str, schedule: impl Into<Schedule>) -> bool {
+    let before = egraph.num_tuples().expect("table census");
     let start = Instant::now();
-    let command = format!("(run-schedule {schedule})");
-    let outputs = egraph
-        .parse_and_run_program(None, &command)
-        .unwrap_or_else(|err| panic!("failed phase {name} schedule {schedule}: {err}"));
+    let report = egraph
+        .run(schedule)
+        .unwrap_or_else(|error| panic!("failed phase {name}: {error}"));
     let elapsed = start.elapsed();
-    let after = egraph.num_tuples();
-    let report = outputs
-        .into_iter()
-        .find_map(|output| match output {
-            egglog::CommandOutput::RunSchedule(report) => Some(report),
-            _ => None,
-        })
-        .expect("run-schedule did not return a report");
+    let after = egraph.num_tuples().expect("table census");
     let mut rules = report
         .search_and_apply_time_per_rule
         .iter()
@@ -569,21 +431,18 @@ fn phase(egraph: &mut egglog::EGraph, name: &str, schedule: &str) -> bool {
     report.updated
 }
 
-fn serialize_summary(egraph: &mut egglog::EGraph, root: &str) {
-    let (sort, value) = egraph.eval_expr(&egglog::var!(root.to_string())).unwrap();
-    let output = egraph.serialize(egglog::SerializeConfig {
-        root_eclasses: vec![(sort, value)],
-        max_functions: None,
-        include_temporary_functions: false,
-        max_calls_per_function: None,
-    });
-    let mut classes = std::collections::BTreeSet::new();
-    let mut top_ops = BTreeMap::<String, usize>::new();
-    let mut nodes = 0usize;
-    for node in output.egraph.nodes.values().filter(|node| !node.subsumed) {
-        nodes += 1;
-        classes.insert(node.eclass.clone());
-        *top_ops.entry(node.op.clone()).or_default() += 1;
+fn frozen_summary(frozen: &FrozenEGraph, roots: usize) {
+    let mut top_ops = BTreeMap::new();
+    let mut nodes = 0;
+    let mut classes = 0;
+    for class in frozen.eclasses() {
+        let mut has_active_node = false;
+        for node in class.nodes().filter(|node| !node.is_subsumed()) {
+            has_active_node = true;
+            nodes += 1;
+            *top_ops.entry(node.name().to_string()).or_insert(0_usize) += 1;
+        }
+        classes += usize::from(has_active_node);
     }
     let top_ops = top_ops
         .into_iter()
@@ -592,31 +451,77 @@ fn serialize_summary(egraph: &mut egglog::EGraph, root: &str) {
         .map(|(op, count)| format!("{op}={count}"))
         .join(", ");
     println!(
-        "serialize nodes={nodes} classes={} roots={} top_ops={top_ops}",
-        classes.len(),
-        output.egraph.root_eclasses.len()
+        "freeze equality_nodes={nodes} equality_classes={classes} output_roots={roots} top_ops={top_ops}"
     );
 }
 
 fn run(args: Args) {
+    use RewritePhase::*;
     let mut graph = build_case(args.case);
     let rolled = if args.skip_roll {
         0
     } else {
         graph.auto_roll_loops_prepass()
     };
-    let (program, root) = hlir_to_egglog(&graph);
-
-    let mut ops = match args.backend {
-        Backend::Reference => <ReferenceRuntime as Runtime>::Ops::into_vec(),
-        Backend::Cuda => <CudaRuntime as Runtime>::Ops::into_vec(),
+    // The former inline datatype* / dtype declarations now have one canonical
+    // definition in luminal::typed_reference::schema (Ir, OpKind, IList, DType).
+    // Backend constructors live in luminal_cuda_lite::typed_rules. Captured roots
+    // preserve output order directly, replacing the artificial OutputJoin node.
+    let outputs = capture_graph(&graph).expect("lower HLIR");
+    let (phases, actions) = match args.backend {
+        Backend::Reference => ReferenceRuntime::rules(),
+        Backend::Cuda => CudaRuntime::rules(),
     };
-    ops.extend(<HLIROps as IntoEgglogOp>::into_vec());
+    let intervals = false; // This harness supplies no dynamic interval facts.
     let cleanup = args.cleanup && matches!(args.backend, Backend::Cuda);
-    let setup = setup_program(&program, &ops, cleanup);
-
+    // The original standalone harness deleted every cleanup-eligible HLIR
+    // constructor unconditionally. Keep that experiment distinct from production
+    // conditional cleanup. These are the sixteen HEAD cleanup() == true kinds.
+    let hlir_cleanup = ruleset(
+        |inputs: &IList,
+         value: &egg::F64,
+         a: &DimExpr,
+         b: &DimExpr,
+         dtype: &EggDType,
+         shape: &EList,
+         strides: &EList,
+         other: &EList,
+         output: &EList,
+         extra: &EList| {
+            vec![
+                OpKind::Constant(value),
+                OpKind::Iota(a, b),
+                OpKind::Cast(a, dtype),
+                OpKind::Log2(shape, strides, output),
+                OpKind::Exp2(shape, strides, output),
+                OpKind::Sin(shape, strides, output),
+                OpKind::Recip(shape, strides, output),
+                OpKind::Sqrt(shape, strides, output),
+                OpKind::Add(shape, strides, other, output),
+                OpKind::Mul(shape, strides, other, output),
+                OpKind::Mod(shape, strides, other, output),
+                OpKind::LessThan(shape, strides, other, output),
+                OpKind::Gather(shape, strides, other, output),
+                OpKind::Scatter(shape, strides, other, output, extra),
+                OpKind::Sum(shape, a, strides, b, output),
+                OpKind::Max(shape, a, strides, b, output),
+            ]
+            .into_iter()
+            .map(|kind| {
+                let op = Ir::Op(kind, inputs);
+                rule((&op,), (delete(&op),))
+            })
+            .collect::<Vec<_>>()
+        },
+    );
+    if cleanup {
+        phases.insert(Cleanup, ruleset((&phases[&Cleanup], &hlir_cleanup)));
+    }
+    // All rules registered by the original catalog explicitly selected a named
+    // phase; its unnamed default group was empty, not the union of main phases.
+    let default_rules = ruleset(Vec::<Rule>::new());
     println!(
-        "case={:?} backend={:?} mode={:?} passes={} cleanup={} rolled={} hlir_nodes={} setup_lines={} setup_bytes={} root={root}",
+        "case={:?} backend={:?} mode={:?} passes={} cleanup={} rolled={} hlir_nodes={} roots={}",
         args.case,
         args.backend,
         args.mode,
@@ -624,28 +529,30 @@ fn run(args: Args) {
         cleanup,
         rolled,
         graph.graph.node_count(),
-        setup.lines().count(),
-        setup.len(),
+        outputs.len(),
     );
-
-    let mut egraph = egglog::EGraph::default();
-    let before = egraph.num_tuples();
+    let mut egraph = EGraph::default();
+    let before = egraph.num_tuples().expect("table census");
     let start = Instant::now();
-    let commands = egraph.parser.get_program_from_string(None, &setup).unwrap();
-    egraph.run_program(commands).unwrap();
+    egraph.register(&actions).expect("backend initialization");
+    // Install every rule before ending setup, without applying any of them.
+    egraph
+        .run(ruleset(phases.values().cloned().collect::<Vec<_>>()).repeat(0))
+        .expect("rule installation");
+    egraph.register(&outputs).expect("captured roots");
+    let after = egraph.num_tuples().expect("table census");
     println!(
-        "setup {:>8.2} ms | tuples {before} -> {} ({:+})",
+        "setup {:>8.2} ms | tuples {before} -> {after} ({:+})",
         start.elapsed().as_secs_f64() * 1000.0,
-        egraph.num_tuples(),
-        egraph.num_tuples() as isize - before as isize,
+        after as isize - before as isize,
     );
 
     match args.mode {
         Mode::Current | Mode::Steps => {
             for pass in 1..=args.passes {
                 let mut updated = false;
-                for (name, schedule) in split_cycle() {
-                    updated |= phase(&mut egraph, &format!("{pass:03} {name}"), &schedule);
+                for (name, schedule) in split_cycle(&phases) {
+                    updated |= phase(&mut egraph, &format!("{pass:03} {name}"), schedule);
                 }
                 if matches!(args.mode, Mode::Current) && !updated {
                     break;
@@ -653,25 +560,32 @@ fn run(args: Args) {
             }
         }
         Mode::FullDefault => {
-            phase(&mut egraph, "expr", "(saturate expr)");
-            phase(&mut egraph, "dtype", "(saturate dtype_prop)");
-            phase(&mut egraph, "default-full", "(saturate (run))");
+            phase(&mut egraph, "expr", phases[&Expr].saturate());
+            phase(&mut egraph, "dtype", phases[&DtypeProp].saturate());
+            phase(&mut egraph, "default-full", default_rules.saturate());
         }
         Mode::FullCycle => {
             phase(
                 &mut egraph,
                 "cycle-full",
-                &format!("(saturate {})", split_cycle_schedule()),
+                luminal::egglog_utils::main_schedule(&phases, intervals),
             );
         }
     }
-
-    phase(&mut egraph, "final expr", "(saturate expr)");
+    phase(&mut egraph, "final expr", &phases[&Expr].saturate());
     if cleanup {
-        phase(&mut egraph, "cleanup", "(saturate cleanup)");
+        phase(&mut egraph, "cleanup", &phases[&Cleanup].saturate());
     }
-    phase(&mut egraph, "base cleanup", "(saturate base_cleanup)");
-    serialize_summary(&mut egraph, &root);
+    phase(
+        &mut egraph,
+        "base cleanup",
+        &phases[&BaseCleanup].saturate(),
+    );
+    let frozen = egraph.freeze().expect("exact snapshot");
+    for output in &outputs {
+        frozen.lookup(output).expect("retained output capture");
+    }
+    frozen_summary(&frozen, outputs.len());
 }
 
 fn main() {

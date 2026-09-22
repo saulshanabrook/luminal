@@ -27,6 +27,9 @@
 //! input (gate_up; k-stride 0) and a per-slot `(s, k, D)` input (down)
 //! differ only in the embedded stride constants.
 
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -34,15 +37,7 @@ use crate::{
     kernel::{KernelOp, hlir::dtype_includes, hlir::generate_dyn_dims_defines},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{ELIST, EXPRESSION, OP_KIND},
-        extract_expr, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 const TPB: usize = 256;
 const WARPS_PER_BLOCK: usize = TPB / 32;
@@ -64,109 +59,166 @@ pub struct KernelMoEGemv {
     topk_strides: Vec<Expression>,
 }
 
-impl EgglogOp for KernelMoEGemv {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelMoEGemv",
-            &[
-                ("out_shape", ELIST),
-                ("k_dim", EXPRESSION),
-                ("w_shape", ELIST),
-                ("x_strides", ELIST),
-                ("topk_strides", ELIST),
-            ],
-        )
-    }
+pub(crate) mod kernel_mo_e_gemv {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        3
-    }
+    // Expert flat index = topk * (O*D) + within-expert iota. The topk strides
+    // describe a sliced (s,E) argsort view. Gather BF16 weights, widen to F32,
+    // then reduce D in (E,O,D); the transposed view reads O with z*D and D
+    // with z, while the activation broadcasts over O.
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![raw_rules(parser, 
-            "(rule
+    #[ruleset]
+    pub(crate) fn matmul_backend(
+        mb_a: &EList,
+        topk_idx: &Ir,
+        ts_s: &DimExpr,
+        ts_k: &DimExpr,
+        iota_within_range: &DimExpr,
+        g_data_shape: &EList,
+        weights: &Ir,
+        f32_size: &DimExpr,
+        x_strides: &EList,
+        w_strides: &EList,
+        x: &Ir,
+        out_shape: &EList,
+        k_dim: &DimExpr,
+        mm: &Ir,
+        e: &DimExpr,
+        o: &DimExpr,
+        d: &DimExpr,
+        s: &DimExpr,
+        k: &DimExpr,
+        o2: &DimExpr,
+        ws_s: &DimExpr,
+        ws_k: &DimExpr,
+        ws_1: &DimExpr,
+        d3: &DimExpr,
+        xs_s: &DimExpr,
+        xs_k: &DimExpr,
+        xs_1: &DimExpr,
+    ) -> Vec<Rule> {
+        let kmoe = &Ir::Op(
+            kernel_mo_e_gemv(out_shape, k_dim, g_data_shape, x_strides, mb_a),
+            [x, topk_idx, weights],
+        );
+        let iota_base = &Ir::Op(IotaArgs::fresh(), IList::INil());
+        let iota_within = &Ir::Op(
+            OpKind::Iota(DimExpr::MIter(), iota_within_range),
+            IList::INil(),
+        );
+        let mul_base = &Ir::Op(
+            MulArgs {
+                a_strides: mb_a.into(),
+                ..MulArgs::fresh()
+            },
+            [topk_idx, iota_base],
+        );
+        let add_idx = &Ir::Op(AddArgs::fresh(), [mul_base, iota_within]);
+        let gathered = &Ir::Op(
+            GatherArgs {
+                data_shape: g_data_shape.into(),
+                ..GatherArgs::fresh()
+            },
+            [add_idx, weights],
+        );
+        let f32 = &Ir::Op(OpKind::Cast(f32_size, DType::F32()), [gathered]);
+        let mm_mul = &Ir::Op(
+            MulArgs {
+                a_strides: x_strides.into(),
+                b_strides: w_strides.into(),
+                ..MulArgs::fresh()
+            },
+            [x, f32],
+        );
+        vec![
+            rule(
                 (
-                    ; expert flat index: topk · (O·D) + within-expert iota.
-                    ; ?mb_a carries the topk read strides over (s, k) — the
-                    ; indices are usually a slice view of the (s, E) argsort.
-                    (= ?iota_base (Op (Iota ?io ?iota_base_range) (INil)))
-                    (= ?mul_base (Op (Mul ?mb_shape ?mb_a ?mb_b ?mb_o)
-                        (ICons ?topk_idx (ICons ?iota_base (INil)))))
-                    (= ?mb_a (ECons ?ts_s (ECons ?ts_k (ENil))))
-                    (= ?iota_within (Op (Iota (MIter) ?iota_within_range) (INil)))
-                    (= ?add_idx (Op (Add ?ai_shape ?ai_a ?ai_b ?ai_o)
-                        (ICons ?mul_base (ICons ?iota_within (INil)))))
-
-                    ; gather the selected experts' BF16 weights, widen to F32
-                    (= ?gathered (Op (Gather ?g_idx_shape ?g_idx_stride ?g_data_shape ?g_data_stride)
-                        (ICons ?add_idx (ICons ?weights (INil)))))
-                    (= (Bf16) (dtype ?weights))
-                    (= ?f32 (Op (Cast ?f32_size (F32)) (ICons ?gathered (INil))))
-
-                    ; batched mat-vec against the transposed gathered view
-                    (= ?mm_mul (Op (Mul ?mm_shape ?x_strides ?w_strides ?mm_mul_out)
-                        (ICons ?x (ICons ?f32 (INil)))))
-                    (= (F32) (dtype ?x))
-                    (= ?mm (Op (Sum ?out_shape ?k_dim ?mm_in_stride ?mm_k_stride ?mm_out_stride)
-                        (ICons ?mm_mul (INil))))
-
-                    ; weights are (E, O, D); reduce dim must be D
-                    (= ?g_data_shape (ECons ?e (ECons ?o (ECons ?d (ENil)))))
-                    (= ?d ?k_dim)
-                    ; matmul output is (s, k, 1, O)
-                    (= ?out_shape (ECons ?s (ECons ?k (ECons (MNum 1) (ECons ?o2 (ENil))))))
-                    (= ?o ?o2)
-                    ; gathered operand reads (s,k,O,D) through the transpose
-                    ; view: O-dim stride z·D, D-dim stride z
-                    (= ?w_strides (ECons ?ws_s (ECons ?ws_k (ECons ?ws_1
-                        (ECons (MMul (MIter) ?d3) (ECons (MIter) (ENil)))))))
-                    (= ?d3 ?d)
-                    ; x reads its row contiguously and broadcasts over O
-                    (= ?x_strides (ECons ?xs_s (ECons ?xs_k (ECons ?xs_1
-                        (ECons (MNum 0) (ECons (MIter) (ENil)))))))
-                )
-                (
-                    (let ?kmoe (Op (KernelMoEGemv ?out_shape ?k_dim ?g_data_shape ?x_strides ?mb_a)
-                        (ICons ?x (ICons ?topk_idx (ICons ?weights (INil))))))
-                    (union ?mm ?kmoe)
-                    (set (dtype ?kmoe) (F32))
-                )
-                :ruleset matmul_backend
-                :name \"kernel moe gemv from expert gather\"
-            )",
-        )]
-    };
-        __rules.into_iter().flatten().collect()
+                    eq(mb_a, [ts_s, ts_k]),
+                    eq(DType::Bf16(), weights.dtype()),
+                    eq(DType::F32(), x.dtype()),
+                    eq(
+                        mm,
+                        Ir::Op(
+                            SumArgs {
+                                shape: out_shape.into(),
+                                iters: k_dim.into(),
+                                ..SumArgs::fresh()
+                            },
+                            [mm_mul],
+                        ),
+                    ),
+                    eq(g_data_shape, [e, o, d]),
+                    eq(d, k_dim),
+                    eq(out_shape, [s, k, &(DimExpr::MNum(1)), o2]),
+                    eq(o, o2),
+                    eq(
+                        w_strides,
+                        [
+                            ws_s,
+                            ws_k,
+                            ws_1,
+                            &(DimExpr::MIter() * d3),
+                            &(DimExpr::MIter()),
+                        ],
+                    ),
+                    eq(d3, d),
+                    eq(
+                        x_strides,
+                        [xs_s, xs_k, xs_1, &(DimExpr::MNum(0)), &(DimExpr::MIter())],
+                    ),
+                ),
+                (kmoe, union(mm, kmoe), set(kmoe.dtype(), DType::F32())),
+            )
+            .label("kernel moe gemv from expert gather"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                k_dim: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                w_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                x_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                topk_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+impl KernelMoEGemv {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_out_shape,
+            field_k_dim,
+            field_w_shape,
+            field_x_strides,
+            field_topk_strides,
+        )) = typed::get_args(
+            kind,
+            |out_shape: &EList,
+             k_dim: &DimExpr,
+             w_shape: &EList,
+             x_strides: &EList,
+             topk_strides: &EList| {
+                crate::typed_rules::kernel_mo_e_gemv(
+                    out_shape,
+                    k_dim,
+                    w_shape,
+                    x_strides,
+                    topk_strides,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let decoded_w_shape = context.expressions(&field_w_shape)?;
+        let decoded_x_strides = context.expressions(&field_x_strides)?;
+        let decoded_topk_strides = context.expressions(&field_topk_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            out_shape: decoded_out_shape,
+            k_dim: context.expression(&field_k_dim)?,
+            w_shape: decoded_w_shape,
+            x_strides: decoded_x_strides,
+            topk_strides: decoded_topk_strides,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

@@ -1,3 +1,6 @@
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -7,20 +10,13 @@ use crate::{
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, ELIST, EXPRESSION, OP_KIND, STRING},
-        extract_dtype, extract_expr, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
-
-pub type Ops = (KernelMeanReduce, KernelScatterNoCopy);
+use luminal::{op::*, prelude::*};
 
 #[derive(Default, Debug, Clone)]
 
+// Mean fusion remains disabled: its union can expose genomes with accumulated
+// floating-point error across layers. The unfused Sum + Mul(Recip(Cast(Iota)))
+// path remains available.
 pub struct KernelMeanReduce {
     out_shape: Vec<Expression>,
     iters: Expression,
@@ -29,70 +25,59 @@ pub struct KernelMeanReduce {
     out_stride: Vec<Expression>,
     dtype: DType,
 }
-impl EgglogOp for KernelMeanReduce {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelMean",
-            &[
-                ("shape", ELIST),
-                ("iters", EXPRESSION),
-                ("strides", ELIST),
-                ("iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Disabled: the e-graph union introduced by this rule can cause the search
-        // to select genomes with accumulated FP precision issues over many layers.
-        // The unfused Sum + Mul(Recip(Cast(Iota))) path produces equivalent results.
-        vec![]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            {
-                let out_shape =
-                    extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-                let iters = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-                let in_stride =
-                    extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
-                let iter_stride = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-                let out_stride =
-                    extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
-                let dtype = extract_dtype(egraph, kind_children[5]);
-                LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                    out_shape,
+impl KernelMeanReduce {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_shape,
+            field_iters,
+            field_strides,
+            field_iter_stride,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |shape: &EList,
+             iters: &DimExpr,
+             strides: &EList,
+             iter_stride: &DimExpr,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_mean(
+                    shape,
                     iters,
-                    in_stride,
+                    strides,
                     iter_stride,
-                    out_stride,
+                    out_strides,
                     dtype,
-                }) as Box<dyn KernelOp>)
+                )
             },
-            input_enodes,
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some({
+            let out_shape = decoded_shape;
+            let iters = context.expression(&field_iters)?;
+            let in_stride = decoded_strides;
+            let iter_stride = context.expression(&field_iter_stride)?;
+            let out_stride = decoded_out_strides;
+            let dtype = context.dtype(&field_dtype)?;
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape,
+                iters,
+                in_stride,
+                iter_stride,
+                out_stride,
+                dtype,
+            }) as Box<dyn KernelOp>)
+        }))
     }
 }
 
@@ -261,173 +246,209 @@ impl Default for KernelScatterNoCopy {
     }
 }
 
-impl EgglogOp for KernelScatterNoCopy {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelScatterNoCopy",
-            &[
-                ("dest_shape", ELIST),
-                ("dest_strides", ELIST),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-                ("src_strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
+pub(crate) mod kernel_scatter_no_copy {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
+
+    // ConsumedBuffer permits an in-place scatter only when the destination
+    // also represents the output layout; strided/broadcast destinations need
+    // the regular Scatter's contiguous copy. Cleanup deletes shared claims;
+    // base_cleanup resolves surviving claims to the source and deletes them.
+    // Deleted claims cascade through IList/Op, leaving the copying alternative.
+    #[relation]
+    pub(crate) fn consumed_buffer_ilist_contains(a0: IList, a1: Ir);
+
+    #[ruleset]
+    pub(crate) fn cleanup(
+        head: &Ir,
+        tail: &IList,
+        list: &IList,
+        item: &Ir,
+        a: &Ir,
+        cb: &Ir,
+        k1: &OpKind,
+        ilist1: &IList,
+        k2: &OpKind,
+        ilist2: &IList,
+    ) -> Vec<Rule> {
+        let op1 = &Ir::Op(k1, ilist1);
+        let op2 = &Ir::Op(k2, ilist2);
+        vec![
+            rule(
+                (eq(list, IList::ICons(head, tail)),),
+                (consumed_buffer_ilist_contains(list, head),),
+            )
+            .label("consumed-buffer-ilist-contains-head"),
+            rule(
+                (
+                    eq(list, IList::ICons(head, tail)),
+                    Fact::from(consumed_buffer_ilist_contains(tail, item)),
+                ),
+                (consumed_buffer_ilist_contains(list, item),),
+            )
+            .label("consumed-buffer-ilist-contains-tail"),
+            rule(
+                (
+                    eq(cb, consumed_buffer(a)),
+                    Fact::from(consumed_buffer_ilist_contains(ilist1, cb)),
+                    ne(op1, op2),
+                    Fact::from(consumed_buffer_ilist_contains(ilist2, a)),
+                ),
+                (delete(consumed_buffer(a)),),
+            )
+            .label("consumed-buffer-cleanup-shared-op-use"),
+        ]
+    }
+
+    #[ruleset]
+    pub(crate) fn buffer_reuse(
+        ds: &EList,
+        dst: &EList,
+        is: &EList,
+        istr: &EList,
+        ss: &EList,
+        os: &EList,
+        dt: &DType,
+        dest: &Ir,
+        indexes: &Ir,
+        src: &Ir,
+        scatter: &Ir,
+        dty: &DType,
+    ) -> Rule {
+        let consumed = &consumed_buffer(dest);
+        let nocopy = &Ir::Op(
+            kernel_scatter_no_copy(ds, dst, is, istr, ss, os, dt),
+            [consumed, indexes, src],
+        );
+        rule(
+            (
+                eq(
+                    scatter,
+                    Ir::Op(
+                        kernel_scatter(ds, dst, is, istr, ss, os, dt),
+                        [dest, indexes, src],
+                    ),
+                ),
+                eq(dst, os),
+                eq(dty, src.dtype()),
+            ),
+            (
+                consumed,
+                nocopy,
+                union(scatter, nocopy),
+                set(nocopy.dtype(), dty),
+            ),
         )
+        .label("scatter to scatter-no-copy")
     }
 
-    fn ir_defs(&self) -> Vec<String> {
-        vec!["(ConsumedBuffer IR)".to_string()]
-    }
-
-    fn n_inputs(&self) -> usize {
-        3
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
-        // ConsumedBuffer wraps dest to signal in-place modification.
-        // This is only valid when the destination buffer can also represent
-        // the scatter output layout. If dest is a strided/broadcast view,
-        // regular Scatter must first materialize a contiguous output copy.
-        //
-        // Two-phase resolution:
-        // 1. During (run): cleanup rules delete ConsumedBuffer if dest is shared (another op uses it)
-        // 2. During (saturate base_cleanup): surviving ConsumedBuffers are valid — union with
-        //    source and delete. This merges the ConsumedBuffer eclass into the source eclass,
-        //    making KernelScatterNoCopy's input resolve directly to the source buffer.
-        //
-        // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
-        // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
-        let mut rules = vec![
-            raw_rules(parser, "(relation consumed_buffer_ilist_contains (IList IR))"),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?list (ICons ?head ?tail)))
-                    ((consumed_buffer_ilist_contains ?list ?head))
-                    :ruleset cleanup
-                    :name \"consumed-buffer-ilist-contains-head\"
-                )",
-            ),
-            raw_rules(parser, 
-                "(rule
-                    ((= ?list (ICons ?head ?tail))
-                     (consumed_buffer_ilist_contains ?tail ?item))
-                    ((consumed_buffer_ilist_contains ?list ?item))
-                    :ruleset cleanup
-                    :name \"consumed-buffer-ilist-contains-tail\"
-                )",
-            ),
-            // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
-            raw_rules(parser, 
-                "(rule
-                    (
-                        (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                            (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
-                        (= ?dst ?os)
-                        (= ?dty (dtype ?src))
-                    )
-                    (
-                        (let ?consumed (ConsumedBuffer ?dest))
-                        (let ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                            (ICons ?consumed (ICons ?indexes (ICons ?src (INil))))))
-                        (union ?scatter ?nocopy)
-                        (set (dtype ?nocopy) ?dty)
-                    )
-                    :ruleset buffer_reuse
-                    :name \"scatter to scatter-no-copy\"
-                )",
-            ),
-            // Dtype propagation for ConsumedBuffer
-            raw_rules(parser, 
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?a))
-                     (= ?dt (dtype ?a)))
-                    ((set (dtype ?cb) ?dt))
-                    :ruleset dtype_prop
-                    :name \"consumed-buffer-dtype\"
-                )",
-            ),
-        ];
-        // Cleanup: delete ConsumedBuffer when inner buffer is used by a DIFFERENT Op.
-        rules.push(raw_rules(parser, 
-            "(rule
-                ((= ?cb (ConsumedBuffer ?a))
-                 (= ?op1 (Op ?k1 ?ilist1))
-                 (consumed_buffer_ilist_contains ?ilist1 ?cb)
-                 (= ?op2 (Op ?k2 ?ilist2))
-                 (!= ?op1 ?op2)
-                 (consumed_buffer_ilist_contains ?ilist2 ?a))
-                ((delete (ConsumedBuffer ?a)))
-                :ruleset cleanup
-                :name \"consumed-buffer-cleanup-shared-op-use\"
-            )",
-        ));
-        // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
-        // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
-        rules.push(raw_rules(parser, 
-            "(rule
-                ((= ?cb (ConsumedBuffer ?dest))
-                 (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
-                 (= ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
-                ((delete (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
-                :ruleset post_cleanup
-                :name \"scatter-no-copy-dominates-valid-consumed-buffer\"
-            )",
-        ));
-        // Surviving ConsumedBuffers are valid — union with source and delete.
-        // Runs in base_cleanup (after all (run) iterations).
-        // TODO: figure out how to validate this is a valid ConsumedBuffer independantly so we can run it in the cleanup ruleset, rather than base_cleanup
-        rules.push(raw_rules(parser, 
-            "(rule
-                ((= ?cb (ConsumedBuffer ?a)))
-                ((union ?cb ?a)
-                 (delete (ConsumedBuffer ?a)))
-                :ruleset base_cleanup
-                :name \"consumed-buffer-resolve\"
-            )",
-        ));
-        rules
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                dest_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                dest_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                index_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                index_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                src_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[5], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[6]),
-            })),
-            input_enodes, // dest, indexes, src
+    #[ruleset]
+    pub(crate) fn dtype_prop(a: &Ir, cb: &Ir, dt: &DType) -> Rule {
+        rule(
+            (eq(cb, consumed_buffer(a)), eq(dt, a.dtype())),
+            (set(cb.dtype(), dt),),
         )
+        .label("consumed-buffer-dtype")
+    }
+
+    #[ruleset]
+    // A surviving no-copy scatter dominates the copying one. Run this before
+    // base_cleanup resolves ConsumedBuffer back to the destination.
+    pub(crate) fn post_cleanup(
+        dest: &Ir,
+        cb: &Ir,
+        ds: &EList,
+        dst: &EList,
+        is: &EList,
+        istr: &EList,
+        ss: &EList,
+        os: &EList,
+        dt: &DType,
+        indexes: &Ir,
+        src: &Ir,
+        scatter: &Ir,
+    ) -> Rule {
+        let source = &Ir::Op(
+            kernel_scatter(ds, dst, is, istr, ss, os, dt),
+            [dest, indexes, src],
+        );
+        rule(
+            (
+                eq(cb, consumed_buffer(dest)),
+                eq(scatter, source),
+                Ir::Op(
+                    kernel_scatter_no_copy(ds, dst, is, istr, ss, os, dt),
+                    [cb, indexes, src],
+                ),
+            ),
+            (delete(source),),
+        )
+        .label("scatter-no-copy-dominates-valid-consumed-buffer")
+    }
+
+    #[ruleset]
+    pub(crate) fn base_cleanup(a: &Ir, cb: &Ir) -> Rule {
+        rule(
+            (eq(cb, consumed_buffer(a)),),
+            (union(cb, a), delete(consumed_buffer(a))),
+        )
+        .label("consumed-buffer-resolve")
+    }
+}
+
+impl KernelScatterNoCopy {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_dest_shape,
+            field_dest_strides,
+            field_index_shape,
+            field_index_strides,
+            field_src_strides,
+            field_out_strides,
+            field_dtype,
+        )) = typed::get_args(
+            kind,
+            |dest_shape: &EList,
+             dest_strides: &EList,
+             index_shape: &EList,
+             index_strides: &EList,
+             src_strides: &EList,
+             out_strides: &EList,
+             dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::kernel_scatter_no_copy(
+                    dest_shape,
+                    dest_strides,
+                    index_shape,
+                    index_strides,
+                    src_strides,
+                    out_strides,
+                    dtype,
+                )
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_dest_shape = context.expressions(&field_dest_shape)?;
+        let decoded_dest_strides = context.expressions(&field_dest_strides)?;
+        let decoded_index_shape = context.expressions(&field_index_shape)?;
+        let decoded_index_strides = context.expressions(&field_index_strides)?;
+        let decoded_src_strides = context.expressions(&field_src_strides)?;
+        let decoded_out_strides = context.expressions(&field_out_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            dest_shape: decoded_dest_shape,
+            dest_strides: decoded_dest_strides,
+            index_shape: decoded_index_shape,
+            index_strides: decoded_index_strides,
+            src_strides: decoded_src_strides,
+            out_strides: decoded_out_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

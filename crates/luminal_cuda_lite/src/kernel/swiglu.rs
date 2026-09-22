@@ -7,7 +7,9 @@
 //! dtype in/out — same compute precision as the widened decomposed chain,
 //! rounded once at the store.
 
-use luminal::prelude::{Command, Parser, raw_rules};
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -330,16 +332,6 @@ pub fn fused_swiglu_quant(
 // lives in the FlashInfer host-op egg, which loads after kernel ops.
 // ═══════════════════════════════════════════════════════════
 
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{ELIST, OP_KIND},
-        extract_expr_list,
-    },
-    op::EgglogOp,
-    prelude::{ENodeId, SerializedEGraph},
-};
-
 fn swiglu_chain_atoms() -> &'static str {
     "
                     ; silu(gate): gate is the (rows, I) start-0 view of x
@@ -388,58 +380,124 @@ pub struct KernelSwiglu {
     out_shape: Vec<Expression>,
 }
 
-impl EgglogOp for KernelSwiglu {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "KernelSwiglu", &[("out_shape", ELIST)])
-    }
+pub(crate) mod kernel_swiglu {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![raw_rules(parser, format!(
-            "(rule
-                ({}
-                )
+    #[allow(
+        clippy::approx_constant,
+        reason = "Exact pattern literals must match the authored graph."
+    )]
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        e_2i: &DimExpr,
+        x: &Ir,
+        nb_size: &DimExpr,
+        l2eb_size: &DimExpr,
+        ob_size: &DimExpr,
+        e_2i2: &DimExpr,
+        x2: &Ir,
+        o_sh: &EList,
+        out: &Ir,
+        rows: &DimExpr,
+        i: &DimExpr,
+        e_2i3: &DimExpr,
+        x3: &Ir,
+        e_i: &DimExpr,
+        e_2i4: &DimExpr,
+        up_range: &DimExpr,
+    ) -> Vec<Rule> {
+        let ks = &Ir::Op(kernel_swiglu(o_sh), [x]);
+        let negc = &Ir::Op(OpKind::Constant(-1.0), IList::INil());
+        let l2ec = &Ir::Op(OpKind::Constant(1.442695), IList::INil());
+        let onec = &Ir::Op(OpKind::Constant(1.0), IList::INil());
+        let upidx = &Ir::Op(
+            OpKind::Iota(
+                ((DimExpr::MIter() % e_i) + e_i) + ((DimExpr::MIter() / e_i) * e_2i4),
+                up_range,
+            ),
+            IList::INil(),
+        );
+        let negb = &Ir::Op(OpKind::Cast(nb_size, DType::Bf16()), [negc]);
+        let l2eb = &Ir::Op(OpKind::Cast(l2eb_size, DType::Bf16()), [l2ec]);
+        let oneb = &Ir::Op(OpKind::Cast(ob_size, DType::Bf16()), [onec]);
+        let up = &Ir::Op(
+            GatherArgs {
+                data_strides: ([&(DimExpr::MIter() * e_2i3), &(DimExpr::MIter())]).into(),
+                ..GatherArgs::fresh()
+            },
+            [upidx, x3],
+        );
+        let ng = &Ir::Op(
+            MulArgs {
+                a_strides: ([&(DimExpr::MIter() * e_2i), &(DimExpr::MIter())]).into(),
+                ..MulArgs::fresh()
+            },
+            [x, negb],
+        );
+        let sc = &Ir::Op(MulArgs::fresh(), [ng, l2eb]);
+        let ex = &Ir::Op(Exp2Args::fresh(), [sc]);
+        let pl1 = &Ir::Op(AddArgs::fresh(), [ex, oneb]);
+        let sig = &Ir::Op(RecipArgs::fresh(), [pl1]);
+        let silu = &Ir::Op(
+            MulArgs {
+                a_strides: ([&(DimExpr::MIter() * e_2i2), &(DimExpr::MIter())]).into(),
+                ..MulArgs::fresh()
+            },
+            [x2, sig],
+        );
+        vec![
+            rule(
                 (
-                    (let ?ks (Op (KernelSwiglu ?o_sh) (ICons ?x (INil))))
-                    (union ?out ?ks)
-                    (set (dtype ?ks) (Bf16))
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel swiglu bf16\"
-            )",
-            swiglu_chain_atoms()
-        ))]
-    };
-        __rules.into_iter().flatten().collect()
+                    eq(x, x2),
+                    eq(
+                        out,
+                        Ir::Op(
+                            MulArgs {
+                                shape: o_sh.into(),
+                                ..MulArgs::fresh()
+                            },
+                            [silu, up],
+                        ),
+                    ),
+                    eq(o_sh, [rows, i]),
+                    eq(x, x3),
+                    eq(i, e_i),
+                    eq(DType::Bf16(), x.dtype()),
+                ),
+                (ks, union(out, ks), set(ks.dtype(), DType::Bf16())),
+            )
+            .label("kernel swiglu bf16"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+impl KernelSwiglu {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape,)) = typed::get_args(kind, |out_shape: &EList| {
+            crate::typed_rules::kernel_swiglu(out_shape)
+        })?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let out_shape = decoded_out_shape;
         let kern = SwigluKernel {
             rows: out_shape[0],
-            intermediate: out_shape[1].to_usize().expect("swiglu I must be static"),
+            intermediate: out_shape[1]
+                .to_usize()
+                .ok_or_else(|| TypedError::Decode("swiglu I must be static".into()))?,
             dtype: DType::Bf16,
         };
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(kern) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+        Ok(Some(LLIROp::new::<dyn KernelOp>(
+            Box::new(kern) as Box<dyn KernelOp>
+        )))
     }
 }
 
@@ -448,65 +506,129 @@ pub struct KernelSwigluQuant {
     out_shape: Vec<Expression>,
 }
 
-impl EgglogOp for KernelSwigluQuant {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "KernelSwigluQuant", &[("out_shape", ELIST)])
-    }
+pub(crate) mod kernel_swiglu_quant {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
+    // Quant tail: cast_f8(out_f32 * recip(scale)).
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![raw_rules(parser, format!(
-            "(rule
-                ({}
-
-                    ; quant tail: cast_f8(out_f32 · recip(scale))
-                    (= ?qf (Op (Cast ?qf_size (F32)) (ICons ?out (INil))))
-                    (= ?qrecip (Op (Recip ?qr_sh ?qr_in ?qr_out)
-                        (ICons ?scale (INil))))
-                    (= ?qmul (Op (Mul ?qm_sh ?qm_a ?qm_b ?qm_o)
-                        (ICons ?qf (ICons ?qrecip (INil)))))
-                    (= ?q (Op (Cast ?q_size (F8E4M3)) (ICons ?qmul (INil))))
-                )
+    #[allow(
+        clippy::approx_constant,
+        reason = "Exact pattern literals must match the authored graph."
+    )]
+    #[ruleset]
+    pub(crate) fn kernel_fuse_late(
+        e_2i: &DimExpr,
+        x: &Ir,
+        nb_size: &DimExpr,
+        l2eb_size: &DimExpr,
+        ob_size: &DimExpr,
+        e_2i2: &DimExpr,
+        x2: &Ir,
+        o_sh: &EList,
+        rows: &DimExpr,
+        i: &DimExpr,
+        e_2i3: &DimExpr,
+        x3: &Ir,
+        e_i: &DimExpr,
+        e_2i4: &DimExpr,
+        up_range: &DimExpr,
+        qf_size: &DimExpr,
+        scale: &Ir,
+        q_size: &DimExpr,
+        q: &Ir,
+    ) -> Vec<Rule> {
+        let ksq = &Ir::Op(kernel_swiglu_quant(o_sh), [x, scale]);
+        let negc = &Ir::Op(OpKind::Constant(-1.0), IList::INil());
+        let l2ec = &Ir::Op(OpKind::Constant(1.442695), IList::INil());
+        let onec = &Ir::Op(OpKind::Constant(1.0), IList::INil());
+        let upidx = &Ir::Op(
+            OpKind::Iota(
+                ((DimExpr::MIter() % e_i) + e_i) + ((DimExpr::MIter() / e_i) * e_2i4),
+                up_range,
+            ),
+            IList::INil(),
+        );
+        let qrecip = &Ir::Op(RecipArgs::fresh(), [scale]);
+        let negb = &Ir::Op(OpKind::Cast(nb_size, DType::Bf16()), [negc]);
+        let l2eb = &Ir::Op(OpKind::Cast(l2eb_size, DType::Bf16()), [l2ec]);
+        let oneb = &Ir::Op(OpKind::Cast(ob_size, DType::Bf16()), [onec]);
+        let up = &Ir::Op(
+            GatherArgs {
+                data_strides: ([&(DimExpr::MIter() * e_2i3), &(DimExpr::MIter())]).into(),
+                ..GatherArgs::fresh()
+            },
+            [upidx, x3],
+        );
+        let ng = &Ir::Op(
+            MulArgs {
+                a_strides: ([&(DimExpr::MIter() * e_2i), &(DimExpr::MIter())]).into(),
+                ..MulArgs::fresh()
+            },
+            [x, negb],
+        );
+        let sc = &Ir::Op(MulArgs::fresh(), [ng, l2eb]);
+        let ex = &Ir::Op(Exp2Args::fresh(), [sc]);
+        let pl1 = &Ir::Op(AddArgs::fresh(), [ex, oneb]);
+        let sig = &Ir::Op(RecipArgs::fresh(), [pl1]);
+        let silu = &Ir::Op(
+            MulArgs {
+                a_strides: ([&(DimExpr::MIter() * e_2i2), &(DimExpr::MIter())]).into(),
+                ..MulArgs::fresh()
+            },
+            [x2, sig],
+        );
+        let out = &Ir::Op(
+            MulArgs {
+                shape: o_sh.into(),
+                ..MulArgs::fresh()
+            },
+            [silu, up],
+        );
+        let qf = &Ir::Op(OpKind::Cast(qf_size, DType::F32()), [out]);
+        let qmul = &Ir::Op(MulArgs::fresh(), [qf, qrecip]);
+        vec![
+            rule(
                 (
-                    (let ?ksq (Op (KernelSwigluQuant ?o_sh) (ICons ?x (ICons ?scale (INil)))))
-                    (union ?q ?ksq)
-                    (set (dtype ?ksq) (F8E4M3))
-                )
-                :ruleset kernel_fuse_late
-                :name \"kernel swiglu quant f8\"
-            )",
-            swiglu_chain_atoms()
-        ))]
-    };
-        __rules.into_iter().flatten().collect()
+                    eq(x, x2),
+                    eq(o_sh, [rows, i]),
+                    eq(x, x3),
+                    eq(i, e_i),
+                    eq(DType::Bf16(), x.dtype()),
+                    eq(q, Ir::Op(OpKind::Cast(q_size, DType::F8E4M3()), [qmul])),
+                ),
+                (ksq, union(q, ksq), set(ksq.dtype(), DType::F8E4M3())),
+            )
+            .label("kernel swiglu quant f8"),
+        ]
     }
+}
 
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+impl KernelSwigluQuant {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_out_shape,)) = typed::get_args(kind, |out_shape: &EList| {
+            crate::typed_rules::kernel_swiglu_quant(out_shape)
+        })?
+        else {
+            return Ok(None);
+        };
+        let decoded_out_shape = context.expressions(&field_out_shape)?;
+        let out_shape = decoded_out_shape;
         let kern = SwigluQuantKernel {
             rows: out_shape[0],
-            intermediate: out_shape[1].to_usize().expect("swiglu I must be static"),
+            intermediate: out_shape[1]
+                .to_usize()
+                .ok_or_else(|| TypedError::Decode("swiglu I must be static".into()))?,
             dtype: DType::Bf16,
         };
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(kern) as Box<dyn KernelOp>),
-            input_enodes,
-        )
+        Ok(Some(LLIROp::new::<dyn KernelOp>(
+            Box::new(kern) as Box<dyn KernelOp>
+        )))
     }
 }

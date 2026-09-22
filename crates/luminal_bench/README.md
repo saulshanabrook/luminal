@@ -79,17 +79,20 @@ cargo run -p luminal_bench --features metal --example debug_ops -- --case gelu-i
 # Inspect a var's eclass/enodes/children and dtype facts (HLIR-only)
 cargo run -p luminal_bench --features metal --example debug_ops -- --case gelu-inner --inspect-var t24
 
-# Dump the raw egglog program (the `(let tN ...)` program from `hlir_to_egglog`)
+# Dump the display-only typed listing with source tN aliases (not executable Egglog)
 cargo run -p luminal_bench --features metal --example debug_ops -- --case gelu-inner \
-  --dump-egglog target/gelu-inner.egg
+  --dump-egglog target/gelu-inner.txt
 
 # Export structured JSON (useful for repro/diffing)
 cargo run -p luminal_bench --features metal --example debug_ops -- --case gelu-inner --json target/debug_ops.json
 ```
 
 Notes:
-- `--trace-fact` can only evaluate functions that exist in the egglog program (e.g. `dtype`).
+- `--trace-fact` reads already-installed unary table rows (e.g. `dtype`) without evaluation.
   Many values such as shape/strides are encoded as IR term parameters, not as function facts.
+
+Source aliases are diagnostic-only. Source counts exclude the artificial
+`OutputJoin` formerly used to collect outputs, so they may be one lower.
 
 For more options, see:
 

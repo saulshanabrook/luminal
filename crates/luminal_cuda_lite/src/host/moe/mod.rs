@@ -1,15 +1,11 @@
+pub(crate) mod glumoe_rewrite;
+
+use egglog_experimental::typed::{self as typed, TypedError};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, Ir, OpKind};
 use std::sync::{Arc, OnceLock};
 
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{EXPRESSION, OP_KIND},
-        extract_expr,
-    },
-    op::{EgglogOp, LLIROp},
-    prelude::*,
-    shape::Expression,
-};
+use luminal::{op::LLIROp, prelude::*, shape::Expression};
 
 use crate::{
     compile_module_image_for_current_device,
@@ -97,23 +93,6 @@ impl GLUMoEMode {
         match self {
             Self::SwiGLU | Self::SwiGLUNormalized => 0,
             Self::GemmaGELU => 1,
-        }
-    }
-}
-
-impl Default for GLUMoE {
-    fn default() -> Self {
-        Self {
-            mode: GLUMoEMode::SwiGLU,
-            gu_io: Expression::default(),
-            dn_io: Expression::default(),
-            gu_matmul_k: Expression::default(),
-            dn_matmul_k: Expression::default(),
-            output_k: Expression::default(),
-            gu_within_range: Expression::default(),
-            dn_within_range: Expression::default(),
-            cublaslt: OnceLock::new(),
-            module: OnceLock::new(),
         }
     }
 }
@@ -207,67 +186,79 @@ extern "C" __global__ void glu_activation_bf16(
     }
 }
 
-impl EgglogOp for GLUMoE {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "GLUMoE",
-            &[
-                ("gu_io", EXPRESSION),
-                ("dn_io", EXPRESSION),
-                ("gu_matmul_k", EXPRESSION),
-                ("dn_matmul_k", EXPRESSION),
-                ("output_k", EXPRESSION),
-                ("gu_within_range", EXPRESSION),
-                ("dn_within_range", EXPRESSION),
-                ("mode", EXPRESSION),
-            ],
-        )
+impl Default for GLUMoE {
+    fn default() -> Self {
+        Self {
+            mode: GLUMoEMode::SwiGLU,
+            gu_io: Expression::default(),
+            dn_io: Expression::default(),
+            gu_matmul_k: Expression::default(),
+            dn_matmul_k: Expression::default(),
+            output_k: Expression::default(),
+            gu_within_range: Expression::default(),
+            dn_within_range: Expression::default(),
+            cublaslt: OnceLock::new(),
+            module: OnceLock::new(),
+        }
     }
+}
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![
-            raw_rules(parser, 
-                "(rule
-                (
-                    (= ?e (Op (GLUMoE ?gu_io ?dn_io ?gu_matmul_k ?dn_matmul_k ?output_k ?gu_within_range ?dn_within_range ?mode) ?inputs))
+impl GLUMoE {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((
+            field_gu_io,
+            field_dn_io,
+            field_gu_matmul_k,
+            field_dn_matmul_k,
+            field_output_k,
+            field_gu_within_range,
+            field_dn_within_range,
+            field_mode,
+        )) = typed::get_args(
+            kind,
+            |gu_io: &DimExpr,
+             dn_io: &DimExpr,
+             gu_matmul_k: &DimExpr,
+             dn_matmul_k: &DimExpr,
+             output_k: &DimExpr,
+             gu_within_range: &DimExpr,
+             dn_within_range: &DimExpr,
+             mode: &DimExpr| {
+                crate::typed_rules::glu_mo_e(
+                    gu_io,
+                    dn_io,
+                    gu_matmul_k,
+                    dn_matmul_k,
+                    output_k,
+                    gu_within_range,
+                    dn_within_range,
+                    mode,
                 )
-                (
-                    (set (dtype ?e) (F32))
-                )
-                :ruleset dtype_prop
-            )",
-            ),
-            raw_rules(parser, include_str!["glumoe_rewrite.egg"]),
-        ]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn n_inputs(&self) -> usize {
-        6
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a luminal::egglog_utils::SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let gu_io = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let dn_io = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let gu_matmul_k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-        let dn_matmul_k = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-        let output_k = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
-        let gu_within_range = extract_expr(egraph, kind_children[5], expr_cache).unwrap();
-        let dn_within_range = extract_expr(egraph, kind_children[6], expr_cache).unwrap();
-        let mode_expr = extract_expr(egraph, kind_children[7], expr_cache).unwrap();
-        let mode_id = mode_expr
-            .to_usize()
-            .unwrap_or_else(|| panic!("GLUMoE mode must be static, got expression: {mode_expr}"));
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let gu_io = context.expression(&field_gu_io)?;
+        let dn_io = context.expression(&field_dn_io)?;
+        let gu_matmul_k = context.expression(&field_gu_matmul_k)?;
+        let dn_matmul_k = context.expression(&field_dn_matmul_k)?;
+        let output_k = context.expression(&field_output_k)?;
+        let gu_within_range = context.expression(&field_gu_within_range)?;
+        let dn_within_range = context.expression(&field_dn_within_range)?;
+        let mode_expr = context.expression(&field_mode)?;
+        let mode_id = mode_expr.to_usize().ok_or_else(|| {
+            TypedError::Decode(format!(
+                "GLUMoE mode must be static, got expression: {mode_expr}"
+            ))
+        })?;
+        if mode_id > 2 {
+            return Err(TypedError::Decode(format!("unknown GLUMoE mode {mode_id}")));
+        }
         let mode = GLUMoEMode::from_mode_id(mode_id);
 
         let extracted = GLUMoE {
@@ -285,15 +276,14 @@ impl EgglogOp for GLUMoE {
 
         let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
         // Return the 6 IR inputs: x, topk_idx, topk_values, gate_up_w, down_w, mode_aux
-        (op, input_enodes)
-    }
-
-    fn cleanup(&self) -> bool {
-        false
+        Ok(Some(op))
     }
 }
 
 impl HostOp for GLUMoE {
+    fn n_inputs(&self) -> usize {
+        6
+    }
     fn execute(
         &self,
         stream: &Arc<CudaStream>,

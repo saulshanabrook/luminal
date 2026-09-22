@@ -1,3 +1,6 @@
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 // =========================================================================
 // Fusion boundary markers — FusionStart and FusionEnd.
 //
@@ -17,19 +20,9 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{DTYPE, ELIST, OP_KIND},
-        extract_dtype, extract_expr_list,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 use crate::kernel::KernelOp;
-
-pub type Ops = (FusionStart, FusionEnd);
 
 type CompileOut = (
     CudaFunction,
@@ -52,47 +45,28 @@ pub struct FusionStart {
     pub(crate) dtype: DType,
 }
 
-impl EgglogOp for FusionStart {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "FusionStart",
-            &[("shape", ELIST), ("strides", ELIST), ("dtype", DTYPE)],
-        )
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // No idempotence rule. `FusionStart(FusionStart(x)) ≡ FusionStart(x)`
-        // would unify nested markers and create eclass cycles via the
-        // pair-fuse rules; without it, occasional re-firings produce extra
-        // semantically-correct identity layers, bounded by the run schedule.
-        Vec::new()
-    };
-        __rules.into_iter().flatten().collect()
-    }
-    fn cleanup(&self) -> bool {
-        false
-    }
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[2]),
-            })),
-            input_enodes,
-        )
+impl FusionStart {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_strides, field_dtype)) = typed::get_args(
+            kind,
+            |shape: &EList, strides: &EList, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::fusion_start(shape, strides, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            strides: decoded_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 
@@ -132,346 +106,493 @@ pub struct FusionEnd {
     pub(crate) dtype: DType,
 }
 
-impl EgglogOp for FusionEnd {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "FusionEnd",
-            &[("shape", ELIST), ("strides", ELIST), ("dtype", DTYPE)],
-        )
-    }
-    fn n_inputs(&self) -> usize {
-        1
-    }
+pub(crate) mod fusion_end {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::builtins as egg;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        // Generic region growth works directly from HLIR elementwise ops into
-        // `Cuda*Elementwise` region nodes. The concrete HLIR op still appears in
-        // the egraph, so fusion remains a normal nondestructive alternative, but
-        // the region-internal representation is arity based instead of one
-        // dedicated fused sort per operation.
-        let mut rules = Vec::new();
+    // No idempotence or dissolve rule: unifying nested FusionStart markers,
+    // or FS(FE(x)) with x, creates eclass cycles after growth. The grow rules
+    // already compose adjacent regions; extra identity layers are bounded by
+    // the run schedule.
 
-        let unaries: &[(&str, &str)] = &[
-            ("Sin", "Sin"),
-            ("Sqrt", "Sqrt"),
-            ("Exp2", "Exp2"),
-            ("Log2", "Log2"),
-            ("Recip", "Recip"),
+    #[ruleset]
+    pub(crate) fn fusion_grow(
+        shape: &EList,
+        s: &EList,
+        dt: &DType,
+        inner: &Ir,
+        fe: &Ir,
+        u: &Ir,
+        dt_in: &DType,
+        size: &DimExpr,
+        dt_out: &DType,
+        cast: &Ir,
+        x: &Ir,
+        fs_c: &Ir,
+        a_s: &EList,
+        inner_a: &Ir,
+        b_s: &EList,
+        out_s: &EList,
+        b: &Ir,
+        bin: &Ir,
+        inner_b: &Ir,
+        a: &Ir,
+        fs_u: &Ir,
+        fs_bin: &Ir,
+    ) -> Vec<Rule> {
+        let unaries = [
+            ("Sin", OpKind::Sin(shape, s, s)),
+            ("Sqrt", OpKind::Sqrt(shape, s, s)),
+            ("Exp2", OpKind::Exp2(shape, s, s)),
+            ("Log2", OpKind::Log2(shape, s, s)),
+            ("Recip", OpKind::Recip(shape, s, s)),
         ];
-        let binaries: &[(&str, &str)] = &[("Add", "Add"), ("Mul", "Mul")];
-
-        // Grow FE → unary consumer: U(FE(inner)) → FE(CudaUnary(inner)).
-        for (hlir, opcode) in unaries {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
-                    (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?fe (INil))))
-                 ) (
-                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                   (ICons ?inner (INil))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?elem (INil))))
-                    (union ?u ?new_fe)
-                    (set (dtype ?new_fe) ?dt)
-                 ) :ruleset fusion_grow :name \"grow-FE-U-{hlir}\")"
-            )));
+        let binaries = [
+            ("Add", OpKind::Add(shape, a_s, b_s, out_s)),
+            ("Mul", OpKind::Mul(shape, a_s, b_s, out_s)),
+        ];
+        let fs_b = &Ir::Op(fusion_start(shape, b_s, dt), [b]);
+        let fs_a = &Ir::Op(fusion_start(shape, a_s, dt), [a]);
+        let fs_x = &Ir::Op(fusion_start(shape, s, dt), [x]);
+        let mut rules = Vec::new();
+        for (opcode, hlir) in &unaries {
+            let element = &Ir::Op(cuda_unary_elementwise(*opcode, shape, s, s, dt), [inner]);
+            let end = &Ir::Op(fusion_end(shape, s, dt), [element]);
+            rules.push(
+                rule(
+                    (
+                        eq(fe, Ir::Op(fusion_end(shape, s, dt), [inner])),
+                        eq(u, Ir::Op(hlir, [fe])),
+                    ),
+                    (element, end, union(u, end), set(end.dtype(), dt)),
+                )
+                .label(format!("grow-FE-U-{opcode}")),
+            );
         }
-
-        // Grow FE → Cast consumer: Cast(FE(inner)) → FE(CudaCast(inner)).
-        // Cast is the one region op whose output dtype differs from its
-        // input's; the new FE takes the cast's target dtype. HLIR Cast is
-        // positionwise (out[z] = (T)in[z]), so it preserves the producer's
-        // layout and the FE's shape/strides carry over unchanged.
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
-                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?fe (INil))))
-             ) (
-                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                               (ICons ?inner (INil))))
-                (let ?new_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?elem (INil))))
-                (union ?cast ?new_fe)
-                (set (dtype ?new_fe) ?dt_out)
-             ) :ruleset fusion_grow :name \"grow-FE-Cast\")",
-        ));
-
-        // Absorb a Cast producer through a FusionStart boundary:
-        // FS(Cast(x)) → CudaCast(FS(x)). The region reads x with the same
-        // strides it would have used on the cast's output (cast preserves
-        // layout) and converts in-register.
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
-                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
-                (= ?dt_in (dtype ?x))
-             ) (
-                (let ?fs_x (Op (FusionStart ?shape ?s ?dt_in) (ICons ?x (INil))))
-                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                               (ICons ?fs_x (INil))))
-                (union ?fs_c ?elem)
-             ) :ruleset fusion_grow :name \"grow-Cast-FS\")",
-        ));
-
-        // Cast variant of the nested-FS-FE cleanup. Without it, the
-        // grow-FE-Cast + grow-Cast-FS pair congruence-merges an FS eclass
-        // with the FE eclass it wraps (FS(dt_in)(FE-result) vs the fused
-        // cast elem reading the FE's interior), leaving a 2-node FS/FE
-        // cycle that extraction can select. Deleting the redundant
-        // FS-wrapping-FE enode breaks the cycle; the fused form remains.
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
-                (= ?bad_fs (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
-                (= ?bad_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                                 (ICons ?bad_fs (INil))))
-                (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?bad_elem (INil))))
-                (= ?good_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                                  (ICons ?inner (INil))))
-                (= ?good_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?good_elem (INil))))
-                (= ?bad_fe ?good_fe)
-             ) (
-                (delete (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
-             ) :ruleset cleanup :name \"cleanup-nested-FS-FE-cast\")",
-        ));
-
-        // Genome freeze: grow-Cast-FS leaves each cast-bearing FS eclass
-        // with two extraction-equivalent variants — the bare FS reading the
-        // materialized cast output, and the absorbed CudaCast reading the
-        // original buffer and converting in-register. Both wirings move
-        // the same bytes for the bandwidth-bound regions they sit in, but
-        // each pair doubles the search genome and makes candidates emit
-        // textually fresh region kernels. Delete the bare-FS variant once
-        // growth is done (cleanup runs after the fusion_grow cycles, so
-        // the row is not re-derived); the premise proves the absorbed
-        // survivor exists in the same eclass, so the eclass never empties.
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
-                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
-                (= ?fs_c (Op (CudaUnaryElementwise \"Cast\" ?shape ?is ?os ?dt_out)
-                             (ICons ?fs_x (INil))))
-             ) (
-                (delete (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
-             ) :ruleset cleanup :name \"cleanup-FS-with-absorbed-cast\")",
-        ));
-
-        // Grow FE → binary consumer, left and right orientations.
-        for (hlir, opcode) in binaries {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?fe (ICons ?b (INil)))))
-                 ) (
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?inner_a (ICons ?fs_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt)
-                 ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{hlir}\")"
-            )));
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?a (ICons ?fe (INil)))))
-                 ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?fs_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt)
-                 ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{hlir}\")"
-            )));
+        let cast_op = &Ir::Op(cuda_unary_elementwise("Cast", shape, s, s, dt_out), [inner]);
+        let cast_end = &Ir::Op(fusion_end(shape, s, dt_out), [cast_op]);
+        let cast_start = &Ir::Op(fusion_start(shape, s, dt_in), [x]);
+        let cast_started = &Ir::Op(
+            cuda_unary_elementwise("Cast", shape, s, s, dt_out),
+            [cast_start],
+        );
+        rules.extend([
+            rule(
+                (
+                    eq(fe, Ir::Op(fusion_end(shape, s, dt_in), [inner])),
+                    eq(cast, Ir::Op(OpKind::Cast(size, dt_out), [fe])),
+                ),
+                (
+                    cast_op,
+                    cast_end,
+                    union(cast, cast_end),
+                    set(cast_end.dtype(), dt_out),
+                ),
+            )
+            .label("grow-FE-Cast"),
+            rule(
+                (
+                    eq(cast, Ir::Op(OpKind::Cast(size, dt_out), [x])),
+                    eq(fs_c, Ir::Op(fusion_start(shape, s, dt_out), [cast])),
+                    eq(dt_in, x.dtype()),
+                ),
+                (cast_start, cast_started, union(fs_c, cast_started)),
+            )
+            .label("grow-Cast-FS"),
+        ]);
+        for (opcode, hlir) in &binaries {
+            let lhs = &Ir::Op(
+                cuda_binary_elementwise(*opcode, shape, a_s, b_s, out_s, dt),
+                [inner_a, fs_b],
+            );
+            let lhs_end = &Ir::Op(fusion_end(shape, out_s, dt), [lhs]);
+            let rhs = &Ir::Op(
+                cuda_binary_elementwise(*opcode, shape, a_s, b_s, out_s, dt),
+                [fs_a, inner_b],
+            );
+            let rhs_end = &Ir::Op(fusion_end(shape, out_s, dt), [rhs]);
+            rules.extend([
+                rule(
+                    (
+                        eq(fe, Ir::Op(fusion_end(shape, a_s, dt), [inner_a])),
+                        eq(bin, Ir::Op(hlir, [fe, b])),
+                    ),
+                    (
+                        fs_b,
+                        lhs,
+                        lhs_end,
+                        union(bin, lhs_end),
+                        set(lhs_end.dtype(), dt),
+                    ),
+                )
+                .label(format!("grow-FE-B-lhs-{opcode}")),
+                rule(
+                    (
+                        eq(fe, Ir::Op(fusion_end(shape, b_s, dt), [inner_b])),
+                        eq(bin, Ir::Op(hlir, [a, fe])),
+                    ),
+                    (
+                        fs_a,
+                        rhs,
+                        rhs_end,
+                        union(bin, rhs_end),
+                        set(rhs_end.dtype(), dt),
+                    ),
+                )
+                .label(format!("grow-FE-B-rhs-{opcode}")),
+            ]);
         }
-
-        // Absorb an elementwise producer through a FusionStart boundary. This
-        // makes a region that initially treats `producer(...)` as an external
-        // input able to pull that producer inside later.
-        for (hlir, opcode) in unaries {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?x (INil))))
-                    (= ?fs_u (Op (FusionStart ?shape ?s ?dt) (ICons ?u (INil))))
-                 ) (
-                    (let ?fs_x (Op (FusionStart ?shape ?s ?dt) (ICons ?x (INil))))
-                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                   (ICons ?fs_x (INil))))
-                    (union ?fs_u ?elem)
-                 ) :ruleset fusion_grow :name \"grow-U-FS-{hlir}\")"
-            )));
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?bad_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                     (ICons ?bad_fs (INil))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                      (ICons ?inner (INil))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-unary-{hlir}\")"
-            )));
+        for (opcode, hlir) in &unaries {
+            let element = &Ir::Op(cuda_unary_elementwise(*opcode, shape, s, s, dt), [fs_x]);
+            rules.push(
+                rule(
+                    (
+                        eq(u, Ir::Op(hlir, [x])),
+                        eq(fs_u, Ir::Op(fusion_start(shape, s, dt), [u])),
+                    ),
+                    (fs_x, element, union(fs_u, element)),
+                )
+                .label(format!("grow-U-FS-{opcode}")),
+            );
         }
-        for (hlir, opcode) in binaries {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?a (ICons ?b (INil)))))
-                    (= ?fs_bin (Op (FusionStart ?shape ?out_s ?dt) (ICons ?bin (INil))))
-                 ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?fs_a (ICons ?fs_b (INil)))))
-                    (union ?fs_bin ?elem)
-                 ) :ruleset fusion_grow :name \"grow-B-FS-{hlir}\")"
-            )));
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                     (ICons ?bad_fs (ICons ?fs_b (INil)))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                      (ICons ?inner_a (ICons ?fs_b (INil)))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-lhs-{hlir}\")"
-            )));
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                     (ICons ?fs_a (ICons ?bad_fs (INil)))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                      (ICons ?fs_a (ICons ?inner_b (INil)))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-rhs-{hlir}\")"
-            )));
+        for (opcode, hlir) in &binaries {
+            let element = &Ir::Op(
+                cuda_binary_elementwise(*opcode, shape, a_s, b_s, out_s, dt),
+                [fs_a, fs_b],
+            );
+            rules.push(
+                rule(
+                    (
+                        eq(bin, Ir::Op(hlir, [a, b])),
+                        eq(fs_bin, Ir::Op(fusion_start(shape, out_s, dt), [bin])),
+                    ),
+                    (fs_a, fs_b, element, union(fs_bin, element)),
+                )
+                .label(format!("grow-B-FS-{opcode}")),
+            );
         }
-
-        // Merge two FEs at a binary: B(FE(ia), FE(ib)) → FE(CudaBinary(ia, ib)).
-        for (hlir, opcode) in binaries {
-            rules.push(raw_rules(parser, format!(
-                "(rule (
-                    (= ?fe_a (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (= ?fe_b (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?fe_a (ICons ?fe_b (INil)))))
-                 ) (
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                   (ICons ?inner_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt)
-                 ) :ruleset fusion_merge :name \"merge-FE-FE-{hlir}\")"
-            )));
-        }
-
-        // No dissolve rule (`FS(FE(x)) → x`): unioning FS's eclass with FE's
-        // inner eclass creates self-referential eclasses after grow rules
-        // extend the downstream region, and extraction then panics with
-        // `Cycle(NodeIndex(_))`. Grow rules already compose adjacent regions
-        // correctly without dissolve.
-
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-unary-shape\")",
-        ));
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-unary-strides\")",
-        ));
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-binary-shape\")",
-        ));
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-binary-strides\")",
-        ));
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-nested-shape\")",
-        ));
-        rules.push(raw_rules(parser, 
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-nested-strides\")",
-        ));
-
         rules
-    };
-        __rules.into_iter().flatten().collect()
     }
 
-    fn cleanup(&self) -> bool {
-        false
+    #[ruleset]
+    pub(crate) fn cleanup(
+        shape: &EList,
+        s: &EList,
+        dt_in: &DType,
+        inner: &Ir,
+        inner_fe: &Ir,
+        bad_fs: &Ir,
+        dt_out: &DType,
+        bad_elem: &Ir,
+        bad_fe: &Ir,
+        good_elem: &Ir,
+        good_fe: &Ir,
+        size: &DimExpr,
+        x: &Ir,
+        cast: &Ir,
+        fs_c: &Ir,
+        is: &EList,
+        os: &EList,
+        fs_x: &Ir,
+        dt: &DType,
+        a_s: &EList,
+        inner_a: &Ir,
+        b_s: &EList,
+        b: &Ir,
+        fs_b: &Ir,
+        out_s: &EList,
+        inner_b: &Ir,
+        a: &Ir,
+        fs_a: &Ir,
+        fe_shape: &EList,
+        fe_s: &EList,
+        op: &egg::String,
+        inner_shape: &EList,
+        inner_in_s: &EList,
+        inner_s: &EList,
+        inner_inputs: &IList,
+    ) -> Vec<Rule> {
+        let mut rules = vec![
+            rule(
+                (
+                    // Cast growth can merge FS with the FE it wraps. The
+                    // fused survivor below proves deleting the redundant
+                    // FS-wrapping-FE breaks the cycle without emptying it.
+                    eq(inner_fe, Ir::Op(fusion_end(shape, s, dt_in), [inner])),
+                    eq(bad_fs, Ir::Op(fusion_start(shape, s, dt_in), [inner_fe])),
+                    eq(
+                        bad_elem,
+                        Ir::Op(
+                            cuda_unary_elementwise("Cast", shape, s, s, dt_out),
+                            [bad_fs],
+                        ),
+                    ),
+                    eq(bad_fe, Ir::Op(fusion_end(shape, s, dt_out), [bad_elem])),
+                    eq(
+                        good_elem,
+                        Ir::Op(cuda_unary_elementwise("Cast", shape, s, s, dt_out), [inner]),
+                    ),
+                    eq(good_fe, Ir::Op(fusion_end(shape, s, dt_out), [good_elem])),
+                    eq(bad_fe, good_fe),
+                ),
+                (delete(Ir::Op(fusion_start(shape, s, dt_in), [inner_fe])),),
+            )
+            .label("cleanup-nested-FS-FE-cast"),
+            // Genome freeze: bare-FS and absorbed-Cast variants move the same
+            // bytes but double the search genome and produce fresh kernels.
+            // Cleanup runs after growth, so the deleted variant is not rederived.
+            rule(
+                (
+                    eq(cast, Ir::Op(OpKind::Cast(size, dt_out), [x])),
+                    eq(fs_c, Ir::Op(fusion_start(shape, s, dt_out), [cast])),
+                    eq(
+                        fs_c,
+                        Ir::Op(
+                            cuda_unary_elementwise("Cast", shape, is, os, dt_out),
+                            [fs_x],
+                        ),
+                    ),
+                ),
+                (delete(Ir::Op(fusion_start(shape, s, dt_out), [cast])),),
+            )
+            .label("cleanup-FS-with-absorbed-cast"),
+        ];
+        for opcode in ["Sin", "Sqrt", "Exp2", "Log2", "Recip"] {
+            rules.push(
+                rule(
+                    (
+                        eq(inner_fe, Ir::Op(fusion_end(shape, s, dt), [inner])),
+                        eq(bad_fs, Ir::Op(fusion_start(shape, s, dt), [inner_fe])),
+                        eq(
+                            bad_elem,
+                            Ir::Op(cuda_unary_elementwise(opcode, shape, s, s, dt), [bad_fs]),
+                        ),
+                        eq(bad_fe, Ir::Op(fusion_end(shape, s, dt), [bad_elem])),
+                        eq(
+                            good_elem,
+                            Ir::Op(cuda_unary_elementwise(opcode, shape, s, s, dt), [inner]),
+                        ),
+                        eq(good_fe, Ir::Op(fusion_end(shape, s, dt), [good_elem])),
+                        eq(bad_fe, good_fe),
+                    ),
+                    (delete(Ir::Op(fusion_start(shape, s, dt), [inner_fe])),),
+                )
+                .label(format!("cleanup-nested-FS-FE-unary-{opcode}")),
+            );
+        }
+        for opcode in ["Add", "Mul"] {
+            rules.push(
+                rule(
+                    (
+                        eq(inner_fe, Ir::Op(fusion_end(shape, a_s, dt), [inner_a])),
+                        eq(bad_fs, Ir::Op(fusion_start(shape, a_s, dt), [inner_fe])),
+                        eq(fs_b, Ir::Op(fusion_start(shape, b_s, dt), [b])),
+                        eq(
+                            bad_elem,
+                            Ir::Op(
+                                cuda_binary_elementwise(opcode, shape, a_s, b_s, out_s, dt),
+                                [bad_fs, fs_b],
+                            ),
+                        ),
+                        eq(bad_fe, Ir::Op(fusion_end(shape, out_s, dt), [bad_elem])),
+                        eq(
+                            good_elem,
+                            Ir::Op(
+                                cuda_binary_elementwise(opcode, shape, a_s, b_s, out_s, dt),
+                                [inner_a, fs_b],
+                            ),
+                        ),
+                        eq(good_fe, Ir::Op(fusion_end(shape, out_s, dt), [good_elem])),
+                        eq(bad_fe, good_fe),
+                    ),
+                    (delete(Ir::Op(fusion_start(shape, a_s, dt), [inner_fe])),),
+                )
+                .label(format!("cleanup-nested-FS-FE-binary-lhs-{opcode}")),
+            );
+            rules.push(
+                rule(
+                    (
+                        eq(inner_fe, Ir::Op(fusion_end(shape, b_s, dt), [inner_b])),
+                        eq(bad_fs, Ir::Op(fusion_start(shape, b_s, dt), [inner_fe])),
+                        eq(fs_a, Ir::Op(fusion_start(shape, a_s, dt), [a])),
+                        eq(
+                            bad_elem,
+                            Ir::Op(
+                                cuda_binary_elementwise(opcode, shape, a_s, b_s, out_s, dt),
+                                [fs_a, bad_fs],
+                            ),
+                        ),
+                        eq(bad_fe, Ir::Op(fusion_end(shape, out_s, dt), [bad_elem])),
+                        eq(
+                            good_elem,
+                            Ir::Op(
+                                cuda_binary_elementwise(opcode, shape, a_s, b_s, out_s, dt),
+                                [fs_a, inner_b],
+                            ),
+                        ),
+                        eq(good_fe, Ir::Op(fusion_end(shape, out_s, dt), [good_elem])),
+                        eq(bad_fe, good_fe),
+                    ),
+                    (delete(Ir::Op(fusion_start(shape, b_s, dt), [inner_fe])),),
+                )
+                .label(format!("cleanup-nested-FS-FE-binary-rhs-{opcode}")),
+            );
+        }
+        rules.extend([
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(
+                            cuda_unary_elementwise(op, inner_shape, inner_in_s, inner_s, dt),
+                            inner_inputs,
+                        ),
+                    ),
+                    ne(fe_shape, inner_shape),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-unary-shape"),
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(
+                            cuda_unary_elementwise(op, inner_shape, inner_in_s, inner_s, dt),
+                            inner_inputs,
+                        ),
+                    ),
+                    ne(fe_s, inner_s),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-unary-strides"),
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(
+                            CudaBinaryElementwiseArgs {
+                                shape: inner_shape.into(),
+                                dtype: dt.into(),
+                                ..CudaBinaryElementwiseArgs::fresh()
+                            },
+                            inner_inputs,
+                        ),
+                    ),
+                    ne(fe_shape, inner_shape),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-binary-shape"),
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(
+                            CudaBinaryElementwiseArgs {
+                                out_strides: inner_s.into(),
+                                dtype: dt.into(),
+                                ..CudaBinaryElementwiseArgs::fresh()
+                            },
+                            inner_inputs,
+                        ),
+                    ),
+                    ne(fe_s, inner_s),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-binary-strides"),
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(fusion_end(inner_shape, inner_s, dt), inner_inputs),
+                    ),
+                    ne(fe_shape, inner_shape),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-nested-shape"),
+            rule(
+                (
+                    Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner]),
+                    eq(
+                        inner,
+                        Ir::Op(fusion_end(inner_shape, inner_s, dt), inner_inputs),
+                    ),
+                    ne(fe_s, inner_s),
+                ),
+                (delete(Ir::Op(fusion_end(fe_shape, fe_s, dt), [inner])),),
+            )
+            .label("delete-malformed-FE-nested-strides"),
+        ]);
+        rules
     }
 
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[2]),
-            })),
-            input_enodes,
-        )
+    #[ruleset]
+    pub(crate) fn fusion_merge(
+        shape: &EList,
+        a_s: &EList,
+        dt: &DType,
+        inner_a: &Ir,
+        b_s: &EList,
+        inner_b: &Ir,
+        out_s: &EList,
+        bin: &Ir,
+    ) -> Vec<Rule> {
+        [
+            ("Add", OpKind::Add(shape, a_s, b_s, out_s)),
+            ("Mul", OpKind::Mul(shape, a_s, b_s, out_s)),
+        ]
+        .into_iter()
+        .map(|(opcode, hlir)| {
+            let element = &Ir::Op(
+                cuda_binary_elementwise(opcode, shape, a_s, b_s, out_s, dt),
+                [inner_a, inner_b],
+            );
+            let fused = &Ir::Op(fusion_end(shape, out_s, dt), [element]);
+            let fe_a = &Ir::Op(fusion_end(shape, a_s, dt), [inner_a]);
+            let fe_b = &Ir::Op(fusion_end(shape, b_s, dt), [inner_b]);
+            rule(
+                (eq(bin, Ir::Op(hlir, [fe_a, fe_b])),),
+                (element, fused, union(bin, fused), set(fused.dtype(), dt)),
+            )
+            .label(format!("merge-FE-FE-{opcode}"))
+        })
+        .collect()
+    }
+}
+
+impl FusionEnd {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_shape, field_strides, field_dtype)) = typed::get_args(
+            kind,
+            |shape: &EList, strides: &EList, dtype: &luminal::typed_reference::schema::DType| {
+                crate::typed_rules::fusion_end(shape, strides, dtype)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let decoded_shape = context.expressions(&field_shape)?;
+        let decoded_strides = context.expressions(&field_strides)?;
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            shape: decoded_shape,
+            strides: decoded_strides,
+            dtype: context.dtype(&field_dtype)?,
+        }))))
     }
 }
 

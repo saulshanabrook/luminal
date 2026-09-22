@@ -13,6 +13,9 @@
 //! the three-kernel chain. The scaled-fp8 cuBLASLt rewrite consumes the same
 //! eclass as its A input, so this slots in front of every fp8 GEMM.
 
+use egglog_experimental::typed::{self as typed, TypedError, builtins as egg};
+use luminal::egglog_utils::DecodeContext;
+use luminal::typed_reference::schema::{DimExpr, EList, IList, Ir, OpKind};
 use std::sync::Arc;
 
 use crate::{
@@ -20,15 +23,7 @@ use crate::{
     kernel::{KernelOp, hlir::dtype_includes, hlir::generate_dyn_dims_defines},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    egglog_utils::{
-        api::{SortDef, sort},
-        base::{EXPRESSION, OP_KIND},
-        extract_expr,
-    },
-    op::*,
-    prelude::*,
-};
+use luminal::{op::*, prelude::*};
 
 const TPB: usize = 256;
 
@@ -37,59 +32,50 @@ pub struct KernelQuantF8 {
     size: Expression,
 }
 
-impl EgglogOp for KernelQuantF8 {
-    fn sort(&self) -> SortDef {
-        sort(OP_KIND, "KernelQuantF8", &[("size", EXPRESSION)])
-    }
+pub(crate) mod kernel_quant_f8 {
+    use crate::typed_rules::*;
+    use egglog_experimental::typed::prelude::*;
+    use luminal::typed_reference::schema::*;
 
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
-        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
-        vec![raw_rules(parser, 
-            "(rule
-                (
-                    (= ?xf (Op (Cast ?xf_size (F32)) (ICons ?x (INil))))
-                    (= (Bf16) (dtype ?x))
-                    (= ?recip (Op (Recip ?r_shape ?r_in_strides ?r_out_strides)
-                        (ICons ?scale (INil))))
-                    (= ?mul (Op (Mul ?m_shape ?xf_strides ?recip_strides ?m_out_strides)
-                        (ICons ?xf (ICons ?recip (INil)))))
-                    (= ?q (Op (Cast ?q_size (F8E4M3)) (ICons ?mul (INil))))
-                )
-                (
-                    (let ?kq (Op (KernelQuantF8 ?q_size) (ICons ?x (ICons ?scale (INil)))))
-                    (union ?q ?kq)
-                    (set (dtype ?kq) (F8E4M3))
-                )
-                :ruleset kernel_specialize
-                :name \"kernel quant f8 from bf16\"
-            )",
-        )]
-    };
-        __rules.into_iter().flatten().collect()
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                size: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
+    #[ruleset]
+    pub(crate) fn kernel_specialize(
+        xf_size: &DimExpr,
+        x: &Ir,
+        scale: &Ir,
+        q_size: &DimExpr,
+        q: &Ir,
+    ) -> Rule {
+        let kq = &Ir::Op(kernel_quant_f8(q_size), [x, scale]);
+        let xf = &Ir::Op(OpKind::Cast(xf_size, DType::F32()), [x]);
+        let recip = &Ir::Op(RecipArgs::fresh(), [scale]);
+        let mul = &Ir::Op(MulArgs::fresh(), [xf, recip]);
+        rule(
+            (
+                eq(DType::Bf16(), x.dtype()),
+                eq(q, Ir::Op(OpKind::Cast(q_size, DType::F8E4M3()), [mul])),
+            ),
+            (kq, union(q, kq), set(kq.dtype(), DType::F8E4M3())),
         )
+        .label("kernel quant f8 from bf16")
+    }
+}
+
+impl KernelQuantF8 {
+    pub fn decode(
+        kind: &OpKind,
+        _inputs: &mut Vec<Ir>,
+        context: &mut DecodeContext<'_, '_>,
+    ) -> Result<Option<LLIROp>, TypedError> {
+        let Some((field_size,)) = typed::get_args(kind, |size: &DimExpr| {
+            crate::typed_rules::kernel_quant_f8(size)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LLIROp::new::<dyn KernelOp>(Box::new(Self {
+            size: context.expression(&field_size)?,
+        })
+            as Box<dyn KernelOp>)))
     }
 }
 

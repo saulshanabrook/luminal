@@ -8,13 +8,11 @@
 //!
 //! Usage examples: see `crates/luminal_bench/README.md`.
 
-use luminal::op::IntoEgglogOp;
 use luminal::prelude::*;
-use luminal::{egglog_utils::hlir_to_egglog, hlir::HLIROps};
 use luminal_bench::egglog_debug::{
-    DebugReport, FactQuery, analyze_hlir_dtype_chain, analyze_hlir_function_chain,
-    analyze_lowering, analyze_with_ops, inspect_var_hlir, print_dtype_chain, print_function_chain,
-    print_lowering_analysis, print_var_inspection, summarize_egglog_ops, summarize_hlir_ops,
+    DebugReport, DependencyGraph, FactQuery, analyze, analyze_dtype_chain, analyze_function_chain,
+    inspect_var, print_dtype_chain, print_function_chain, print_lowering_analysis,
+    print_var_inspection, run_egraph, summarize_egglog_ops, summarize_hlir_ops,
 };
 
 // ============================================================================
@@ -274,8 +272,8 @@ fn parse_args() -> Args {
                       --inspect-op HLIR:Backend  Check backend coverage for an op mapping\n  \
                       --check KIND         Run checks: missing-backend|dtype|fn|all\n  \
                       --json PATH          Write JSON report (use '-' for stdout)\n  \
-                      --dump-egglog PATH  Write egglog program to file\n  \
-                      --print-egglog      Print egglog program to stdout\n  \
+                      --dump-egglog PATH  Write display-only typed listing to file\n  \
+                      --print-egglog      Print display-only typed listing\n  \
                       --help              Show this help"
                 );
                 std::process::exit(0);
@@ -323,7 +321,6 @@ fn parse_args() -> Args {
 fn run_case<B: BackendConfig>(case: Case, size: usize, args: &Args)
 where
     B::Runtime: luminal::op::Runtime,
-    <B::Runtime as luminal::op::Runtime>::Ops: luminal::op::IntoEgglogOp,
 {
     println!(
         "\n=== Case: {} (size={}) [{}] ===",
@@ -343,8 +340,9 @@ where
         println!("  {}: {}", k, v);
     }
 
-    // Get egglog program
-    let (program, root) = hlir_to_egglog(&cx);
+    // Retain source aliases for typed diagnostic lookup.
+    let program = DependencyGraph::from_hlir(&cx).expect("typed diagnostic inputs");
+    let root = program.roots.join(", ");
 
     // Summarize egglog ops
     let egglog_counts = summarize_egglog_ops(&program);
@@ -367,32 +365,28 @@ where
             base_path.clone()
         };
 
-        let content = format!("; hlir_to_egglog dump\n; root: {root}\n{program}");
+        let content = format!(
+            "// Display-only typed HLIR; not executable Egglog\n// roots: {root}\n{}",
+            program.display_program()
+        );
         std::fs::write(&path, content).expect("Failed to write egglog file");
-        println!("Wrote egglog program to {}", path.display());
+        println!("Wrote display-only typed listing to {}", path.display());
     }
 
     if args.print_egglog {
-        println!("-- Egglog program --\n{program}");
+        println!(
+            "-- Egglog authoring (display only) --\n{}",
+            program.display_program()
+        );
     }
 
     let find_vars_by_head = |head: &str| -> Vec<String> {
-        let mut vars = Vec::new();
-        for line in program.lines() {
-            let line = line.trim();
-            if !line.starts_with("(let ") {
-                continue;
-            }
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() >= 3 && tokens[0] == "(let" {
-                let var = tokens[1].to_string();
-                let op = tokens[2].trim_start_matches('(');
-                if op == head {
-                    vars.push(var);
-                }
-            }
-        }
-        vars
+        program
+            .order
+            .iter()
+            .filter(|name| program.nodes[*name].op_type == head)
+            .cloned()
+            .collect()
     };
 
     // Validate any pending --within-op pairing.
@@ -422,17 +416,33 @@ where
     let need_backend_analysis = args.analyze || !args.inspect_ops.is_empty();
     let need_hlir_analysis = args.analyze || !fact_queries.is_empty();
 
+    let hlir_frozen = (need_backend_analysis
+        || need_hlir_analysis
+        || !args.trace_facts.is_empty()
+        || !args.inspect_vars.is_empty())
+    .then(|| run_egraph::<ReferenceRuntime>(&program))
+    .transpose()
+    .expect("HLIR diagnostic execution");
     if need_backend_analysis {
-        let (hlir, backend) =
-            analyze_lowering::<B::Runtime>(&program, &root, &fact_queries, &args.inspect_ops);
-        hlir_analysis = Some(hlir);
-        backend_analysis = Some(backend);
-    } else if need_hlir_analysis {
-        let hlir_ops = <HLIROps as IntoEgglogOp>::into_vec();
-        hlir_analysis = Some(analyze_with_ops(
+        hlir_analysis = Some(analyze(
+            hlir_frozen.as_ref().unwrap(),
             &program,
-            &root,
-            hlir_ops,
+            "HLIR",
+            &fact_queries,
+            &[],
+        ));
+        let backend = run_egraph::<B::Runtime>(&program).expect("backend diagnostic execution");
+        backend_analysis = Some(analyze(
+            &backend,
+            &program,
+            &format!("{}+HLIR", B::NAME),
+            &fact_queries,
+            &args.inspect_ops,
+        ));
+    } else if need_hlir_analysis {
+        hlir_analysis = Some(analyze(
+            hlir_frozen.as_ref().unwrap(),
+            &program,
             "HLIR",
             &fact_queries,
             &[],
@@ -458,12 +468,18 @@ where
     for (fn_name, var) in &args.trace_facts {
         if fn_name == "dtype" {
             println!("-- Trace dtype chain for {} (HLIR-only) --", var);
-            let chain = analyze_hlir_dtype_chain(&program, var);
+            let chain = analyze_dtype_chain(hlir_frozen.as_ref().unwrap(), &program, var);
             print_dtype_chain(&chain);
             // Also record a function-trace entry for JSON output.
-            function_traces.push(analyze_hlir_function_chain(&program, fn_name, var));
+            function_traces.push(analyze_function_chain(
+                hlir_frozen.as_ref().unwrap(),
+                &program,
+                fn_name,
+                var,
+            ));
         } else {
-            let trace = analyze_hlir_function_chain(&program, fn_name, var);
+            let trace =
+                analyze_function_chain(hlir_frozen.as_ref().unwrap(), &program, fn_name, var);
             print_function_chain(&trace);
             function_traces.push(trace);
         }
@@ -503,11 +519,21 @@ where
             );
             println!("  ❌ first missing at: {}", var);
             if req.fn_name == "dtype" {
-                let chain = analyze_hlir_dtype_chain(&program, &var);
+                let chain = analyze_dtype_chain(hlir_frozen.as_ref().unwrap(), &program, &var);
                 print_dtype_chain(&chain);
-                function_traces.push(analyze_hlir_function_chain(&program, "dtype", &var));
+                function_traces.push(analyze_function_chain(
+                    hlir_frozen.as_ref().unwrap(),
+                    &program,
+                    "dtype",
+                    &var,
+                ));
             } else {
-                let trace = analyze_hlir_function_chain(&program, &req.fn_name, &var);
+                let trace = analyze_function_chain(
+                    hlir_frozen.as_ref().unwrap(),
+                    &program,
+                    &req.fn_name,
+                    &var,
+                );
                 print_function_chain(&trace);
                 function_traces.push(trace);
             }
@@ -523,7 +549,7 @@ where
     let mut var_inspections = Vec::new();
     if !args.inspect_vars.is_empty() {
         for var in &args.inspect_vars {
-            let inspection = inspect_var_hlir(&program, var);
+            let inspection = inspect_var(hlir_frozen.as_ref().unwrap(), &program, var, "HLIR");
             print_var_inspection(&inspection);
             var_inspections.push(inspection);
         }

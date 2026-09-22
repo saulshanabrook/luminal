@@ -1,8 +1,9 @@
+use super::utilities::op_candidates;
 use half::bf16;
 use luminal::{dtype::DType, prelude::*, shape::Expression};
 
 use super::utilities::{assert_close, get_cuda_stream, random_f32_vec};
-use crate::{host::moe::GLUMoE, runtime::CudaRuntime};
+use crate::runtime::CudaRuntime;
 
 const SEQ: usize = 2;
 const HIDDEN: usize = 32;
@@ -10,6 +11,55 @@ const NUM_EXPERTS: usize = 8;
 const TOP_K: usize = 2;
 const MOE_INTERMEDIATE: usize = 12;
 const RMS_NORM_EPS: f32 = 1e-6;
+
+#[test]
+fn disabled_glumoe_dtype_rule_is_inert_for_authored_models() {
+    use egglog_experimental::typed::{EgglogValue, ruleset};
+    use luminal::egglog_utils::RewritePhase;
+    use luminal::typed_reference::schema::OpKind;
+
+    for build in [
+        (|| build_qwen_moe_graph().graph) as fn() -> Graph,
+        (|| build_gemma_moe_graph().graph) as fn() -> Graph,
+    ] {
+        for keep_dtype_rule in [false, true] {
+            let mut graph = build();
+            graph.set_dim('s', SEQ);
+            let (mut phases, actions) = CudaRuntime::rules();
+            phases.insert(RewritePhase::Glumoe, ruleset(()));
+            if !keep_dtype_rule {
+                // The former GLUMoE exclusion also omitted this dtype rule.
+                phases.insert(
+                    RewritePhase::DtypeProp,
+                    ruleset((
+                        &luminal::egglog_utils::base_phase_rules()[&RewritePhase::DtypeProp],
+                        &crate::kernel::other_ops::kernel_scatter_no_copy::dtype_prop,
+                    )),
+                );
+            }
+            graph.build_search_space_with_rules::<CudaRuntime>(
+                CompileOptions::default(),
+                phases,
+                actions,
+            );
+            let space = graph.egraph().unwrap();
+            // Inspect every kind, not only admissible extracted alternatives:
+            // no GLUMoE expression exists that could match the extra dtype rule.
+            assert!(
+                space
+                    .frozen
+                    .eclasses()
+                    .filter(|class| class.sort() == OpKind::sort_ref())
+                    .flat_map(|class| class.nodes())
+                    .all(|node| crate::typed_rules::GLUMoEArgs::get_args(
+                        &space.frozen.typed_node::<OpKind>(node).unwrap()
+                    )
+                    .unwrap()
+                    .is_none())
+            );
+        }
+    }
+}
 
 struct QwenMoeGraph {
     graph: Graph,
@@ -170,32 +220,15 @@ fn gemma_gelu(x: GraphTensor) -> GraphTensor {
     x * scaled.sigmoid()
 }
 
-fn search_space_contains(cx: &Graph, op_name: &str) -> bool {
-    let egraph = cx.egraph().expect("test should build an e-graph");
-
-    for (label, children) in egraph.enodes.values() {
-        if label != "Op" {
-            continue;
-        }
-        let Some(kind_eclass) = children.first() else {
-            continue;
-        };
-        let Some((_, kind_enodes)) = egraph.eclasses.get(kind_eclass) else {
-            continue;
-        };
-        if kind_enodes
-            .iter()
-            .any(|kind_node| egraph.enodes[kind_node].0 == op_name)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn assert_glumoe_in_search_space(cx: &Graph) {
     assert!(
-        search_space_contains(cx, "GLUMoE"),
+        !op_candidates(
+            cx.egraph().expect("test should build search space"),
+            |kind| crate::typed_rules::GLUMoEArgs::get_args(kind)
+                .unwrap()
+                .is_some()
+        )
+        .is_empty(),
         "GLUMoE was not in the e-graph search space"
     );
 }
@@ -212,9 +245,16 @@ fn run_qwen_moe(include_glumoe: bool) -> Vec<f32> {
             .graph
             .build_search_space::<CudaRuntime>(CompileOptions::default());
     } else {
-        model
-            .graph
-            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>(CompileOptions::default());
+        let (mut phases, actions) = CudaRuntime::rules();
+        phases.insert(
+            luminal::egglog_utils::RewritePhase::Glumoe,
+            egglog_experimental::typed::ruleset(()),
+        );
+        model.graph.build_search_space_with_rules::<CudaRuntime>(
+            CompileOptions::default(),
+            phases,
+            actions,
+        );
     }
 
     let x_data = random_f32_vec(SEQ * HIDDEN, 11, -0.15, 0.15);
@@ -253,9 +293,16 @@ fn run_gemma_moe(include_glumoe: bool) -> Vec<f32> {
             .graph
             .build_search_space::<CudaRuntime>(CompileOptions::default());
     } else {
-        model
-            .graph
-            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>(CompileOptions::default());
+        let (mut phases, actions) = CudaRuntime::rules();
+        phases.insert(
+            luminal::egglog_utils::RewritePhase::Glumoe,
+            egglog_experimental::typed::ruleset(()),
+        );
+        model.graph.build_search_space_with_rules::<CudaRuntime>(
+            CompileOptions::default(),
+            phases,
+            actions,
+        );
     }
 
     let router_input_data = random_f32_vec(SEQ * HIDDEN, 21, -0.15, 0.15);

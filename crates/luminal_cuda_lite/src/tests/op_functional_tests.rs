@@ -1,10 +1,12 @@
 use candle_core::{Device, Tensor};
 use cudarc::driver::CudaContext;
+use egglog_experimental::typed::EgglogValue;
 use luminal::prelude::*;
 use proptest::prelude::*;
 
 use luminal::egglog_utils::{
-    egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
+    extract_reachable_generation, hash_choice_set, random_initial_choice, reconstruct,
+    validate_choice_set,
 };
 
 use crate::runtime::CudaRuntime;
@@ -426,19 +428,25 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
-    let ops = cx.egglog_ops().unwrap();
+    let ops = cx.decoders.as_ref().unwrap();
+    let alternatives = egraph
+        .alternatives()
+        .expect("admissible typed alternatives");
 
     // Count mutable eclasses
-    let mutable_eclasses: usize = egraph
-        .eclasses
+    let mutable_eclasses = alternatives
         .iter()
-        .filter(|(_, (label, enodes))| {
-            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        .filter(|(class, nodes)| {
+            let sort = class.sort();
+            (sort == luminal::typed_reference::schema::Ir::sort_ref()
+                || sort == luminal::typed_reference::schema::IList::sort_ref()
+                || sort == luminal::typed_reference::schema::OpKind::sort_ref())
+                && nodes.len() > 1
         })
         .count();
     println!(
         "CUDA search space: {} total eclasses, {} mutable",
-        egraph.eclasses.len(),
+        egraph.frozen.eclasses().count(),
         mutable_eclasses
     );
 
@@ -462,26 +470,16 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
 
     // Test initial genome
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(&egraph.frozen, &alternatives, &mut rng);
     prev_selected.insert(hash_choice_set(&initial));
 
-    if let Err(e) = validate_choice_set(egraph, &initial, ops) {
+    if let Err(e) = validate_choice_set(egraph, &alternatives, &initial) {
         panic!("Initial genome invalid: {}", e);
     }
 
     // Extract and execute initial genome
-    let mut list_cache = FxHashMap::default();
-    let mut expr_cache = FxHashMap::default();
-    let llir_graph = egglog_to_llir(
-        egraph,
-        initial.clone(),
-        ops,
-        &cx.custom_ops,
-        &mut list_cache,
-        &mut expr_cache,
-        None,
-    );
-
+    let (llir_graph, _) = reconstruct(egraph, &initial, ops, &cx.custom_ops)
+        .expect("initial CUDA genome should reconstruct");
     let mut rt: CudaRuntime = CudaRuntime::initialize(stream.clone());
     rt.load_llir(&llir_graph);
     rt.set_data(a, a_data.clone());
@@ -506,7 +504,15 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
     let target = 50;
 
     for _generation in 0..100 {
-        let offspring = extract_generation(egraph, &base, 10, 2, &mut prev_selected, &mut rng);
+        let offspring = extract_reachable_generation(
+            egraph,
+            &alternatives,
+            &base,
+            10,
+            2,
+            &mut prev_selected,
+            &mut rng,
+        );
 
         if offspring.is_empty() {
             println!("Search space exhausted");
@@ -515,22 +521,13 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
 
         for genome in offspring {
             // Validate
-            if let Err(e) = validate_choice_set(egraph, &genome, ops) {
+            if let Err(e) = validate_choice_set(egraph, &alternatives, &genome) {
                 panic!("Invalid genome: {}", e);
             }
 
             // Extract and execute
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let llir_graph = egglog_to_llir(
-                egraph,
-                genome.clone(),
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
+            let (llir_graph, _) = reconstruct(egraph, &genome, ops, &cx.custom_ops)
+                .expect("selected CUDA candidate should reconstruct");
 
             // Create fresh runtime for this genome
             let mut rt: CudaRuntime = CudaRuntime::initialize(stream.clone());
