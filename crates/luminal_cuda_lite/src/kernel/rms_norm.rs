@@ -538,7 +538,7 @@ pub(crate) mod kernel_r_m_s_norm {
         vec![
             rule(
                 (
-                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    rms_rinv(rin, xf, xb, eps, cols),
                     eq(xf, xf3),
                     eq(DType::F32(), w.dtype()),
                     eq(out, Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [wgt])),
@@ -551,7 +551,7 @@ pub(crate) mod kernel_r_m_s_norm {
             .label("kernel rms norm bf16 2d"),
             rule(
                 (
-                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    rms_rinv(rin, xf, xb, eps, cols),
                     eq(xf, xf3),
                     eq(DType::F32(), w.dtype()),
                     eq(out, Ir::Op(OpKind::Cast(o_size, DType::Bf16()), [wgt])),
@@ -663,7 +663,7 @@ pub(crate) mod kernel_r_m_s_norm_quant {
         vec![
             rule(
                 (
-                    Fact::from(rms_rinv(rin, xf, xb, eps, cols)),
+                    rms_rinv(rin, xf, xb, eps, cols),
                     eq(xf, xf3),
                     eq(DType::F32(), w.dtype()),
                     eq(wg_shape, [rows, cols2]),

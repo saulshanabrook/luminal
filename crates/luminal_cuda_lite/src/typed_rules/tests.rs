@@ -2,7 +2,6 @@ use super::*;
 
 #[test]
 fn unrelated_kind_is_rejected_by_every_decoder_without_changing_inputs() -> Result<(), TypedError> {
-    use egglog_experimental::typed::FrozenValueView;
     use luminal::egglog_utils::DecodeContext;
     use luminal::op::Runtime;
 
@@ -13,18 +12,14 @@ fn unrelated_kind_is_rejected_by_every_decoder_without_changing_inputs() -> Resu
     let frozen = graph.freeze()?;
     let kind = frozen.nodes(&frozen.lookup(&kind)?)?.next().unwrap();
     let input = frozen.lookup(&input)?;
-    let FrozenValueView::EClass(expected) = frozen.as_view(&input)?.view() else {
-        unreachable!()
-    };
+    let expected = frozen.class_of(&input)?;
     let choices = Default::default();
     let mut context = DecodeContext::new(&frozen, &choices);
     for decode in crate::runtime::CudaRuntime::DECODERS {
         let mut inputs = vec![input.clone()];
         assert!(decode(&kind, &mut inputs, &mut context)?.is_none());
         assert_eq!(inputs.len(), 1);
-        let FrozenValueView::EClass(actual) = frozen.as_view(&inputs[0])?.view() else {
-            unreachable!()
-        };
+        let actual = frozen.class_of(&inputs[0])?;
         assert_eq!(actual, expected);
     }
     Ok(())
@@ -95,8 +90,9 @@ fn constant_and_iota_lowering_preserve_arbitrary_input_lists() -> Result<(), Typ
             let value = frozen.lookup(source)?;
             assert!(
                 frozen
-                    .nodes(&value)?
-                    .all(|node| !frozen.is_subsumed(&node).unwrap())
+                    .class_of(&value)?
+                    .nodes()
+                    .all(|node| !node.is_subsumed())
             );
         }
     }

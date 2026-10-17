@@ -1,5 +1,4 @@
 use super::*;
-use egglog_experimental::typed::FrozenValueView;
 use luminal::op::DecodeFn;
 
 #[test]
@@ -43,8 +42,9 @@ fn unary_and_binary_lowering_preserve_dtype_guards_and_input_order() -> Result<(
         let value = frozen.lookup(source)?;
         assert!(
             frozen
-                .nodes(&value)?
-                .any(|node| frozen.is_subsumed(&node).unwrap())
+                .class_of(&value)?
+                .nodes()
+                .any(|node| node.is_subsumed())
         );
     }
     Ok(())
@@ -60,15 +60,16 @@ fn constant_and_gather_preserve_inputs_dtype_and_subsumption() -> Result<(), Typ
     assert!(graph.check((eq(&constant, &lowered), eq(lowered.dtype(), DType::F32())))?);
     let frozen = graph.freeze()?;
     let value = frozen.lookup(&constant)?;
-    assert!(frozen.nodes(&value)?.into_iter().any(|node| {
-        let (kind, _) = get_args(&node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
+    assert!(frozen.class_of(&value)?.nodes().any(|node| {
+        let typed = frozen.typed_node::<Ir>(node).unwrap();
+        let (kind, _) = get_args(&typed, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
             .unwrap()
             .unwrap();
         frozen.nodes(&kind).unwrap().into_iter().any(|kind| {
             get_args(&kind, |value: &egg::F64| OpKind::Constant(value))
                 .unwrap()
                 .is_some()
-        }) && frozen.is_subsumed(&node).unwrap()
+        }) && node.is_subsumed()
     }));
 
     let indexes = Ir::Input(0, "indexes", DType::Int());
@@ -187,9 +188,7 @@ fn unary_args_follow_the_selected_producer_and_frozen_metadata() -> Result<(), T
     ))?;
     let frozen = graph.freeze()?;
     let observed = frozen.lookup(&kind)?;
-    let FrozenValueView::EClass(class) = frozen.as_view(&observed)?.view() else {
-        panic!("op kind must be an equality class");
-    };
+    let class = frozen.class_of(&observed)?;
     assert_eq!(class.nodes().len(), 2);
     for node in class.nodes() {
         let choices = [(class, node)].into_iter().collect();
@@ -201,8 +200,8 @@ fn unary_args_follow_the_selected_producer_and_frozen_metadata() -> Result<(), T
         assert_eq!(inputs, original_inputs);
         if let Some((shape_arg, input_arg, output_arg)) = get_args(&selected, selector)? {
             assert_eq!(
-                frozen.as_view(&shape_arg)?,
-                frozen.as_view(&frozen.lookup(&shape)?)?
+                frozen.class_of(&shape_arg)?,
+                frozen.class_of(&frozen.lookup(&shape)?)?
             );
             assert_eq!(input_arg, output_arg);
             // The preserved tie policy need not select the literal producer.

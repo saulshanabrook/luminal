@@ -11,7 +11,7 @@
 
 use crate::tests::utilities::op_candidates;
 use egglog_experimental::typed::builtins as egg;
-use egglog_experimental::typed::{EgglogValue, FrozenValue, FrozenValueView, get_args};
+use egglog_experimental::typed::{EgglogValue, ValueRef, get_args};
 use half::bf16;
 use luminal::dtype::DType;
 use luminal::prelude::*;
@@ -924,12 +924,12 @@ fn dump_rotary_post_egglog() {
     let egraph = cx.egraph().unwrap();
 
     // Render frozen values directly. The depth bound keeps cyclic alternatives finite.
-    fn render(value: FrozenValue<'_>, depth: usize) -> String {
+    fn render(value: ValueRef<'_>, depth: usize) -> String {
         if depth == 0 {
             return "…".into();
         }
-        match value.view() {
-            FrozenValueView::EClass(class) => class
+        match value.class() {
+            Some(class) => class
                 .nodes()
                 .next()
                 .map(|node| {
@@ -943,8 +943,8 @@ fn dump_rotary_post_egglog() {
                     )
                 })
                 .unwrap_or_else(|| "<no producer>".into()),
-            FrozenValueView::Scalar(value) => format!("{value:?}"),
-            _ => format!("<{} container>", value.sort().name()),
+            None if value.children().len() == 0 => value.to_string(),
+            None => format!("<{} container>", value.sort()),
         }
     }
     let alternatives = egraph.alternatives().unwrap();
@@ -990,11 +990,7 @@ fn dump_rotary_post_egglog() {
                             get_args(&tail, |head: &Ir, tail: &IList| IList::ICons(head, tail))
                                 .unwrap()
                         {
-                            let FrozenValueView::EClass(class) =
-                                egraph.frozen.as_view(&data).unwrap().view()
-                            else {
-                                unreachable!()
-                            };
+                            let class = egraph.frozen.class_of(&data).unwrap();
                             println!("=== cat data class {:?}:", class);
                             for node in class.nodes() {
                                 println!(

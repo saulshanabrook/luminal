@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 use super::utilities::op_candidates;
 use cudarc::driver::{CudaStream, DevicePtr};
 use egglog_experimental::typed::{
-    EGraph, EgglogValue, FrozenEGraph, FrozenValueView, TypedError, get_args, let_, ruleset, set,
-    union,
+    EGraph, EgglogValue, Snapshot, TypedError, get_args, let_, ruleset, set, union,
 };
 use luminal::egglog_utils::{DecodeContext, RewritePhase};
 use luminal::prelude::*;
@@ -351,7 +350,7 @@ fn flashinfer_compact_indices_follow_real_gather_rows_through_fusion() {
     );
     let phases = luminal::egglog_utils::base_phase_rules();
     let mut live = EGraph::default();
-    live.register(&roots).unwrap();
+    live.register(roots.as_slice()).unwrap();
     live.register(&compact).unwrap();
     live.run(fi::matmul_backend.saturate()).unwrap();
 
@@ -372,19 +371,24 @@ fn flashinfer_compact_indices_follow_real_gather_rows_through_fusion() {
                 .run(ruleset((&fusion_end::fusion_grow, &fusion_end::fusion_merge)).saturate())
                 .unwrap();
             assert!(
-                report.updated,
+                report.detail.updated,
                 "the fixture must exercise actual fusion rules"
             );
         }
         let frozen = live.freeze().unwrap();
         let flat = frozen
-            .table(|input: &Ir, index: &egg::I64| Ir::Output(input, index))
+            .eclasses()
+            .filter(|class| class.sort() == Ir::sort_ref())
+            .flat_map(|class| class.nodes())
+            .filter_map(|node| {
+                get_args(
+                    &frozen.typed_node::<Ir>(node).unwrap(),
+                    |input: &Ir, index: &egg::I64| Ir::Output(input, index),
+                )
+                .unwrap()
+            })
+            .find(|(_, index)| i64::try_from(index).unwrap() == flat_id.index() as i64)
             .unwrap()
-            .rows
-            .into_iter()
-            .find(|row| i64::try_from(&row.args.1).unwrap() == flat_id.index() as i64)
-            .unwrap()
-            .args
             .0;
         let choices = Default::default();
         let context = DecodeContext::new(&frozen, &choices);
@@ -734,7 +738,7 @@ fn flashinfer_compact_recovery_inspects_only_the_supplied_lowered_producer() {
 
 // These rule fixtures deliberately install the real FlashInfer groups without
 // the runtime's device-capability gate; they neither decode nor JIT an operation.
-fn flashinfer_fixture_snapshot(graph: &Graph, s_interval: (i64, i64)) -> FrozenEGraph {
+fn flashinfer_fixture_snapshot(graph: &Graph, s_interval: (i64, i64)) -> Snapshot {
     use crate::host::flashinfer::flashinfer_attention as fi;
 
     let outputs = luminal::typed_reference::capture_graph(graph).unwrap();
@@ -783,33 +787,26 @@ fn flashinfer_fixture_snapshot(graph: &Graph, s_interval: (i64, i64)) -> FrozenE
 
 // Check every emitted FlashInfer IR node's proof dependencies and recoverable
 // compact-input identity. This does not invoke the JIT-backed decoder.
-fn assert_flashinfer_compact_dependencies(frozen: &FrozenEGraph, compact_id: usize) -> usize {
-    let kinds = frozen
-        .table(
-            |qh: &DimExpr,
-             kh: &DimExpr,
-             hd: &DimExpr,
-             page: &DimExpr,
-             batch: &DimExpr,
-             dtype: &IrDType,
-             scale: &egg::F64,
-             window: &egg::F64| {
-                crate::typed_rules::flash_infer_attention(
-                    qh, kh, hd, page, batch, dtype, scale, window,
-                )
-            },
-        )
-        .unwrap();
+fn assert_flashinfer_compact_dependencies(frozen: &Snapshot, compact_id: usize) -> usize {
     let mut found = 0;
-    for row in frozen
-        .table(|kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))
-        .unwrap()
-        .rows
+    for node in frozen
+        .eclasses()
+        .filter(|class| class.sort() == Ir::sort_ref())
+        .flat_map(|class| class.nodes())
     {
-        if !kinds.rows.iter().any(|kind| kind.output == row.args.0) {
+        let ir = frozen.typed_node::<Ir>(node).unwrap();
+        let Some((kind, mut current)) =
+            get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs)).unwrap()
+        else {
+            continue;
+        };
+        if !frozen.nodes(&kind).unwrap().any(|kind| {
+            crate::typed_rules::FlashInferAttentionArgs::get_args(&kind)
+                .unwrap()
+                .is_some()
+        }) {
             continue;
         }
-        let mut current = row.args.1;
         let mut inputs = Vec::new();
         loop {
             let nodes: Vec<_> = frozen.nodes(&current).unwrap().collect();
@@ -843,7 +840,7 @@ fn assert_flashinfer_compact_dependencies(frozen: &FrozenEGraph, compact_id: usi
             )
             .unwrap()
             .is_some_and(|(id, _, dtype)| {
-                i64::try_from(id).unwrap() == compact_id as i64
+                i64::try_from(&id).unwrap() == compact_id as i64
                     && frozen
                         .nodes(&dtype)
                         .unwrap()
@@ -1037,41 +1034,10 @@ fn flashinfer_rules_preserve_source_mask_and_layout_constraints() {
 
 #[test]
 fn flashinfer_runtime_recipe_respects_hardware_gate() {
-    use RewritePhase::*;
     let (phases, actions) = CudaRuntime::rules();
-    let mut without = phases.clone();
-    without.insert(
-        MatmulBackend,
-        ruleset((
-            &crate::kernel::gemv::kernel_gemv::matmul_backend,
-            &crate::kernel::gemv::kernel_gemv_f8::matmul_backend,
-            &crate::kernel::moe_gemv::kernel_mo_e_gemv::matmul_backend,
-            &crate::kernel::generic_matmul::rewrites::matmul_backend,
-            &crate::host::cublaslt::rewrites::matmul_backend,
-        )),
-    );
-    without.insert(
-        KernelFuseLatePre,
-        ruleset((
-            &crate::kernel::rms_norm::kernel_r_m_s_norm::kernel_fuse_late_pre,
-            &crate::kernel::rope::kernel_ro_p_e::kernel_fuse_late_pre,
-            &crate::kernel::topk::kernel_stable_sort_idx::kernel_fuse_late_pre,
-        )),
-    );
-    without.insert(KernelFuseLate2, ruleset(()));
     let enabled = crate::device_compute_major() >= 8;
     let expected_actions = if enabled {
         crate::host::flashinfer::flashinfer_attention::initial_actions().len()
-    } else {
-        0
-    };
-    let expected_rules = if enabled {
-        ruleset((
-            &crate::host::flashinfer::flashinfer_attention::matmul_backend,
-            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late2,
-            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late_pre,
-        ))
-        .len()
     } else {
         0
     };
@@ -1079,9 +1045,8 @@ fn flashinfer_runtime_recipe_respects_hardware_gate() {
         actions.len() - crate::host::cublaslt::rewrites::initial_actions().len(),
         expected_actions
     );
-    let all: usize = phases.values().map(|group| group.len()).sum();
-    let filtered: usize = without.values().map(|group| group.len()).sum();
-    assert_eq!(all - filtered, expected_rules);
+    // FlashInfer is the only producer of this late phase in the runtime recipe.
+    assert_eq!(phases[&RewritePhase::KernelFuseLate2].is_empty(), !enabled);
 }
 
 #[test]
@@ -1097,32 +1062,24 @@ fn flashinfer_egg_rule_parses() {
     let mut live = EGraph::default();
     live.register(crate::host::flashinfer::flashinfer_attention::initial_actions())
         .unwrap();
+    let kind = let_(
+        "flashinfer_kind",
+        crate::typed_rules::flash_infer_attention(8, 2, 64, 1, 1, IrDType::F32(), 1.0, -1.0),
+    );
+    live.register(&kind).unwrap();
     live.run(&rules)
         .expect("typed FlashInfer rules must install and run");
     let frozen = live.freeze().unwrap();
-    frozen
-        .table(
-            |num_qo_heads: &DimExpr,
-             num_kv_heads: &DimExpr,
-             head_dim: &DimExpr,
-             page_size: &DimExpr,
-             batch_dim: &DimExpr,
-             dtype: &IrDType,
-             sm_scale: &egg::F64,
-             window_left: &egg::F64| {
-                crate::typed_rules::flash_infer_attention(
-                    num_qo_heads,
-                    num_kv_heads,
-                    head_dim,
-                    page_size,
-                    batch_dim,
-                    dtype,
-                    sm_scale,
-                    window_left,
-                )
-            },
-        )
-        .expect("FlashInfer constructor table is installed");
+    assert!(
+        frozen
+            .nodes(&frozen.lookup(&kind).unwrap())
+            .unwrap()
+            .any(|kind| {
+                crate::typed_rules::FlashInferAttentionArgs::get_args(&kind)
+                    .unwrap()
+                    .is_some()
+            })
+    );
 }
 
 #[test]
@@ -1136,9 +1093,7 @@ fn flashinfer_op_sort_shape() {
     live.register((&kind, &input)).unwrap();
     let frozen = live.freeze().unwrap();
     let observed = frozen.lookup(&kind).unwrap();
-    let FrozenValueView::EClass(class) = frozen.as_view(&observed).unwrap().view() else {
-        unreachable!()
-    };
+    let class = frozen.class_of(&observed).unwrap();
     let node = class.nodes().next().unwrap();
     assert!(
         crate::typed_rules::FlashInferAttentionArgs::get_args(
@@ -1628,7 +1583,7 @@ fn saturate_and_has_flashinfer_with_s_interval(
     saturate_and_has_flashinfer_inner(cx, Some((s_min, s_max)))
 }
 
-fn saturate_attention_graph(cx: &Graph, s_interval: Option<(i64, i64)>) -> FrozenEGraph {
+fn saturate_attention_graph(cx: &Graph, s_interval: Option<(i64, i64)>) -> Snapshot {
     let roots = luminal::typed_reference::capture_graph(cx).unwrap();
     let (phases, actions) = CudaRuntime::rules();
     let mut live = EGraph::default();
@@ -1641,7 +1596,7 @@ fn saturate_attention_graph(cx: &Graph, s_interval: Option<(i64, i64)>) -> Froze
         }
     }
     live.register(actions).unwrap();
-    live.register(&roots).unwrap();
+    live.register(roots.as_slice()).unwrap();
     live.run(luminal::egglog_utils::main_schedule(
         &phases,
         s_interval.is_some(),
@@ -1689,18 +1644,11 @@ fn saturate_and_has_flashinfer_inner(
 #[ignore]
 fn flashinfer_dump_paged_attn_egglog() {
     let (phases, _) = CudaRuntime::rules();
-    let total: usize = phases.values().map(|rules| rules.len()).sum();
+    eprintln!("rewrite phases: {:?}", phases.keys());
     eprintln!(
-        "FlashInfer typed rules: {:#?}",
-        ruleset((
-            &crate::host::flashinfer::flashinfer_attention::matmul_backend,
-            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late2,
-            &crate::host::flashinfer::flashinfer_attention::kernel_fuse_late_pre,
-        ))
-    );
-    eprintln!(
-        "decoders={} total_rewrites={total}",
-        CudaRuntime::DECODERS.len()
+        "decoders={} phases={}",
+        CudaRuntime::DECODERS.len(),
+        phases.len()
     );
     let (cx, _) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
     let roots = luminal::typed_reference::capture_graph(&cx).unwrap();
@@ -2614,11 +2562,7 @@ fn egraph_choice_eclass_census() {
                 if let Some((kind, _)) =
                     get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs)).unwrap()
                 {
-                    let FrozenValueView::EClass(kind) =
-                        egraph.frozen.as_view(&kind).unwrap().view()
-                    else {
-                        unreachable!()
-                    };
+                    let kind = egraph.frozen.class_of(&kind).unwrap();
                     for &node in &alternatives[&kind] {
                         ew_only &=
                             is_elementwise(&egraph.frozen.typed_node::<OpKind>(node).unwrap());

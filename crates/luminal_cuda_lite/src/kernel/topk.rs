@@ -197,7 +197,7 @@ pub(crate) mod kernel_stable_sort_idx {
         vec![
             rule(
                 (
-                    Fact::from(stable_ranks_part(ranks, eqidx, a_val, b_val, x, out_shape)),
+                    stable_ranks_part(ranks, eqidx, a_val, b_val, x, out_shape),
                     eq(a_val, a_val2),
                     eq(b_val, b_val2),
                     eq(a_val, a_val3),
@@ -208,7 +208,7 @@ pub(crate) mod kernel_stable_sort_idx {
             .label("stable ranks tiebreak"),
             rule(
                 (
-                    Fact::from(stable_ranks(ranks, x, out_shape)),
+                    stable_ranks(ranks, x, out_shape),
                     eq(sorted, Ir::Op(ScatterArgs::fresh(), [zeros, adj, vals])),
                     eq(out_shape, [rows, e]),
                     eq(e, e2),

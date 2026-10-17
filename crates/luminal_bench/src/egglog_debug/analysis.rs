@@ -3,9 +3,7 @@ use super::{
     DTypeChainAnalysis, DTypeStatus, DependencyGraph, FactStatus, FunctionChainAnalysis,
     FunctionTraceEntry,
 };
-use egglog_experimental::typed::{
-    FrozenEClass, FrozenEGraph, FrozenValue, FrozenValueView, prelude::*,
-};
+use egglog_experimental::typed::{ClassRef, Snapshot, TableRowRef, ValueRef, prelude::*};
 use luminal::{
     egglog_utils::{Alternatives, SearchSpace, final_phases, main_schedule},
     op::Runtime,
@@ -84,7 +82,7 @@ pub struct ChildInspection {
 /// Source aliases are captures only in this diagnostic destination.
 pub fn run_egraph<R: Runtime>(program: &DependencyGraph) -> Result<SearchSpace, TypedError> {
     let (phases, actions) = R::rules();
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let mut egraph = EGraph::default();
     egraph.register(actions)?;
     for name in &program.order {
         egraph.register(&program.captures[name])?;
@@ -98,7 +96,7 @@ pub fn run_egraph<R: Runtime>(program: &DependencyGraph) -> Result<SearchSpace, 
     SearchSpace::from_frozen(egraph.freeze()?, &[])
 }
 
-fn class_labels<'f>(class: FrozenEClass<'f>, alternatives: &Alternatives<'f>) -> Vec<String> {
+fn class_labels<'f>(class: ClassRef<'f>, alternatives: &Alternatives<'f>) -> Vec<String> {
     let mut labels: Vec<_> = alternatives
         .get(&class)
         .into_iter()
@@ -111,28 +109,26 @@ fn class_labels<'f>(class: FrozenEClass<'f>, alternatives: &Alternatives<'f>) ->
 }
 
 /// Read an existing unary table row. No primitive evaluation, insertion or extraction.
-fn function_value<'f>(
-    frozen: &'f FrozenEGraph,
+fn function_row<'f>(
+    frozen: &'f Snapshot,
     name: &str,
-    input: FrozenValue<'f>,
-) -> Option<FrozenValue<'f>> {
+    matches: impl Fn(ValueRef<'f>) -> bool,
+) -> Option<TableRowRef<'f>> {
     frozen
-        .tables()
-        .filter(|table| table.name() == name && table.inputs() == [input.sort()])
-        .flat_map(|table| table.rows())
-        .find(|row| row.args().next() == Some(input))
-        .map(|row| row.output())
+        .rows()
+        .filter(|row| row.name() == name && row.args().len() == 1)
+        .find(|row| matches(row.args().next().unwrap()))
 }
 
-fn describe<'f>(value: FrozenValue<'f>, alternatives: &Alternatives<'f>) -> String {
-    match value.view() {
-        FrozenValueView::EClass(class) => class_labels(class, alternatives).join("|"),
-        _ => luminal::visualization::display_frozen_value(value),
+fn describe<'f>(value: ValueRef<'f>, alternatives: &Alternatives<'f>) -> String {
+    match value.class() {
+        Some(class) => class_labels(class, alternatives).join("|"),
+        None => luminal::visualization::display_frozen_value(value),
     }
 }
 
 fn eval_function<'f>(
-    frozen: &'f FrozenEGraph,
+    frozen: &'f Snapshot,
     alternatives: &Alternatives<'f>,
     program: &DependencyGraph,
     name: &str,
@@ -145,10 +141,13 @@ fn eval_function<'f>(
             .ok_or_else(|| format!("unknown variable {var}"))?;
         let observed = frozen.lookup(capture).map_err(|error| error.to_string())?;
         let input = frozen
-            .as_view(&observed)
+            .class_of(&observed)
             .map_err(|error| error.to_string())?;
-        function_value(frozen, name, input)
-            .map(|value| describe(value, alternatives))
+        function_row(frozen, name, |value| value.class() == Some(input))
+            .map(|row| {
+                row.value()
+                    .map_or_else(|| "()".into(), |value| describe(value, alternatives))
+            })
             .ok_or_else(|| format!("no {name} row for {var}"))
     })();
     match result {
@@ -158,12 +157,12 @@ fn eval_function<'f>(
 }
 
 fn inspect_child<'f>(
-    frozen: &'f FrozenEGraph,
+    frozen: &'f Snapshot,
     alternatives: &Alternatives<'f>,
-    value: FrozenValue<'f>,
+    value: ValueRef<'f>,
 ) -> ChildInspection {
-    let (class_id, class_labels) = match value.view() {
-        FrozenValueView::EClass(class) => (
+    let (class_id, class_labels) = match value.class() {
+        Some(class) => (
             format!(
                 "class {}",
                 frozen
@@ -173,16 +172,18 @@ fn inspect_child<'f>(
             ),
             class_labels(class, alternatives),
         ),
-        _ => (
+        None => (
             describe(value, alternatives),
             vec![describe(value, alternatives)],
         ),
     };
     ChildInspection {
         class_id,
-        class_type: value.sort().name().to_owned(),
+        class_type: value.sort().to_string(),
         class_labels,
-        dtype: function_value(frozen, "dtype", value).map(|value| describe(value, alternatives)),
+        dtype: function_row(frozen, "dtype", |input| input == value)
+            .and_then(|row| row.value())
+            .map(|value| describe(value, alternatives)),
     }
 }
 
@@ -215,32 +216,37 @@ pub fn inspect_var(
             return result;
         }
     };
-    let value = match frozen.as_view(&observed) {
-        Ok(value) => value,
+    let class = match frozen.class_of(&observed) {
+        Ok(class) => class,
         Err(error) => {
             result.eval_error = Some(error.to_string());
             return result;
         }
     };
-    let child = inspect_child(frozen, &alternatives, value);
-    result.class_id = Some(child.class_id);
-    result.class_type = Some(child.class_type);
-    result.class_labels = child.class_labels;
-    result.dtype = child.dtype;
-    if let FrozenValueView::EClass(class) = value.view() {
-        result.enodes = alternatives
-            .get(&class)
-            .into_iter()
-            .flatten()
-            .map(|node| EnodeInspection {
-                label: node.name().to_owned(),
-                children: node
-                    .args()
-                    .map(|arg| inspect_child(frozen, &alternatives, arg))
-                    .collect(),
-            })
-            .collect();
-    }
+    result.class_id = Some(format!(
+        "class {}",
+        frozen
+            .eclasses()
+            .position(|candidate| candidate == class)
+            .unwrap()
+    ));
+    result.class_type = Some(class.sort().to_string());
+    result.class_labels = class_labels(class, &alternatives);
+    result.dtype = function_row(frozen, "dtype", |value| value.class() == Some(class))
+        .and_then(|row| row.value())
+        .map(|value| describe(value, &alternatives));
+    result.enodes = alternatives
+        .get(&class)
+        .into_iter()
+        .flatten()
+        .map(|node| EnodeInspection {
+            label: node.name().to_owned(),
+            children: node
+                .args()
+                .map(|arg| inspect_child(frozen, &alternatives, arg))
+                .collect(),
+        })
+        .collect();
     result
 }
 

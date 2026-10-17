@@ -265,7 +265,7 @@ pub(crate) fn kernel_fuse_late2(
                 // softmax internals connect the mask chain to the second matmul —
                 // without this the two halves join as a cross-product across the
                 // distinct layer instances of rolled multi-layer bodies.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 // ── Second matmul: Mul(softmax_out, V_gqa) ──
                 // Shape: (nheads, s, hdim, c) — 4D
                 eq(
@@ -293,7 +293,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 // ── V GQA broadcast: Mul(V_gathered, 1.0) with zero-stride constant ──
                 // Shape: (nheads, c, hdim) — 3D
                 eq(
@@ -345,12 +345,12 @@ pub(crate) fn kernel_fuse_late2(
                 // has two disconnected halves whose join cross-products across the
                 // distinct layer instances of rolled multi-layer bodies (the gemma
                 // 530GB egglog OOM), and Q could pair with another instance's mask.
-                Fact::from(const_like(sq_scale, sq_scale_val)),
+                const_like(sq_scale, sq_scale_val),
                 // The mask proves a valid KV prefix; do not accept a precomputed mask Input.
                 // Mask spelling staged as a fact — see "FlashInfer scaled-offset mask
                 // fact".
-                Fact::from(fi_scaled_offset_mask(mask)),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                fi_scaled_offset_mask(mask),
+                const_like(k_gqa_const, 1.0),
                 // ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
                 // Shape: (nheads, hdim, c) — 3D
                 eq(
@@ -370,8 +370,8 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok(hdim)),
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok(hdim),
             ),
             (
                 attention,
@@ -387,7 +387,7 @@ pub(crate) fn kernel_fuse_late2(
         // not prefill. It is only valid when the active dynamic-dim bucket proves
         // s == 1.
         rule(
-            [
+            (
                 eq(s_lower, (DimExpr::MVar("s")).lower()),
                 eq(s_upper, (DimExpr::MVar("s")).upper()),
                 s_lower.gt(0_i64),
@@ -395,7 +395,7 @@ pub(crate) fn kernel_fuse_late2(
                 // softmax internals connect the mask chain to the second matmul —
                 // without this the two halves join as a cross-product across the
                 // distinct layer instances of rolled multi-layer bodies.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 eq(
                     mul,
                     Ir::Op(
@@ -419,7 +419,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 eq(
                     v_gqa,
                     Ir::Op(
@@ -460,11 +460,11 @@ pub(crate) fn kernel_fuse_late2(
                 // has two disconnected halves whose join cross-products across the
                 // distinct layer instances of rolled multi-layer bodies (the gemma
                 // 530GB egglog OOM), and Q could pair with another instance's mask.
-                Fact::from(const_like(sq_scale, sq_scale_val)),
+                const_like(sq_scale, sq_scale_val),
                 // Mask spelling staged as a fact — see "FlashInfer direct causal mask
                 // fact".
-                Fact::from(fi_direct_causal_mask(mask, q_pos)),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                fi_direct_causal_mask(mask, q_pos),
+                const_like(k_gqa_const, 1.0),
                 eq(
                     k_gqa,
                     Ir::Op(
@@ -479,9 +479,9 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok(hdim)),
-            ],
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok(hdim),
+            ),
             (
                 attention,
                 union(output, attention),
@@ -498,7 +498,7 @@ pub(crate) fn kernel_fuse_late2(
         // Like the direct causal spelling, this is decode-only until the fp32
         // prefill runtime exists. The active bucket must prove s == 1.
         rule(
-            [
+            (
                 eq(s_lower, (DimExpr::MVar("s")).lower()),
                 eq(s_upper, (DimExpr::MVar("s")).upper()),
                 s_lower.gt(0_i64),
@@ -506,7 +506,7 @@ pub(crate) fn kernel_fuse_late2(
                 // softmax internals connect the mask chain to the second matmul —
                 // without this the two halves join as a cross-product across the
                 // distinct layer instances of rolled multi-layer bodies.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 eq(
                     mul,
                     Ir::Op(
@@ -530,7 +530,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 eq(
                     v_gqa,
                     Ir::Op(
@@ -571,15 +571,15 @@ pub(crate) fn kernel_fuse_late2(
                 // has two disconnected halves whose join cross-products across the
                 // distinct layer instances of rolled multi-layer bodies (the gemma
                 // 530GB egglog OOM), and Q could pair with another instance's mask.
-                Fact::from(const_like(sq_scale, sq_scale_val)),
+                const_like(sq_scale, sq_scale_val),
                 // Mask indices are row-aligned triangular-mask rows plus arange(c).
                 // Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
                 // (see "FlashInfer triu mask fact"). Anchoring this rule at the
                 // tiny fact relation instead of inlining the ~20 mask atoms keeps
                 // the join narrow on rolled bodies with many distinct attention
                 // instances (gemma: 35+ min / OOM as a single inlined join).
-                Fact::from(fi_triu_mask(mask, q_pos)),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                fi_triu_mask(mask, q_pos),
+                const_like(k_gqa_const, 1.0),
                 eq(
                     k_gqa,
                     Ir::Op(
@@ -594,9 +594,9 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok(hdim)),
-            ],
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok(hdim),
+            ),
             (
                 attention,
                 union(output, attention),
@@ -616,11 +616,11 @@ pub(crate) fn kernel_fuse_late2(
         // total_q_tokens at execute time.
         rule(
             (
-                Fact::from(flashinfer_prefill_dt(dt)),
+                flashinfer_prefill_dt(dt),
                 // softmax internals connect the mask chain to the second matmul —
                 // without this the two halves join as a cross-product across the
                 // distinct layer instances of rolled multi-layer bodies.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 eq(
                     mul,
                     Ir::Op(
@@ -644,7 +644,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 eq(
                     v_gqa,
                     Ir::Op(
@@ -685,15 +685,15 @@ pub(crate) fn kernel_fuse_late2(
                 // has two disconnected halves whose join cross-products across the
                 // distinct layer instances of rolled multi-layer bodies (the gemma
                 // 530GB egglog OOM), and Q could pair with another instance's mask.
-                Fact::from(const_like(sq_scale, sq_scale_val)),
+                const_like(sq_scale, sq_scale_val),
                 // Mask indices are row-aligned triangular-mask rows plus arange(c).
                 // Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
                 // (see "FlashInfer triu mask fact"). Anchoring this rule at the
                 // tiny fact relation instead of inlining the ~20 mask atoms keeps
                 // the join narrow on rolled bodies with many distinct attention
                 // instances (gemma: 35+ min / OOM as a single inlined join).
-                Fact::from(fi_triu_mask(mask, q_pos)),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                fi_triu_mask(mask, q_pos),
+                const_like(k_gqa_const, 1.0),
                 eq(
                     k_gqa,
                     Ir::Op(
@@ -708,8 +708,8 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok(hdim)),
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok(hdim),
             ),
             (
                 attention,
@@ -727,8 +727,8 @@ pub(crate) fn kernel_fuse_late2(
                 eq(s_upper, (DimExpr::MVar("s")).upper()),
                 s_lower.gt(0_i64),
                 s_upper.lt(2_i64),
-                Fact::from(flashinfer_prefill_dt(dt)),
-                Fact::from(fi_triu_mask(mask, q_pos)),
+                flashinfer_prefill_dt(dt),
+                fi_triu_mask(mask, q_pos),
                 // SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
                 eq(
                     masked,
@@ -742,7 +742,7 @@ pub(crate) fn kernel_fuse_late2(
                     ),
                 ),
                 // mask Add → softmax internals → second matmul: one connected chain.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 eq(
                     mul,
                     Ir::Op(
@@ -766,7 +766,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 eq(
                     v_gqa,
                     Ir::Op(
@@ -789,7 +789,7 @@ pub(crate) fn kernel_fuse_late2(
                         [q, k_gqa],
                     ),
                 ),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                const_like(k_gqa_const, 1.0),
                 eq(
                     k_gqa,
                     Ir::Op(
@@ -804,8 +804,8 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok_16bit(hdim)),
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok_16bit(hdim),
             ),
             (
                 scale_free_attention,
@@ -817,12 +817,12 @@ pub(crate) fn kernel_fuse_late2(
         // Gemma-4 sliding-window attention: scale-free, causal triu-gather
         // mask + window term; window_left carried onto the op.
         rule(
-            [
+            (
                 eq(s_lower, (DimExpr::MVar("s")).lower()),
                 eq(s_upper, (DimExpr::MVar("s")).upper()),
                 s_lower.gt(0_i64),
                 s_upper.lt(2_i64),
-                Fact::from(flashinfer_prefill_dt(dt)),
+                flashinfer_prefill_dt(dt),
                 eq(
                     mask,
                     Ir::Op(
@@ -833,8 +833,8 @@ pub(crate) fn kernel_fuse_late2(
                         [cmask, wterm],
                     ),
                 ),
-                Fact::from(fi_triu_mask(cmask, q_pos)),
-                Fact::from(fi_window_term(wterm, q_pos2, window_left)),
+                fi_triu_mask(cmask, q_pos),
+                fi_window_term(wterm, q_pos2, window_left),
                 eq(q_pos, q_pos2),
                 // SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
                 eq(
@@ -849,7 +849,7 @@ pub(crate) fn kernel_fuse_late2(
                     ),
                 ),
                 // mask Add → softmax internals → second matmul: one connected chain.
-                Fact::from(const_like(sc_log2e, 1.442695)),
+                const_like(sc_log2e, 1.442695),
                 eq(
                     mul,
                     Ir::Op(
@@ -873,7 +873,7 @@ pub(crate) fn kernel_fuse_late2(
                         [mul],
                     ),
                 ),
-                Fact::from(const_like(v_gqa_const, 1.0)),
+                const_like(v_gqa_const, 1.0),
                 eq(
                     v_gqa,
                     Ir::Op(
@@ -896,7 +896,7 @@ pub(crate) fn kernel_fuse_late2(
                         [q, k_gqa],
                     ),
                 ),
-                Fact::from(const_like(k_gqa_const, 1.0)),
+                const_like(k_gqa_const, 1.0),
                 eq(
                     k_gqa,
                     Ir::Op(
@@ -911,9 +911,9 @@ pub(crate) fn kernel_fuse_late2(
                 eq(dt, q.dtype()),
                 eq(dt, k_cache.dtype()),
                 eq(dt, v_cache.dtype()),
-                Fact::from(flashinfer_cache_pair(k_cache, v_cache)),
-                Fact::from(flashinfer_head_dim_ok_16bit(hdim)),
-            ],
+                flashinfer_cache_pair(k_cache, v_cache),
+                flashinfer_head_dim_ok_16bit(hdim),
+            ),
             (
                 sliding_attention,
                 union(output, sliding_attention),
@@ -1044,7 +1044,7 @@ pub(crate) fn kernel_fuse_late_pre(
                     ),
                 ),
                 eq(col_offsets, columns),
-                Fact::from(const_like(neg_mask_scale, neg_mask_scale_val)),
+                const_like(neg_mask_scale, neg_mask_scale_val),
                 neg_mask_scale_val.lt(-9999999999.0),
                 neg_mask_scale_val.gt(-10000000001.0),
                 eq(
@@ -1072,7 +1072,7 @@ pub(crate) fn kernel_fuse_late_pre(
                     mask,
                     Ir::Op(AddArgs::fresh(), [mask_scaled_allowed, mask_offset]),
                 ),
-                Fact::from(const_like(mask_scale_const, mask_scale_val)),
+                const_like(mask_scale_const, mask_scale_val),
                 mask_scale_val.gt(9999999999.0),
                 mask_scale_val.lt(10000000001.0),
             ),
@@ -1094,7 +1094,7 @@ pub(crate) fn kernel_fuse_late_pre(
                         [blocked_f32, neg_mask_scale],
                     ),
                 ),
-                Fact::from(const_like(neg_mask_scale, neg_mask_scale_val)),
+                const_like(neg_mask_scale, neg_mask_scale_val),
                 neg_mask_scale_val.lt(-9999999999.0),
                 neg_mask_scale_val.gt(-10000000001.0),
                 eq(
@@ -1131,7 +1131,7 @@ pub(crate) fn kernel_fuse_late_pre(
                         [w_bool_cast, w_negbig],
                     ),
                 ),
-                Fact::from(const_like(w_negbig, w_negbig_val)),
+                const_like(w_negbig, w_negbig_val),
                 w_negbig_val.lt(-9999999999.0),
                 w_negbig_val.gt(-10000000001.0),
             ),

@@ -72,10 +72,9 @@ impl DependencyGraph {
                     TypedError::Invalid("HLIR diagnostic lowering must produce a call".into())
                 })?
                 .to_owned();
-            graph.lines.insert(
-                name.clone(),
-                format!("let {name} = {};", expression.expression()),
-            );
+            graph
+                .lines
+                .insert(name.clone(), format!("let {name} = {expression:?};"));
             graph
                 .captures
                 .insert(name.clone(), let_(name.clone(), expression));

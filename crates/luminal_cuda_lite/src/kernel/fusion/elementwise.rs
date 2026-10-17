@@ -51,7 +51,7 @@ mod decoder_tests {
             ),
         ];
         for (kind, decoder, arity) in cases {
-            let mut graph = EGraph::new(EGraphOptions::default());
+            let mut graph = EGraph::default();
             let capture = let_("kind", kind);
             graph.register(&capture)?;
             let frozen = graph.freeze()?;

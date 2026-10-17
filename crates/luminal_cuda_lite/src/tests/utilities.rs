@@ -1,8 +1,6 @@
 use candle_core::{Device, Tensor, WithDType};
 use cudarc::driver::CudaContext;
-use egglog_experimental::typed::{
-    EgglogValue, FrozenEClass, FrozenENode, FrozenValueView, get_args,
-};
+use egglog_experimental::typed::{ClassRef, EgglogValue, ProducerRef, get_args};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::egglog_utils::SearchSpace;
@@ -26,7 +24,7 @@ use crate::runtime::{CudaRuntime, ToCudaInput};
 pub fn op_candidates<'f>(
     space: &'f SearchSpace,
     matches: impl Fn(&OpKind) -> bool,
-) -> Vec<[(FrozenEClass<'f>, FrozenENode<'f>); 2]> {
+) -> Vec<[(ClassRef<'f>, ProducerRef<'f>); 2]> {
     let alternatives = space.alternatives().expect("admissible typed alternatives");
     let mut found = Vec::new();
     for (&class, nodes) in &alternatives {
@@ -38,10 +36,7 @@ pub fn op_candidates<'f>(
             if let Some((kind, _)) =
                 get_args(&ir, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs)).unwrap()
             {
-                let FrozenValueView::EClass(kind) = space.frozen.as_view(&kind).unwrap().view()
-                else {
-                    unreachable!()
-                };
+                let kind = space.frozen.class_of(&kind).unwrap();
                 if let Some(kinds) = alternatives.get(&kind) {
                     for &producer in kinds {
                         if matches(&space.frozen.typed_node::<OpKind>(producer).unwrap()) {
@@ -57,7 +52,7 @@ pub fn op_candidates<'f>(
 
 #[test]
 fn forced_candidates_preserve_global_scope_and_exact_kind_producers() {
-    use egglog_experimental::typed::{EGraph, EGraphOptions, constructor, let_, union};
+    use egglog_experimental::typed::{EGraph, constructor, let_, union};
 
     #[constructor]
     fn metadata_holder(hidden: Ir) -> OpKind;
@@ -67,7 +62,7 @@ fn forced_candidates_preserve_global_scope_and_exact_kind_producers() {
     let data = Ir::Op(&first_kind, IList::INil());
     let hidden = Ir::Op(OpKind::Constant(9.0), IList::INil());
     let root = let_("root", Ir::Op(metadata_holder(hidden), [&data, &data]));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, union(first_kind, second_kind)))
         .unwrap();
     let space = SearchSpace::from_frozen(live.freeze().unwrap(), &[root]).unwrap();

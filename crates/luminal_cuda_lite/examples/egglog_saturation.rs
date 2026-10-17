@@ -1,7 +1,10 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use egglog_experimental::typed::{
-    EGraph, FrozenEGraph, Rule, Schedule, builtins as egg, delete, rule, ruleset, sequence,
+    EGraph, Rule, Schedule, Snapshot, builtins as egg, delete, rule, ruleset, sequence,
 };
 use itertools::Itertools;
 use luminal::typed_reference::schema::{DType as EggDType, DimExpr, EList, IList, Ir, OpKind};
@@ -391,26 +394,33 @@ fn phase(egraph: &mut EGraph, name: &str, schedule: impl Into<Schedule>) -> bool
     let start = Instant::now();
     let report = egraph
         .run(schedule)
-        .unwrap_or_else(|error| panic!("failed phase {name}: {error}"));
+        .unwrap_or_else(|error| panic!("failed phase {name}: {error}"))
+        .detail;
     let elapsed = start.elapsed();
     let after = egraph.num_tuples().expect("table census");
     let mut rules = report
         .search_and_apply_time_per_rule
         .iter()
-        .map(|(rule, time)| {
+        .map(|entry| {
+            let time = entry.value.as_ref().expect("typed report duration");
             (
-                rule.to_string(),
-                *time,
+                entry.native_name.clone(),
+                Duration::new(time.seconds, time.nanos),
                 report
                     .num_matches_per_rule
-                    .get(rule)
-                    .copied()
+                    .iter()
+                    .find(|matches| matches.native_name == entry.native_name)
+                    .map(|matches| matches.value)
                     .unwrap_or_default(),
             )
         })
         .collect_vec();
     rules.sort_by_key(|(_, time, matches)| (std::cmp::Reverse(*time), std::cmp::Reverse(*matches)));
-    let matches = report.num_matches_per_rule.values().sum::<usize>();
+    let matches = report
+        .num_matches_per_rule
+        .iter()
+        .map(|entry| entry.value)
+        .sum::<u64>();
     println!(
         "phase {name:<18} {elapsed_ms:>8.2} ms | tuples {before} -> {after} ({delta:+}) | updated={updated} | iters={iters} | matches={matches}",
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
@@ -431,7 +441,7 @@ fn phase(egraph: &mut EGraph, name: &str, schedule: impl Into<Schedule>) -> bool
     report.updated
 }
 
-fn frozen_summary(frozen: &FrozenEGraph, roots: usize) {
+fn frozen_summary(frozen: &Snapshot, roots: usize) {
     let mut top_ops = BTreeMap::new();
     let mut nodes = 0;
     let mut classes = 0;
@@ -534,12 +544,12 @@ fn run(args: Args) {
     let mut egraph = EGraph::default();
     let before = egraph.num_tuples().expect("table census");
     let start = Instant::now();
-    egraph.register(&actions).expect("backend initialization");
+    egraph.register(actions).expect("backend initialization");
     // Install every rule before ending setup, without applying any of them.
     egraph
         .run(ruleset(phases.values().cloned().collect::<Vec<_>>()).repeat(0))
         .expect("rule installation");
-    egraph.register(&outputs).expect("captured roots");
+    egraph.register(outputs.as_slice()).expect("captured roots");
     let after = egraph.num_tuples().expect("table census");
     println!(
         "setup {:>8.2} ms | tuples {before} -> {after} ({:+})",

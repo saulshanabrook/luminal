@@ -219,7 +219,7 @@ pub(crate) fn matmul_backend(
                 eq(b_k_stride, DimExpr::MIter() * n),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (rm_rm, union(sum, rm_rm), set(rm_rm.dtype(), dt)),
         )
@@ -255,7 +255,7 @@ pub(crate) fn matmul_backend(
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (rm_cm, union(sum, rm_cm), set(rm_cm.dtype(), dt)),
         )
@@ -291,7 +291,7 @@ pub(crate) fn matmul_backend(
                 eq(b_k_stride, DimExpr::MIter() * n),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (cm_rm, union(sum, cm_rm), set(cm_rm.dtype(), dt)),
         )
@@ -327,7 +327,7 @@ pub(crate) fn matmul_backend(
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (cm_cm, union(sum, cm_cm), set(cm_cm.dtype(), dt)),
         )
@@ -374,7 +374,7 @@ pub(crate) fn matmul_backend(
                 eq(b_batch_stride, k * b_k_stride),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (
                 batched_rm_rm,
@@ -425,7 +425,7 @@ pub(crate) fn matmul_backend(
                 eq(b_batch_stride, n * b_n_stride),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (
                 batched_rm_cm,
@@ -476,7 +476,7 @@ pub(crate) fn matmul_backend(
                 eq(b_batch_stride, k * b_k_stride),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (
                 batched_cm_rm,
@@ -527,7 +527,7 @@ pub(crate) fn matmul_backend(
                 eq(b_batch_stride, n * b_n_stride),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (
                 batched_cm_cm,

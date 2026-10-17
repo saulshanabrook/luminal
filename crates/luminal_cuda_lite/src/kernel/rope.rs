@@ -1048,7 +1048,7 @@ pub(crate) mod kernel_ro_p_e {
         vec![
             rule(
                 (
-                    Fact::from(rope_invf(invf, ln_theta, inv_hd)),
+                    rope_invf(invf, ln_theta, inv_hd),
                     eq(DType::Int(), pos.dtype()),
                     eq(emb, Ir::Op(SumArgs::fresh(), [embm])),
                     eq(sinb, Ir::Op(OpKind::Cast(sb_size, DType::Bf16()), [sinv])),
@@ -1060,7 +1060,7 @@ pub(crate) mod kernel_ro_p_e {
             .label("kernel rope angles stage"),
             rule(
                 (
-                    Fact::from(rope_angles(cosb, sinb, pos, ln_theta, inv_hd)),
+                    rope_angles(cosb, sinb, pos, ln_theta, inv_hd),
                     eq(x0out, Ir::Op(AddArgs::fresh(), [x0c, x1sn])),
                     eq(x1out, Ir::Op(AddArgs::fresh(), [x1c, x0s])),
                     eq(x, x3),
@@ -1074,9 +1074,9 @@ pub(crate) mod kernel_ro_p_e {
             .label("kernel rope rotation stage"),
             rule(
                 (
-                    Fact::from(rope_rotated(
+                    rope_rotated(
                         x0out, x1out, x, pos, e_hd, e_hd2, e_w, e_seq, ln_theta, inv_hd,
-                    )),
+                    ),
                     eq(
                         cat,
                         Ir::Op(

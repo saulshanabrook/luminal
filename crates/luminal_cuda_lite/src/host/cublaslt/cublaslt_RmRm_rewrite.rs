@@ -132,7 +132,7 @@ pub(crate) fn matmul_backend(
                 eq(b_k_stride, DimExpr::MIter() * n),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (matmul, union(sum, matmul), set(matmul.dtype(), dt)),
         )
@@ -177,7 +177,7 @@ pub(crate) fn matmul_backend(
                 eq(b_batch_stride, &generic_args.k * b_k_stride),
                 eq(dt, a.dtype()),
                 eq(dt, b.dtype()),
-                Fact::from(cublaslt_base_dtype(dt)),
+                cublaslt_base_dtype(dt),
             ),
             (
                 batched_matmul,

@@ -1,5 +1,5 @@
 use super::utilities::op_candidates;
-use egglog_experimental::typed::{FrozenEClass, FrozenENode};
+use egglog_experimental::typed::{ClassRef, ProducerRef};
 use luminal::egglog_utils::{SearchSpace, random_initial_choice, reconstruct, validate_choice_set};
 use luminal::{dtype::DType, prelude::*};
 use rand::{SeedableRng, rngs::StdRng};
@@ -3473,7 +3473,7 @@ fn assert_no_cublaslt_llir_where(
     }
 }
 
-fn cublaslt_ir_nodes(egraph: &SearchSpace) -> Vec<[(FrozenEClass<'_>, FrozenENode<'_>); 2]> {
+fn cublaslt_ir_nodes(egraph: &SearchSpace) -> Vec<[(ClassRef<'_>, ProducerRef<'_>); 2]> {
     op_candidates(egraph, |kind| {
         crate::typed_rules::CuBlasLtArgs::get_args(kind)
             .unwrap()

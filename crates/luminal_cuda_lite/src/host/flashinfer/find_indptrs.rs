@@ -150,7 +150,7 @@ fn logical_binary_inputs(
     else {
         return Ok(None);
     };
-    if String::try_from(opcode)? != op_name {
+    if String::try_from(&opcode)? != op_name {
         return Ok(None);
     }
     walk_ilist(context, &inputs)?

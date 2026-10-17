@@ -385,7 +385,7 @@ pub(crate) fn matmul_backend(
                 eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(b_dtype, b.dtype()),
-                Fact::from(cublaslt_fp8_f32_output_pair(a_dtype, b_dtype)),
+                cublaslt_fp8_f32_output_pair(a_dtype, b_dtype),
             ),
             (
                 sgemm,
@@ -397,7 +397,7 @@ pub(crate) fn matmul_backend(
         // Batched form of the scaled FP8 linear rewrite. The scale operands are
         // scalar tensors expanded across the last three output/activation axes.
         rule(
-            [
+            (
                 eq(
                     recip_input_scale,
                     Ir::Op(
@@ -452,8 +452,8 @@ pub(crate) fn matmul_backend(
                 eq(a_batch_stride, m * a_m_stride),
                 eq(b_batch_stride, n * b_n_stride),
                 eq(b_dtype, b.dtype()),
-                Fact::from(cublaslt_fp8_f32_output_pair(a_dtype, b_dtype)),
-            ],
+                cublaslt_fp8_f32_output_pair(a_dtype, b_dtype),
+            ),
             (
                 batched_scaled_matmul,
                 union(scaled, batched_scaled_matmul),
@@ -757,7 +757,7 @@ pub(crate) fn matmul_backend(
                 eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(b_dtype, b.dtype()),
-                Fact::from(cublaslt_fp8_f32_output_pair(a_dtype, b_dtype)),
+                cublaslt_fp8_f32_output_pair(a_dtype, b_dtype),
             ),
             (
                 sgemm,
@@ -823,7 +823,7 @@ pub(crate) fn matmul_backend(
                 eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(b_dtype, b.dtype()),
-                Fact::from(cublaslt_fp8_f32_output_pair(a_dtype, b_dtype)),
+                cublaslt_fp8_f32_output_pair(a_dtype, b_dtype),
             ),
             (
                 sgemm,
@@ -1030,7 +1030,7 @@ pub(crate) fn cleanup(
                 eq(b_n_stride, DimExpr::MIter() * &generic_args.k),
                 eq(b_k_stride, DimExpr::MIter()),
                 eq(b_dtype, b.dtype()),
-                Fact::from(cublaslt_fp8_f32_output_pair(a_dtype, b_dtype)),
+                cublaslt_fp8_f32_output_pair(a_dtype, b_dtype),
                 eq(
                     scaled,
                     Ir::Op(
@@ -1074,7 +1074,7 @@ pub(crate) fn cleanup(
         rule(
             (
                 eq(raw_gemm, scaled_fused_matmul),
-                Fact::from(cublaslt_fp8_f32_output_pair(cadt, cbdt)),
+                cublaslt_fp8_f32_output_pair(cadt, cbdt),
                 eq(ccdt, DType::F32()),
                 eq(cddt, DType::F32()),
                 eq(cbeta, 0.0),
@@ -1232,14 +1232,14 @@ pub(crate) fn fusion_grow(
         // cuBLASLt A/B scale inputs and the internal multiply can be bypassed.
         rule(
             (
-                Fact::from(cublaslt_fp8_f32_output_pair(cadt, cbdt)),
+                cublaslt_fp8_f32_output_pair(cadt, cbdt),
                 eq(ccdt, DType::F32()),
                 eq(cddt, DType::F32()),
                 eq(cbeta, 0.0),
                 eq(cepilogue, "DEFAULT"),
                 eq(out_shape, [out_m, out_n]),
                 eq(scale_strides, [0, 0]),
-                Fact::from(cublaslt_fp8_scale_product(scale_product, a_scale, b_scale)),
+                cublaslt_fp8_scale_product(scale_product, a_scale, b_scale),
                 // ?fused_scale = Mul(fs_cast, fs_scale) is the rare anchor (one per
                 // fp8 gemm). fs_scale wraps the scale-product FusionEnd; the staged
                 // fact yields its two scalar operands without re-matching the scalar

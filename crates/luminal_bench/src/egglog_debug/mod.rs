@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(program.nodes["t1"].inputs, ["t0", "t0"]);
         assert_eq!(program.roots, ["t2"]);
         assert_eq!(program.trace_back("t2", 20).len(), 3);
-        let mut egraph = EGraph::new(EGraphOptions::default());
+        let mut egraph = EGraph::default();
         for name in &program.order {
             egraph.register(&program.captures[name]).unwrap();
         }
@@ -128,10 +128,13 @@ mod tests {
 
     #[test]
     fn reports_keep_global_coverage_missing_facts_and_json_shape() {
+        #[relation(name = "seen")]
+        fn seen(node: luminal::typed_reference::schema::Ir);
+
         let mut cx = Graph::new();
         cx.tensor(4).output();
         let program = DependencyGraph::from_hlir(&cx).unwrap();
-        let mut egraph = EGraph::new(EGraphOptions::default());
+        let mut egraph = EGraph::default();
         for name in &program.order {
             egraph.register(&program.captures[name]).unwrap();
         }
@@ -139,6 +142,7 @@ mod tests {
             .register((
                 set(program.captures["t0"].dtype(), DType::F32()),
                 OpKind::Constant(2.0),
+                seen(&program.captures["t0"]),
             ))
             .unwrap();
         let frozen = SearchSpace::from_frozen(egraph.freeze().unwrap(), &[]).unwrap();
@@ -146,10 +150,16 @@ mod tests {
             &frozen,
             &program,
             "HLIR",
-            &[FactQuery {
-                fn_name: "dtype".into(),
-                vars: vec!["t0".into(), "missing".into()],
-            }],
+            &[
+                FactQuery {
+                    fn_name: "dtype".into(),
+                    vars: vec!["t0".into(), "missing".into()],
+                },
+                FactQuery {
+                    fn_name: "seen".into(),
+                    vars: vec!["t0".into(), "t1".into()],
+                },
+            ],
             &[("Constant".into(), "MetalConstant".into())],
         );
         assert_eq!(report.op_reports[0].total_classes, 1);
@@ -158,6 +168,10 @@ mod tests {
             matches!(&report.facts["dtype"]["t0"], FactStatus::Resolved(value) if value == "F32")
         );
         assert!(report.facts["dtype"]["missing"].is_missing());
+        assert!(
+            matches!(&report.facts["seen"]["t0"], FactStatus::Resolved(value) if value == "()")
+        );
+        assert!(report.facts["seen"]["t1"].is_missing());
         let json = serde_json::to_value(DebugReport {
             case_name: "probe".into(),
             size: 4,
@@ -175,11 +189,10 @@ mod tests {
         assert_eq!(
             frozen
                 .frozen
-                .tables()
-                .find(|table| table.name() == "Input")
-                .unwrap()
-                .rows()
-                .len(),
+                .eclasses()
+                .flat_map(|class| class.nodes())
+                .filter(|node| node.name() == "Input")
+                .count(),
             1
         );
     }
@@ -187,7 +200,7 @@ mod tests {
     #[test]
     fn coverage_excludes_subsumed_and_missing_producer_cascades() {
         let program = DependencyGraph::default();
-        let mut egraph = EGraph::new(EGraphOptions::default());
+        let mut egraph = EGraph::default();
         let constant = OpKind::Constant(2.0);
         let backend = OpKind::Iota(1, 4);
         let head = DimExpr::MVar("dead");

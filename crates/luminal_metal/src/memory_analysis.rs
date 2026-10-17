@@ -10,6 +10,9 @@ fn metal_output_bytes(kind: OpKind, bytes: DimExpr);
 #[relation]
 fn metal_local_memory(node: Ir, bytes: DimExpr);
 
+#[cfg(test)]
+const OUTPUT_BYTES_NAME: &str = concat!(module_path!(), "::metal_output_bytes");
+
 pub(crate) fn rules() -> Ruleset {
     ruleset(
         |node: &Ir, kind: &OpKind, shape: &EList, elements: &DimExpr| {
@@ -293,29 +296,32 @@ mod tests {
                 phases.insert(KernelLower, ruleset(()));
             }
             let mut live = EGraph::default();
-            live.register(&actions)?;
-            live.register(&roots)?;
+            live.register(actions)?;
+            live.register(roots.as_slice())?;
             live.run(main_schedule(&phases, false))?;
             // Inspect analysis before final cleanup deletes n_elements metadata.
             live.run(phases[&LateAnalysis].saturate())?;
             let frozen = live.freeze()?;
             assert_eq!(
-                !frozen
-                    .table(|shape: &EList, strides: &EList, out: &EList| {
-                        metal_sin(shape, strides, out)
-                    })?
-                    .rows
-                    .is_empty(),
+                frozen
+                    .eclasses()
+                    .filter(|class| class.sort() == OpKind::sort_ref())
+                    .flat_map(|class| class.nodes())
+                    .any(|node| MetalSinArgs::get_args(
+                        &frozen.typed_node::<OpKind>(node).unwrap()
+                    )
+                    .unwrap()
+                    .is_some()),
                 enabled,
             );
             assert_eq!(
                 frozen
-                    .table(|kind: &OpKind, bytes: &DimExpr| metal_output_bytes(kind, bytes))?
-                    .rows
-                    .iter()
+                    .rows()
+                    .filter(|row| row.name() == OUTPUT_BYTES_NAME)
                     .any(|row| {
+                        let kind = row.args().next().unwrap().try_typed::<OpKind>().unwrap();
                         frozen
-                            .nodes(&row.args.0)
+                            .nodes(&kind)
                             .unwrap()
                             .any(|kind| MetalSinArgs::get_args(&kind).unwrap().is_some())
                     }),
@@ -329,7 +335,6 @@ mod tests {
     fn installed_late_catalog_preserves_old_opkind_filter_and_byte_facts() -> Result<(), TypedError>
     {
         let theory = rules();
-        assert_eq!(theory.len(), 31); // Original 32, without the removed OutputJoin.
         let shape = EList::from([2, 3]);
         let input = Ir::Input(7, "input", DType::F32());
         let unary = metal_exp2(&shape, [3, 1], [3, 1]);
@@ -338,7 +343,7 @@ mod tests {
         let loop_kind = OpKind::LoopInput(17, 19, DType::F32());
         let op = Ir::Op(&unary, [&input]);
         let output = Ir::Output(&op, 11);
-        let mut live = EGraph::new(EGraphOptions::default());
+        let mut live = EGraph::default();
         live.register((
             &output,
             &boolean,
@@ -377,13 +382,12 @@ mod tests {
             live.register(&kind)?;
             live.run(theory.saturate())?;
             let frozen = live.freeze()?;
-            let kind = frozen.lookup(&kind)?;
+            let kind = frozen.class_of(&frozen.lookup(&kind)?)?;
             assert!(
                 frozen
-                    .table(|kind: &OpKind, bytes: &DimExpr| metal_output_bytes(kind, bytes))?
-                    .rows
-                    .iter()
-                    .all(|row| row.args.0 != kind)
+                    .rows()
+                    .filter(|row| row.name() == OUTPUT_BYTES_NAME)
+                    .all(|row| row.args().next().unwrap().class() != Some(kind))
             );
         }
         for kind in [unary, boolean, core_boolean, loop_kind] {

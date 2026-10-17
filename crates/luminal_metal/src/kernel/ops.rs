@@ -3458,7 +3458,7 @@ pub(crate) mod metal_scatter_no_copy {
             rule(
                 (
                     eq(list, IList::ICons(head, tail)),
-                    Fact::from(consumed_buffer_ilist_contains(tail, item)),
+                    consumed_buffer_ilist_contains(tail, item),
                 ),
                 (consumed_buffer_ilist_contains(list, item),),
             )
@@ -3466,9 +3466,9 @@ pub(crate) mod metal_scatter_no_copy {
             rule(
                 (
                     eq(cb, consumed_buffer(a)),
-                    Fact::from(consumed_buffer_ilist_contains(ilist1, cb)),
+                    consumed_buffer_ilist_contains(ilist1, cb),
                     ne(op1, op2),
-                    Fact::from(consumed_buffer_ilist_contains(ilist2, a)),
+                    consumed_buffer_ilist_contains(ilist2, a),
                 ),
                 (delete(consumed_buffer(a)),),
             )
