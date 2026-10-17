@@ -275,7 +275,7 @@ pub(crate) fn expression(
         rule(
             (eq(v_rw_dim, (DimExpr::MNum(vn_num) * va_dim) + va_dim),),
             (
-                union(v_rw_dim, DimExpr::MNum(vn_num + 1i64) * va_dim),
+                union(v_rw_dim, DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim),
                 subsume((DimExpr::MNum(vn_num) * va_dim) + va_dim),
             ),
         )
@@ -283,7 +283,7 @@ pub(crate) fn expression(
         rule(
             (eq(v_rw_dim, va_dim + (DimExpr::MNum(vn_num) * va_dim)),),
             (
-                union(v_rw_dim, DimExpr::MNum(vn_num + 1i64) * va_dim),
+                union(v_rw_dim, DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim),
                 subsume(va_dim + (DimExpr::MNum(vn_num) * va_dim)),
             ),
         )
@@ -291,7 +291,7 @@ pub(crate) fn expression(
         rule(
             (eq(v_rw_dim, (va_dim * DimExpr::MNum(vn_num)) + va_dim),),
             (
-                union(v_rw_dim, DimExpr::MNum(vn_num + 1i64) * va_dim),
+                union(v_rw_dim, DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim),
                 subsume((va_dim * vn_num) + va_dim),
             ),
         )
@@ -299,7 +299,7 @@ pub(crate) fn expression(
         rule(
             (eq(v_rw_dim, va_dim + (va_dim * DimExpr::MNum(vn_num))),),
             (
-                union(v_rw_dim, DimExpr::MNum(vn_num + 1i64) * va_dim),
+                union(v_rw_dim, DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim),
                 subsume(va_dim + (va_dim * vn_num)),
             ),
         )
@@ -332,7 +332,7 @@ pub(crate) fn expression(
                 ((DimExpr::MNum(vn_num) * va_dim) + vb_dim) + va_dim,
             ),),
             (
-                union(v_rw_dim, (DimExpr::MNum(vn_num + 1i64) * va_dim) + vb_dim),
+                union(v_rw_dim, (DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim) + vb_dim),
                 subsume(((DimExpr::MNum(vn_num) * va_dim) + vb_dim) + va_dim),
             ),
         )
@@ -343,7 +343,7 @@ pub(crate) fn expression(
                 (vb_dim + (DimExpr::MNum(vn_num) * va_dim)) + va_dim,
             ),),
             (
-                union(v_rw_dim, vb_dim + (DimExpr::MNum(vn_num + 1i64) * va_dim)),
+                union(v_rw_dim, vb_dim + (DimExpr::MNum(vn_num + egg::I64::from(1i64)) * va_dim)),
                 subsume((vb_dim + (DimExpr::MNum(vn_num) * va_dim)) + va_dim),
             ),
         )
@@ -443,7 +443,7 @@ pub(crate) fn expression(
                 eq(ve_list, EList::ECons(vexpr, vlist)),
                 eq(vprev_len, vlist.len()),
             ),
-            (set(ve_list.len(), vprev_len + 1i64),),
+            (set(ve_list.len(), vprev_len + egg::I64::from(1i64)),),
         ),
         rule(
             (

@@ -267,9 +267,9 @@ impl LoopInput {
             return Ok(None);
         };
         Ok(Some(LLIROp::new::<LoopInput>(Box::new(Self {
-            loop_id: usize::try_from(i64::try_from(loop_id)?)
+            loop_id: usize::try_from(i64::try_from(&loop_id)?)
                 .map_err(|_| TypedError::Decode("LoopInput loop_id must be nonnegative".into()))?,
-            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+            stream_id: usize::try_from(i64::try_from(&stream_id)?).map_err(|_| {
                 TypedError::Decode("LoopInput stream_id must be nonnegative".into())
             })?,
             dtype: context.dtype(&dtype)?,
@@ -333,10 +333,10 @@ impl LoopInputStatic {
             return Ok(None);
         };
         Ok(Some(LLIROp::new::<LoopInputStatic>(Box::new(Self {
-            loop_id: usize::try_from(i64::try_from(loop_id)?).map_err(|_| {
+            loop_id: usize::try_from(i64::try_from(&loop_id)?).map_err(|_| {
                 TypedError::Decode("LoopInputStatic loop_id must be nonnegative".into())
             })?,
-            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+            stream_id: usize::try_from(i64::try_from(&stream_id)?).map_err(|_| {
                 TypedError::Decode("LoopInputStatic stream_id must be nonnegative".into())
             })?,
             dtype: context.dtype(&dtype)?,
@@ -397,9 +397,9 @@ impl LoopOutput {
             return Ok(None);
         };
         Ok(Some(LLIROp::new::<LoopOutput>(Box::new(Self {
-            loop_id: usize::try_from(i64::try_from(loop_id)?)
+            loop_id: usize::try_from(i64::try_from(&loop_id)?)
                 .map_err(|_| TypedError::Decode("LoopOutput loop_id must be nonnegative".into()))?,
-            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+            stream_id: usize::try_from(i64::try_from(&stream_id)?).map_err(|_| {
                 TypedError::Decode("LoopOutput stream_id must be nonnegative".into())
             })?,
             dtype: context.dtype(&dtype)?,
@@ -462,13 +462,13 @@ impl LoopOutputSelect {
             return Ok(None);
         };
         Ok(Some(LLIROp::new::<LoopOutputSelect>(Box::new(Self {
-            loop_id: usize::try_from(i64::try_from(loop_id)?).map_err(|_| {
+            loop_id: usize::try_from(i64::try_from(&loop_id)?).map_err(|_| {
                 TypedError::Decode("LoopOutputSelect loop_id must be nonnegative".into())
             })?,
-            stream_id: usize::try_from(i64::try_from(stream_id)?).map_err(|_| {
+            stream_id: usize::try_from(i64::try_from(&stream_id)?).map_err(|_| {
                 TypedError::Decode("LoopOutputSelect stream_id must be nonnegative".into())
             })?,
-            iter: usize::try_from(i64::try_from(iter)?).map_err(|_| {
+            iter: usize::try_from(i64::try_from(&iter)?).map_err(|_| {
                 TypedError::Decode("LoopOutputSelect iter must be nonnegative".into())
             })?,
             dtype: context.dtype(&dtype)?,
@@ -535,7 +535,7 @@ impl Constant {
             return Ok(None);
         };
         Ok(Some(LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
-            f64::try_from(value)? as f32,
+            f64::try_from(&value)? as f32,
         )))))
     }
 }

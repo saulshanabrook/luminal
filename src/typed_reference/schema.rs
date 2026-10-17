@@ -440,7 +440,7 @@ mod tests {
             ((&x * DimExpr::MNum(&number)) + DimExpr::MNum(3)) / DimExpr::MNum(&number)
         );
         assert_eq!(
-            &x - (&number - 1),
+            &x - (&number - egg::I64::from(1)),
             &x - DimExpr::MNum(&number - egg::I64::from(1))
         );
         assert_eq!(
@@ -448,7 +448,7 @@ mod tests {
             DimExpr::MCeilDiv(DimExpr::MNum(&number), DimExpr::MNum(0))
         );
         // Conversion constructs syntax even when evaluating its input would fail.
-        let quotient = egg::I64::from(1) / 0;
+        let quotient = egg::I64::from(1) / egg::I64::from(0);
         assert_eq!(DimExpr::from(&quotient), DimExpr::MNum(quotient));
         assert_eq!(&x / 0, &x / DimExpr::MNum(0));
 
@@ -460,7 +460,7 @@ mod tests {
             let (field,) = get_args(&expression, |value: &egg::F64| DimExpr::MFloat(value))
                 .unwrap()
                 .unwrap();
-            assert_eq!(f64::try_from(field).unwrap().to_bits(), bits);
+            assert_eq!(f64::try_from(&field).unwrap().to_bits(), bits);
         }
         let float = var::<egg::F64>("float");
         assert_eq!(DimExpr::from(&float), DimExpr::MFloat(&float));
@@ -481,7 +481,7 @@ mod tests {
         let (field,) = get_args(&expected, |name: &egg::String| DimExpr::MVar(name))
             .unwrap()
             .unwrap();
-        assert_eq!(String::try_from(field).unwrap(), name);
+        assert_eq!(String::try_from(&field).unwrap(), name);
         assert_ne!(DimExpr::from("x"), var::<DimExpr>("x"));
         for name in ['x', 'z', 'λ'] {
             assert_eq!(DimExpr::from(name), DimExpr::MVar(name.to_string()));
@@ -594,7 +594,7 @@ mod tests {
     fn conversions_keep_frozen_children_observation_only() -> Result<(), TypedError> {
         let scalar = let_("number", egg::I64::from(7));
         let input = let_("input", Ir::Input(0, "input", crate::dtype::DType::F32));
-        let mut graph = EGraph::new(EGraphOptions::default());
+        let mut graph = EGraph::default();
         graph.register((&scalar, &input))?;
         let frozen = graph.freeze()?;
         let scalar = frozen.lookup(&scalar)?;
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(graph.num_tuples()?, before);
         drop(frozen);
         drop(graph);
-        assert_eq!(i64::try_from(field).unwrap(), 7);
+        assert_eq!(i64::try_from(&field).unwrap(), 7);
         assert_eq!(head, input);
         Ok(())
     }

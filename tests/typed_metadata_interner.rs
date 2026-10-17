@@ -14,7 +14,7 @@ fn frozen_metadata_can_be_reconstructed_after_host_interner_reset() -> Result<()
             [input],
         ),
     );
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register(&root)?;
     let space = SearchSpace::from_frozen(live.freeze()?, &[root])?;
     let mut rng = StdRng::seed_from_u64(1);

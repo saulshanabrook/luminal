@@ -1,7 +1,7 @@
 use super::*;
 use crate::hlir::{Input, LoopEnd, LoopStart, Output};
 use crate::typed_reference::schema::{self, DType as IrDType, DimExpr, EList, IList, Ir, OpKind};
-use egglog_experimental::typed::{FrozenEClass, FrozenENode, FrozenValueView, builtins as egg};
+use egglog_experimental::typed::{ClassRef, ProducerRef, builtins as egg};
 use petgraph::graph::NodeIndex;
 use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 /// A snapshot and its ordered observed roots. Selection never changes either.
 #[derive(Clone)]
 pub struct SearchSpace {
-    pub frozen: FrozenEGraph,
+    pub frozen: Snapshot,
     pub roots: Vec<Ir>,
     /// Apply conditional HLIR cleanup to alternatives, without changing the snapshot.
     pub clean_hlir: bool,
@@ -36,11 +36,11 @@ struct Metadata {
     lists: FxHashMap<EList, Vec<Expression>>,
 }
 
-pub type EGraphChoiceSet<'f> = FxHashMap<FrozenEClass<'f>, FrozenENode<'f>>;
-pub type Alternatives<'f> = FxHashMap<FrozenEClass<'f>, Vec<FrozenENode<'f>>>;
+pub type EGraphChoiceSet<'f> = FxHashMap<ClassRef<'f>, ProducerRef<'f>>;
+pub type Alternatives<'f> = FxHashMap<ClassRef<'f>, Vec<ProducerRef<'f>>>;
 
 impl SearchSpace {
-    pub fn from_frozen(frozen: FrozenEGraph, captures: &[Ir]) -> Result<Self, TypedError> {
+    pub fn from_frozen(frozen: Snapshot, captures: &[Ir]) -> Result<Self, TypedError> {
         let roots = captures
             .iter()
             .enumerate()
@@ -88,10 +88,7 @@ impl SearchSpace {
                     if let Some((kind, _)) =
                         get_args(&typed, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))?
                     {
-                        let FrozenValueView::EClass(kind) = self.frozen.as_view(&kind)?.view()
-                        else {
-                            unreachable!()
-                        };
+                        let kind = self.frozen.class_of(&kind)?;
                         // The old conditional cleanup inspected only Op nodes,
                         // not direct-IR backend constructors. Preserve that
                         // distinction after those constructors become OpKinds.
@@ -127,9 +124,7 @@ impl SearchSpace {
         }
         prune_missing_producers(&mut alternatives);
         for (index, root) in self.roots.iter().enumerate() {
-            let FrozenValueView::EClass(class) = self.frozen.as_view(root)?.view() else {
-                unreachable!()
-            };
+            let class = self.frozen.class_of(root)?;
             if !alternatives.contains_key(&class) {
                 return Err(TypedError::UnresolvedRoot {
                     index: Some(index),
@@ -157,7 +152,7 @@ fn prune_missing_producers(alternatives: &mut Alternatives<'_>) {
     }
 }
 
-fn searchable(class: FrozenEClass<'_>) -> bool {
+fn searchable(class: ClassRef<'_>) -> bool {
     let sort = class.sort();
     sort == Ir::sort_ref() || sort == IList::sort_ref() || sort == OpKind::sort_ref()
 }
@@ -206,8 +201,8 @@ pub fn hash_search_space(space: &SearchSpace) -> Result<u64, TypedError> {
 // Preserve the old metadata-compatibility preference as visible search policy.
 // This deliberately does not redefine what a typed decoder's selected node means.
 fn extractor_list_len<'f>(
-    frozen: &FrozenEGraph,
-    mut class: FrozenEClass<'f>,
+    frozen: &Snapshot,
+    mut class: ClassRef<'f>,
     alternatives: &Alternatives<'f>,
 ) -> Option<usize> {
     let mut len = 0;
@@ -251,14 +246,14 @@ fn extractor_list_len<'f>(
 }
 
 fn opkind_metadata_consistent<'f>(
-    frozen: &FrozenEGraph,
-    node: FrozenENode<'f>,
+    frozen: &Snapshot,
+    node: ProducerRef<'f>,
     alternatives: &Alternatives<'f>,
 ) -> bool {
     let lengths: Vec<_> = node
         .args()
         .filter_map(|field| {
-            let FrozenValueView::EClass(class) = field.view() else {
+            let Some(class) = field.class() else {
                 return None;
             };
             if class.sort() == EList::sort_ref() || class.sort() == IList::sort_ref() {
@@ -272,7 +267,7 @@ fn opkind_metadata_consistent<'f>(
 }
 
 pub fn random_initial_choice<'f>(
-    frozen: &FrozenEGraph,
+    frozen: &Snapshot,
     alternatives: &Alternatives<'f>,
     rng: &mut impl Rng,
 ) -> EGraphChoiceSet<'f> {
@@ -314,18 +309,14 @@ pub fn validate_choice_set(
         }
     }
     for root in &space.roots {
-        let FrozenValueView::EClass(class) = space.frozen.as_view(root)?.view() else {
-            unreachable!()
-        };
+        let class = space.frozen.class_of(root)?;
         if !choices.contains_key(&class) {
             return Err(TypedError::Invalid("root has no selected producer".into()));
         }
     }
     let mut pending = Vec::new();
     for root in &space.roots {
-        let FrozenValueView::EClass(class) = space.frozen.as_view(root)?.view() else {
-            unreachable!()
-        };
+        let class = space.frozen.class_of(root)?;
         pending.push(class);
     }
     let mut seen = FxHashSet::default();
@@ -355,7 +346,7 @@ pub fn validate_choice_set(
     Ok(())
 }
 
-fn choice_hash(class: FrozenEClass<'_>, node: FrozenENode<'_>) -> u64 {
+fn choice_hash(class: ClassRef<'_>, node: ProducerRef<'_>) -> u64 {
     let mut hash = DefaultHasher::new();
     (class, node).hash(&mut hash);
     hash.finish()
@@ -378,11 +369,7 @@ pub fn extract_reachable_generation<'f>(
 ) -> Vec<EGraphChoiceSet<'f>> {
     let mut pending = Vec::new();
     for root in &space.roots {
-        let FrozenValueView::EClass(class) =
-            space.frozen.as_view(root).expect("observed root").view()
-        else {
-            unreachable!()
-        };
+        let class = space.frozen.class_of(root).expect("observed root");
         pending.push(class);
     }
     let mut visited = FxHashSet::default();
@@ -412,7 +399,7 @@ pub fn extract_reachable_generation<'f>(
 
 /// Mutate all searchable classes, retaining the separate fuzz-test policy.
 pub fn extract_generation<'f>(
-    frozen: &FrozenEGraph,
+    frozen: &Snapshot,
     alternatives: &Alternatives<'f>,
     base: &EGraphChoiceSet<'f>,
     generation_size: usize,
@@ -439,10 +426,10 @@ pub fn extract_generation<'f>(
 
 #[allow(clippy::too_many_arguments)] // Shared reachable/all-class mutation policy and its snapshot.
 fn extract_generation_from_classes<'f>(
-    frozen: &FrozenEGraph,
+    frozen: &Snapshot,
     alternatives: &Alternatives<'f>,
     base: &EGraphChoiceSet<'f>,
-    mutable: &[FrozenEClass<'f>],
+    mutable: &[ClassRef<'f>],
     generation_size: usize,
     mutations_per_generation: usize,
     prev_selected: &mut FxHashSet<u64>,
@@ -499,12 +486,12 @@ fn extract_generation_from_classes<'f>(
 // On equal cost, prefer an existing MNum so singleton dimensions decode without
 // a variable environment; all remaining ties retain their first producer.
 fn shortest_dimension<'f>(
-    frozen: &FrozenEGraph,
-    class: FrozenEClass<'f>,
+    frozen: &Snapshot,
+    class: ClassRef<'f>,
     alternatives: Option<&Alternatives<'f>>,
-    seen: &mut FxHashSet<FrozenENode<'f>>,
-    cache: &mut FxHashMap<FrozenENode<'f>, Option<(usize, Vec<FrozenENode<'f>>)>>,
-) -> Option<(usize, Vec<FrozenENode<'f>>)> {
+    seen: &mut FxHashSet<ProducerRef<'f>>,
+    cache: &mut FxHashMap<ProducerRef<'f>, Option<(usize, Vec<ProducerRef<'f>>)>>,
+) -> Option<(usize, Vec<ProducerRef<'f>>)> {
     class
         .nodes()
         .filter(|node| {
@@ -523,7 +510,7 @@ fn shortest_dimension<'f>(
             let mut cost = 1;
             let mut trajectory = vec![node];
             let complete = node.args().try_for_each(|field| {
-                if let FrozenValueView::EClass(child) = field.view() {
+                if let Some(child) = field.class() {
                     let (child_cost, children) =
                         shortest_dimension(frozen, child, alternatives, seen, cache)?;
                     cost += child_cost;
@@ -554,14 +541,14 @@ fn shortest_dimension<'f>(
 
 /// Candidate-local native metadata decoding and exact producer inspection.
 pub struct DecodeContext<'f, 'c> {
-    pub frozen: &'f FrozenEGraph,
+    pub frozen: &'f Snapshot,
     pub choices: &'c EGraphChoiceSet<'f>,
     metadata: Metadata,
     alternatives: Option<&'c Alternatives<'f>>,
 }
 
 impl<'f, 'c> DecodeContext<'f, 'c> {
-    pub fn new(frozen: &'f FrozenEGraph, choices: &'c EGraphChoiceSet<'f>) -> Self {
+    pub fn new(frozen: &'f Snapshot, choices: &'c EGraphChoiceSet<'f>) -> Self {
         Self {
             frozen,
             choices,
@@ -576,12 +563,8 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
     pub fn producers<S: EqualitySort>(
         &self,
         value: &S,
-    ) -> Result<impl Iterator<Item = FrozenENode<'f>> + '_, TypedError> {
-        let FrozenValueView::EClass(class) = self.frozen.as_view(value)?.view() else {
-            return Err(TypedError::Decode(
-                "expected an observed equality class".into(),
-            ));
-        };
+    ) -> Result<impl Iterator<Item = ProducerRef<'f>> + '_, TypedError> {
+        let class = self.frozen.class_of(value)?;
         Ok(class.nodes().filter(move |node| {
             !node.is_subsumed()
                 && self
@@ -593,11 +576,7 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
     /// Resolve candidate choices; use the first producer for lists/dtypes and
     /// shortest expressions for dimensions, preferring MNum on equal cost.
     pub fn selected<S: EqualitySort>(&mut self, value: &S) -> Result<S, TypedError> {
-        let FrozenValueView::EClass(class) = self.frozen.as_view(value)?.view() else {
-            return Err(TypedError::Decode(
-                "expected an observed equality class".into(),
-            ));
-        };
+        let class = self.frozen.class_of(value)?;
         let node = if searchable(class) {
             *self.choices.get(&class).ok_or_else(|| {
                 TypedError::Decode("candidate is missing a producer choice".into())
@@ -624,7 +603,7 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
                 .ok_or_else(|| TypedError::Decode("metadata has no producer".into()))?
         };
         let selected = self.frozen.typed_node(node)?;
-        if self.frozen.as_view(&selected)? != class.value() {
+        if self.frozen.class_of(&selected)? != class {
             return Err(TypedError::Invalid(
                 "selected producer belongs to another equality class".into(),
             ));
@@ -633,9 +612,7 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
     }
 
     pub fn expression(&mut self, value: &DimExpr) -> Result<Expression, TypedError> {
-        let FrozenValueView::EClass(class) = self.frozen.as_view(value)?.view() else {
-            return Err(TypedError::Decode("expected an expression class".into()));
-        };
+        let class = self.frozen.class_of(value)?;
         if let Some(expression) = self.metadata.dimensions.get(value) {
             return Ok(*expression);
         }
@@ -648,17 +625,17 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
         )
         .ok_or_else(|| TypedError::Decode("metadata has no finite producer".into()))?;
         fn decode<'f>(
-            frozen: &'f FrozenEGraph,
-            trajectory: &mut impl Iterator<Item = FrozenENode<'f>>,
+            frozen: &'f Snapshot,
+            trajectory: &mut impl Iterator<Item = ProducerRef<'f>>,
         ) -> Result<Expression, TypedError> {
             let node = frozen.typed_node::<DimExpr>(
                 trajectory.next().expect("complete expression trajectory"),
             )?;
             if let Some((number,)) = get_args(&node, |n: &egg::I64| DimExpr::MNum(n))? {
-                return Ok(Expression::from(i64::try_from(number)?));
+                return Ok(Expression::from(i64::try_from(&number)?));
             }
             if let Some((name,)) = get_args(&node, |name: &egg::String| DimExpr::MVar(name))? {
-                let name = String::try_from(name)?;
+                let name = String::try_from(&name)?;
                 return name
                     .chars()
                     .next()
@@ -739,7 +716,7 @@ impl<'f, 'c> DecodeContext<'f, 'c> {
     }
 
     pub fn expressions(&mut self, value: &EList) -> Result<Vec<Expression>, TypedError> {
-        self.frozen.as_view(value)?;
+        self.frozen.class_of(value)?;
         if let Some(values) = self.metadata.lists.get(value) {
             return Ok(values.clone());
         }
@@ -805,9 +782,7 @@ pub fn reconstruct(
     // original producers and never materialize an otherwise-unreachable input.
     let mut pending = Vec::new();
     for root in &space.roots {
-        let FrozenValueView::EClass(class) = space.frozen.as_view(root)?.view() else {
-            unreachable!()
-        };
+        let class = space.frozen.class_of(root)?;
         pending.push(class);
     }
     let mut reachable = FxHashSet::default();
@@ -890,9 +865,7 @@ pub fn reconstruct(
         } else if let Some((kind, inputs)) =
             get_args(&node, |kind: &OpKind, inputs: &IList| Ir::Op(kind, inputs))?
         {
-            let FrozenValueView::EClass(kind_class) = context.frozen.as_view(&kind)?.view() else {
-                unreachable!()
-            };
+            let kind_class = context.frozen.class_of(&kind)?;
             // Prefer a metadata-compatible OpKind. The decoder inspects exactly
             // this chosen node.
             let nodes = &alternatives[&kind_class];
@@ -971,6 +944,7 @@ pub fn reconstruct(
 fn decode_producer_inspection_preserves_cleanup_and_snapshot_ownership() -> Result<(), TypedError> {
     let root = let_("root", Ir::Op(OpKind::Constant(1.0), IList::INil()));
     let mut live = EGraph::default();
+    live.register(&root)?;
     live.register(union(
         &root,
         Ir::Op(OpKind::LoopInput(7, 9, IrDType::F32()), IList::INil()),

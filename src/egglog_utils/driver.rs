@@ -1,6 +1,7 @@
 use super::*;
 use crate::typed_reference;
 use colored::Colorize;
+use egglog_experimental::typed::report::{ReportDuration, ReportStageKind};
 use itertools::Itertools;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -325,18 +326,33 @@ pub fn run_schedule(
     Ok(report)
 }
 
-fn stage_report(egraph: &EGraph, total_time: Duration) -> Result<EgglogStageReport, TypedError> {
+fn stage_report(
+    egraph: &mut EGraph,
+    total_time: Duration,
+) -> Result<EgglogStageReport, TypedError> {
     let run_report = egraph.stats()?;
     Ok(EgglogStageReport {
         num_matches_per_rule: run_report
+            .detail
             .num_matches_per_rule
             .iter()
-            .map(|(name, matches)| (name.to_string(), *matches))
+            .map(|entry| {
+                (
+                    entry.native_name.clone(),
+                    usize::try_from(entry.value).expect("native match count fits usize"),
+                )
+            })
             .collect(),
         search_and_apply_time_per_rule: run_report
+            .detail
             .search_and_apply_time_per_rule
             .iter()
-            .map(|(name, elapsed)| (name.to_string(), *elapsed))
+            .map(|entry| {
+                (
+                    entry.native_name.clone(),
+                    report_duration(entry.value.as_ref()),
+                )
+            })
             .collect(),
         total_time,
     })
@@ -372,6 +388,11 @@ fn metric_duration(duration: Duration) -> String {
     pretty_duration::pretty_duration(&duration, None)
 }
 
+fn report_duration(duration: Option<&ReportDuration>) -> Duration {
+    let duration = duration.expect("typed reports contain required metric durations");
+    Duration::new(duration.seconds, duration.nanos)
+}
+
 /// Extra per-rule / per-ruleset printing. Requires the normal egglog log
 /// channel plus `EGGLOG_DEBUG=1`.
 fn egglog_debug() -> bool {
@@ -390,18 +411,27 @@ fn metric_name(name: &str) -> String {
 fn sorted_rule_metrics(
     report: &egglog_experimental::typed::RunReport,
 ) -> Vec<(String, Duration, usize)> {
+    let matches: FxHashMap<_, _> = report
+        .detail
+        .num_matches_per_rule
+        .iter()
+        .map(|entry| (entry.native_name.as_str(), entry.value))
+        .collect();
     let mut rules = report
+        .detail
         .search_and_apply_time_per_rule
         .iter()
-        .map(|(rule, elapsed)| {
+        .map(|entry| {
             (
-                rule.to_string(),
-                *elapsed,
-                report
-                    .num_matches_per_rule
-                    .get(rule)
-                    .copied()
-                    .unwrap_or_default(),
+                entry.native_name.clone(),
+                report_duration(entry.value.as_ref()),
+                usize::try_from(
+                    matches
+                        .get(entry.native_name.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .expect("native match count fits usize"),
             )
         })
         .collect_vec();
@@ -416,17 +446,31 @@ fn print_rule_plan_hotspots(
     for (rule, _, _) in rules.iter().take(3) {
         let mut max_stage = None;
         let mut max_shape = None;
-        for iteration in &report.iterations {
-            if let Some(rule_reports) = iteration.rule_reports().get(rule.as_str()) {
-                for rule_report in rule_reports {
+        for iteration in &report.detail.iterations {
+            let ruleset = iteration
+                .rule_set_report
+                .as_ref()
+                .expect("typed iteration reports contain their ruleset report");
+            for rule_reports in ruleset
+                .rule_reports
+                .iter()
+                .filter(|entry| entry.native_name == *rule)
+            {
+                for rule_report in &rule_reports.reports {
                     if let Some(plan) = &rule_report.plan {
                         let scans = plan
                             .stages
                             .iter()
-                            .map(|(stage, _, _)| match stage {
-                                egglog_reports::Stage::Intersect { scans } => scans.len(),
-                                egglog_reports::Stage::FusedIntersect { to_intersect, .. } => {
-                                    to_intersect.len() + 1
+                            .map(|stage| {
+                                match stage
+                                    .kind
+                                    .as_ref()
+                                    .expect("typed plan stages contain their kind")
+                                {
+                                    ReportStageKind::Intersect(stage) => stage.scans.len(),
+                                    ReportStageKind::FusedIntersect(stage) => {
+                                        stage.to_intersect.len() + 1
+                                    }
                                 }
                             })
                             .sum::<usize>();
@@ -441,8 +485,8 @@ fn print_rule_plan_hotspots(
                                 })
                                 .unwrap_or((plan.stages.len(), scans)),
                         );
-                        for (_, stats, _) in &plan.stages {
-                            if let Some(stats) = stats {
+                        for stage in &plan.stages {
+                            if let Some(stats) = &stage.stats {
                                 if max_stage
                                     .map(|(candidates, _)| stats.num_candidates > candidates)
                                     .unwrap_or(true)
@@ -517,27 +561,36 @@ fn print_slow_phase_detail(
     }
     print_rule_plan_hotspots(report, rules);
 
-    let iteration_count = report.iterations.len();
-    for (index, iteration) in report.iterations.iter().enumerate() {
+    let iteration_count = report.detail.iterations.len();
+    for (index, iteration) in report.detail.iterations.iter().enumerate() {
         if iteration_count > 12 && (8..iteration_count.saturating_sub(3)).contains(&index) {
             if index == 8 {
                 eprintln!("      iter   ...");
             }
             continue;
         }
-        let (rule, elapsed, matches) = iteration
-            .rule_reports()
+        let ruleset = iteration
+            .rule_set_report
+            .as_ref()
+            .expect("typed iteration reports contain their ruleset report");
+        let (rule, elapsed, matches) = ruleset
+            .rule_reports
             .iter()
-            .map(|(rule, reports)| {
+            .map(|entry| {
                 (
-                    rule.to_string(),
-                    reports
+                    entry.native_name.clone(),
+                    entry
+                        .reports
                         .iter()
-                        .map(|report| report.search_and_apply_time)
+                        .map(|report| report_duration(report.search_and_apply_time.as_ref()))
                         .sum::<Duration>(),
-                    reports
+                    entry
+                        .reports
                         .iter()
-                        .map(|report| report.num_matches)
+                        .map(|report| {
+                            usize::try_from(report.num_matches)
+                                .expect("native match count fits usize")
+                        })
                         .sum::<usize>(),
                 )
             })
@@ -546,10 +599,10 @@ fn print_slow_phase_detail(
         eprintln!(
             "      iter   {:>2} changed={} | search {:>10} | merge {:>10} | rebuild {:>10} | top {:<64} {:>10} matches {}",
             index + 1,
-            iteration.changed(),
-            metric_duration(iteration.search_and_apply_time()),
-            metric_duration(iteration.rule_set_report.merge_time),
-            metric_duration(iteration.rebuild_time),
+            ruleset.changed,
+            metric_duration(report_duration(ruleset.search_and_apply_time.as_ref())),
+            metric_duration(report_duration(ruleset.merge_time.as_ref())),
+            metric_duration(report_duration(iteration.rebuild_time.as_ref())),
             metric_name(&rule),
             metric_duration(elapsed),
             matches
@@ -687,8 +740,8 @@ fn run_schedule_phase(
     let elapsed = start.elapsed();
     let tuples_after = egraph.num_tuples()?;
 
-    let updated = report.updated;
-    let iterations = report.iterations.len();
+    let updated = report.detail.updated;
+    let iterations = report.detail.iterations.len();
     let tuple_delta = tuples_after as isize - tuples_before as isize;
     if log {
         eprintln!(
@@ -708,51 +761,28 @@ fn run_schedule_phase(
     }
 
     if log && egglog_debug() {
-        let mut rulesets = report
-            .search_and_apply_time_per_ruleset
-            .keys()
-            .chain(report.merge_time_per_ruleset.keys())
-            .chain(report.rebuild_time_per_ruleset.keys())
-            .map(|ruleset| ruleset.to_string())
-            .unique()
-            .collect_vec();
-        let ruleset_total = |ruleset: &str| {
-            report
-                .search_and_apply_time_per_ruleset
-                .get(ruleset)
-                .copied()
-                .unwrap_or(Duration::ZERO)
-                + report
-                    .merge_time_per_ruleset
-                    .get(ruleset)
-                    .copied()
-                    .unwrap_or(Duration::ZERO)
-                + report
-                    .rebuild_time_per_ruleset
-                    .get(ruleset)
-                    .copied()
-                    .unwrap_or(Duration::ZERO)
-        };
-        rulesets.sort_by_key(|ruleset| std::cmp::Reverse(ruleset_total(ruleset)));
-        for ruleset in rulesets.into_iter().take(4) {
-            let search = report
-                .search_and_apply_time_per_ruleset
-                .get(ruleset.as_str())
-                .copied()
-                .unwrap_or(Duration::ZERO);
-            let merge = report
-                .merge_time_per_ruleset
-                .get(ruleset.as_str())
-                .copied()
-                .unwrap_or(Duration::ZERO);
-            let rebuild = report
-                .rebuild_time_per_ruleset
-                .get(ruleset.as_str())
-                .copied()
-                .unwrap_or(Duration::ZERO);
+        let mut rulesets: FxHashMap<_, [Duration; 3]> = FxHashMap::default();
+        for (index, entries) in [
+            &report.detail.search_and_apply_time_per_ruleset,
+            &report.detail.merge_time_per_ruleset,
+            &report.detail.rebuild_time_per_ruleset,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for entry in entries {
+                rulesets.entry(entry.native_name.as_str()).or_default()[index] =
+                    report_duration(entry.value.as_ref());
+            }
+        }
+        let mut rulesets = rulesets.into_iter().collect_vec();
+        rulesets.sort_by_key(|(_, durations)| {
+            std::cmp::Reverse(durations.iter().copied().sum::<Duration>())
+        });
+        for (ruleset, [search, merge, rebuild]) in rulesets.into_iter().take(4) {
             eprintln!(
                 "      ruleset {:<18} search {:>10} | merge {:>10} | rebuild {:>10}",
-                metric_name(&ruleset),
+                metric_name(ruleset),
                 metric_duration(search),
                 metric_duration(merge),
                 metric_duration(rebuild)

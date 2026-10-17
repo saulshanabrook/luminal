@@ -99,10 +99,10 @@ pub(crate) fn simplify_dimension(
     intervals: Option<&DynDimIntervals>,
 ) -> Result<Expression, TypedError> {
     let expr = let_("luminal::dimension", lower::dimension(&value, false));
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let mut egraph = EGraph::default();
     let schedule = if let Some(intervals) = intervals {
         egraph.register(interval_actions(intervals, value.dyn_vars()))?;
-        sequence((&static_rules::expression, &static_rules::intervals)).repeat(5)
+        sequence((&*static_rules::expression, &*static_rules::intervals)).repeat(5)
     } else {
         static_rules::expression.repeat(5)
     };
@@ -118,7 +118,7 @@ pub(crate) fn simplify_dimension(
 pub(crate) fn dimensions_equal(lhs: Expression, rhs: Expression) -> Result<bool, TypedError> {
     let lhs = let_("luminal::lhs", lower::dimension(&lhs, false));
     let rhs = let_("luminal::rhs", lower::dimension(&rhs, false));
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let mut egraph = EGraph::default();
     egraph.register((&lhs, &rhs))?;
     egraph.run(static_rules::expression.saturate())?;
     egraph.run(static_rules::cleanup.saturate())?;

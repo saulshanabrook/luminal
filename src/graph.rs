@@ -387,7 +387,7 @@ fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir:
 }
 
 fn random_choice_generation<'a, G: rand::Rng>(
-    frozen: &'a egglog_experimental::typed::FrozenEGraph,
+    frozen: &'a egglog_experimental::typed::Snapshot,
     alternatives: &Alternatives<'a>,
     generation_size: usize,
     prev_selected: &mut FxHashSet<u64>,
@@ -1256,12 +1256,12 @@ impl Graph {
         let roots =
             crate::typed_reference::capture_graph(self).expect("typed graph capture failed");
         let (phases, actions) = recipe();
-        use egglog_experimental::typed::{EGraph, EGraphOptions, TypedError};
+        use egglog_experimental::typed::{EGraph, TypedError};
         self.egraphs = contexts
             .iter()
             .map(|context| -> Result<SearchSpace, TypedError> {
                 let full_start = std::time::Instant::now();
-                let mut egraph = EGraph::new(EGraphOptions::default());
+                let mut egraph = EGraph::default();
                 run_schedule(
                     &mut egraph,
                     full_start,
@@ -1273,8 +1273,8 @@ impl Graph {
                             &context.intervals,
                             [],
                         ))?;
-                        egraph.register(&actions)?;
-                        egraph.register(&roots)
+                        egraph.register(actions.as_slice())?;
+                        egraph.register(roots.as_slice())
                     },
                 )?;
                 let mut space = SearchSpace::from_frozen(egraph.freeze()?, &roots)?;
@@ -3299,7 +3299,7 @@ mod tests {
         assert_eq!(RULE_CONFIG_CALLS.get(), configured + 1);
         assert_eq!(cx.egraphs.len(), 1);
         assert_eq!(
-            i64::try_from(cx.egraphs[0].frozen.lookup(&capture).unwrap()).unwrap(),
+            i64::try_from(&cx.egraphs[0].frozen.lookup(&capture).unwrap()).unwrap(),
             7,
         );
     }

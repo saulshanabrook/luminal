@@ -1,6 +1,6 @@
 use super::*;
 use crate::typed_reference::schema::{self, DType, DimExpr, EList, IList, Ir, OpKind};
-use egglog_experimental::typed::{FrozenValueView, builtins as egg};
+use egglog_experimental::typed::builtins as egg;
 use rand::{SeedableRng, rngs::StdRng};
 
 #[test]
@@ -84,7 +84,7 @@ fn ordered_decoders_fall_through_and_stop_at_the_first_success_or_error() -> Res
 
 #[test]
 fn nonmatching_core_decoders_leave_inputs_unchanged() -> Result<(), TypedError> {
-    let graph = EGraph::new(EGraphOptions::default());
+    let mut graph = EGraph::default();
     let frozen = graph.freeze()?;
     let choices = Default::default();
     let mut context = DecodeContext::new(&frozen, &choices);
@@ -115,13 +115,11 @@ fn dimension_metadata_prefers_mnum_on_equal_cost() -> Result<(), TypedError> {
                 (&other, &constant)
             };
             let root = let_("dimension", first);
-            let mut live = EGraph::new(EGraphOptions::default());
+            let mut live = EGraph::default();
             live.register((&root, union(&root, second)))?;
             let frozen = live.freeze()?;
             let observed = frozen.lookup(&root)?;
-            let FrozenValueView::EClass(class) = frozen.as_view(&observed)?.view() else {
-                unreachable!()
-            };
+            let class = frozen.class_of(&observed)?;
             let first = class.nodes().find(|node| !node.is_subsumed()).unwrap();
             let first = frozen.typed_node::<DimExpr>(first)?;
             assert_eq!(
@@ -134,7 +132,7 @@ fn dimension_metadata_prefers_mnum_on_equal_cost() -> Result<(), TypedError> {
                 DimExpr::MNum(value)
             })?
             .expect("an equally short MNum must win");
-            assert_eq!(i64::try_from(number)?, 1);
+            assert_eq!(i64::try_from(&number)?, 1);
             assert_eq!(context.expression(&observed)?, Expression::from(1));
         }
     }
@@ -161,7 +159,7 @@ fn dimension_metadata_keeps_the_first_nonnumeric_tie() -> Result<(), TypedError>
             let mut context = DecodeContext::new(&frozen, &choices);
             assert_eq!(context.selected(&observed)?, expected);
             if let Some((name,)) = get_args(&expected, |name: &egg::String| DimExpr::MVar(name))? {
-                let name = String::try_from(name)?;
+                let name = String::try_from(&name)?;
                 assert_eq!(
                     context.expression(&observed)?,
                     Expression::from(name.chars().next().unwrap()),
@@ -201,7 +199,7 @@ fn dimension_metadata_keeps_node_count_primary() -> Result<(), TypedError> {
 fn cleanup_is_conditional_and_does_not_change_the_exact_snapshot() {
     let constant = let_("constant", Ir::Op(OpKind::Constant(1.0), IList::INil()));
     let lowered = Ir::Op(OpKind::LoopInput(7, 9, DType::F32()), IList::INil());
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register(&constant).unwrap();
     let mut only =
         SearchSpace::from_frozen(live.freeze().unwrap(), std::slice::from_ref(&constant)).unwrap();
@@ -213,10 +211,7 @@ fn cleanup_is_conditional_and_does_not_change_the_exact_snapshot() {
     live.register(union(&constant, lowered)).unwrap();
     let mut space = SearchSpace::from_frozen(live.freeze().unwrap(), &[constant]).unwrap();
     space.clean_hlir = true;
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&space.roots[0]).unwrap().view()
-    else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&space.roots[0]).unwrap();
     assert_eq!(class.nodes().len(), 2);
     let alternatives = space.alternatives().unwrap();
     assert_eq!(alternatives[&class].len(), 1);
@@ -249,6 +244,7 @@ fn cleanup_classification_requires_every_active_kind_producer() -> Result<(), Ty
     let other = let_("other", OpKind::LoopInput(7, 9, DType::F32()));
     let root = let_("root", Ir::Op(&core, IList::INil()));
     let mut live = EGraph::default();
+    live.register((&core, &other, &root))?;
     live.register((
         union(&core, OpKind::Iota(DimExpr::MIter(), 3)),
         union(&other, OpKind::LoopOutput(7, 9, DType::F32())),
@@ -259,9 +255,7 @@ fn cleanup_classification_requires_every_active_kind_producer() -> Result<(), Ty
     space.cleanup_ignored = |kind| Ok(schema::LoopInputArgs::get_args(kind)?.is_some());
     assert_eq!(space.frozen.nodes(&space.frozen.lookup(&core)?)?.len(), 2);
     assert_eq!(space.frozen.nodes(&space.frozen.lookup(&other)?)?.len(), 2);
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&space.roots[0])?.view() else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&space.roots[0])?;
     // Both core kinds are cleanable; the mixed ignored/nonignored class survives.
     assert_eq!(space.alternatives()?[&class].len(), 1);
     space.cleanup_ignored = |kind| {
@@ -274,9 +268,7 @@ fn cleanup_classification_requires_every_active_kind_producer() -> Result<(), Ty
     let mut space = SearchSpace::from_frozen(live.freeze()?, &[root])?;
     space.clean_hlir = true;
     assert_eq!(space.frozen.nodes(&space.frozen.lookup(&core)?)?.len(), 3);
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&space.roots[0])?.view() else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&space.roots[0])?;
     // One noncleanable producer prevents removing the mixed core alternative.
     assert_eq!(space.alternatives()?[&class].len(), 2);
     Ok(())
@@ -286,7 +278,7 @@ fn cleanup_classification_requires_every_active_kind_producer() -> Result<(), Ty
 fn metadata_lists_and_dtypes_use_the_first_active_producer() -> Result<(), TypedError> {
     let list = let_("list", EList::from([2, 3]));
     let dtype = let_("dtype", DType::F64());
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((
         &list,
         &dtype,
@@ -331,14 +323,12 @@ fn metadata_compatible_opkind_is_preferred_and_substituted_before_exact_decoding
     let compatible = OpKind::Log2([2], [1], [1]);
     let kind = let_("kind", &inconsistent);
     let root = let_("root", Ir::Op(&kind, [Ir::Input(0, "input", DType::F32())]));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, union(&kind, &compatible)))?;
     let space = SearchSpace::from_frozen(live.freeze()?, &[root])?;
     let alternatives = space.alternatives()?;
     let observed = space.frozen.lookup(&kind)?;
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&observed)?.view() else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&observed)?;
     let nodes = &alternatives[&class];
     let consistent = *nodes
         .iter()
@@ -391,7 +381,7 @@ fn reconstructed_metadata_skips_producers_removed_by_missing_child_pruning()
             [Ir::Input(0, "input", DType::F32())],
         ),
     );
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, union(&shape, EList::from([3]))))?;
     let before = live.freeze()?;
     let first = before.nodes(&before.lookup(&shape)?)?.next().unwrap();
@@ -401,14 +391,12 @@ fn reconstructed_metadata_skips_producers_removed_by_missing_child_pruning()
     .unwrap();
     let first_head = before.nodes(&head)?.next().unwrap();
     let (number,) = get_args(&first_head, |number: &egg::I64| DimExpr::MNum(number))?.unwrap();
-    let removed = i64::try_from(number)?;
+    let removed = i64::try_from(&number)?;
     live.register(subsume(DimExpr::MNum(removed)))?;
     let space = SearchSpace::from_frozen(live.freeze()?, &[root])?;
     let alternatives = space.alternatives()?;
     let observed_shape = space.frozen.lookup(&shape)?;
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&observed_shape)?.view() else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&observed_shape)?;
     assert_eq!(class.nodes().len(), 2);
     assert_eq!(alternatives[&class].len(), 1);
     let forest = space.reconstruct_reference(&mut StdRng::seed_from_u64(7), &[])?;
@@ -434,7 +422,7 @@ fn coarse_hash_uses_all_admissible_ir_classes_and_ignores_metadata_values() -> R
     let mut hashes = Vec::new();
     for (index, label, dtype) in [(0, "first", DType::F32()), (99, "second", DType::F64())] {
         let root = let_("root", Ir::Input(index, label, dtype));
-        let mut live = EGraph::new(EGraphOptions::default());
+        let mut live = EGraph::default();
         live.register(&root)?;
         let space = SearchSpace::from_frozen(live.freeze()?, std::slice::from_ref(&root))?;
         hashes.push(hash_search_space(&space)?);
@@ -472,7 +460,7 @@ fn schedule_reports_preserve_outer_cycles_and_optional_late_phase() -> Result<()
         ruleset(rewrite(DimExpr::MVar("x"), 1i64)),
     );
     let full_start = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     let report = run_schedule(&mut live, full_start, &phases, false, false, |live| {
         live.register(&root)
     })?;
@@ -516,7 +504,7 @@ fn schedule_reports_preserve_outer_cycles_and_optional_late_phase() -> Result<()
 fn choices_count_only_search_sorts_and_are_checked_against_their_class() {
     let a = let_("a", Ir::Input(0i64, "a", DType::F32()));
     let b = let_("b", Ir::Input(1i64, "b", DType::F32()));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((
         &a,
         &b,
@@ -532,12 +520,8 @@ fn choices_count_only_search_sorts_and_are_checked_against_their_class() {
     let mut choices =
         random_initial_choice(&space.frozen, &alternatives, &mut StdRng::seed_from_u64(7));
     validate_choice_set(&space, &alternatives, &choices).unwrap();
-    let FrozenValueView::EClass(a) = space.frozen.as_view(&space.roots[0]).unwrap().view() else {
-        unreachable!()
-    };
-    let FrozenValueView::EClass(b) = space.frozen.as_view(&space.roots[1]).unwrap().view() else {
-        unreachable!()
-    };
+    let a = space.frozen.class_of(&space.roots[0]).unwrap();
+    let b = space.frozen.class_of(&space.roots[1]).unwrap();
     choices.insert(a, choices[&b]);
     assert!(validate_choice_set(&space, &alternatives, &choices).is_err());
     assert!(
@@ -578,7 +562,7 @@ fn reconstruction_uses_the_selected_input_list() {
         "root",
         Ir::Op(OpKind::Exp2(&shape, &shape, &shape), &inputs),
     );
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((
         &a,
         &b,
@@ -593,10 +577,7 @@ fn reconstruction_uses_the_selected_input_list() {
         random_initial_choice(&space.frozen, &alternatives, &mut StdRng::seed_from_u64(7));
     let observed_inputs = space.frozen.lookup(&inputs).unwrap();
     let observed_b = space.frozen.lookup(&b).unwrap();
-    let FrozenValueView::EClass(class) = space.frozen.as_view(&observed_inputs).unwrap().view()
-    else {
-        unreachable!()
-    };
+    let class = space.frozen.class_of(&observed_inputs).unwrap();
     let selected = class
         .nodes()
         .find(|&node| {
@@ -627,17 +608,18 @@ fn decoder_replacements_require_an_originally_reachable_exact_producer() -> Resu
             return Ok(None);
         }
         let mut replacement = None;
-        for row in context
+        for class in context
             .frozen
-            .table(|id: &egg::I64, label: &egg::String, dtype: &DType| Ir::Input(id, label, dtype))?
-            .rows
+            .eclasses()
+            .filter(|class| class.sort() == Ir::sort_ref())
         {
-            for node in context.frozen.nodes(&row.output)? {
+            for producer in class.nodes() {
+                let node = context.frozen.typed_node::<Ir>(producer)?;
                 if get_args(
                     &node,
                     |id: &egg::I64, label: &egg::String, dtype: &DType| Ir::Input(id, label, dtype),
                 )?
-                .is_some_and(|(id, _, _)| i64::try_from(id).unwrap() == 9)
+                .is_some_and(|(id, _, _)| i64::try_from(&id).unwrap() == 9)
                 {
                     replacement = Some(node);
                     break;
@@ -673,11 +655,7 @@ fn decoder_replacements_require_an_originally_reachable_exact_producer() -> Resu
         let mut choices =
             random_initial_choice(&space.frozen, &alternatives, &mut StdRng::seed_from_u64(7));
         if case == "unselected same-class" {
-            let FrozenValueView::EClass(class) =
-                space.frozen.as_view(&space.frozen.lookup(&input)?)?.view()
-            else {
-                unreachable!()
-            };
+            let class = space.frozen.class_of(&space.frozen.lookup(&input)?)?;
             let selected = class
                 .nodes()
                 .find(|&node| {
@@ -689,7 +667,7 @@ fn decoder_replacements_require_an_originally_reachable_exact_producer() -> Resu
                         },
                     )
                     .unwrap()
-                    .is_some_and(|(id, _, _)| i64::try_from(id).unwrap() == 0)
+                    .is_some_and(|(id, _, _)| i64::try_from(&id).unwrap() == 0)
                 })
                 .unwrap();
             choices.insert(class, selected);
@@ -722,7 +700,7 @@ fn decoder_replacements_require_an_originally_reachable_exact_producer() -> Resu
 #[test]
 fn metadata_without_a_finite_tree_returns_an_error() {
     let value = let_("value", DimExpr::MNum(1i64));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((
         &value,
         union(&value, &value + &value),
@@ -747,7 +725,7 @@ fn final_schedule_preserves_cleanup_order() {
         RewritePhase::PostCleanup,
         ruleset(|input: &Ir, index: &egg::I64| rewrite(Ir::Output(input, index), input)),
     );
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register(&output).unwrap();
     run_schedule(
         &mut live,

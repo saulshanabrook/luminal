@@ -1,6 +1,5 @@
 use super::*;
 use crate::egglog_utils::{DecodeContext, SearchSpace, random_initial_choice, reconstruct};
-use egglog_experimental::typed::FrozenValueView;
 use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashMap;
 use schema::{DType, EList, IList};
@@ -34,7 +33,7 @@ fn dtype_native_conversion_requires_a_concrete_constructor() -> Result<(), Typed
         assert_eq!(Host::try_from(&authored)?, host);
         assert_eq!(Host::try_from(authored.clone())?, host);
         let capture = let_("dtype", authored);
-        let mut live = EGraph::new(EGraphOptions::default());
+        let mut live = EGraph::default();
         live.register(&capture)?;
         let frozen = live.freeze()?;
         let unresolved = frozen.lookup(&capture)?;
@@ -49,7 +48,7 @@ fn dtype_native_conversion_requires_a_concrete_constructor() -> Result<(), Typed
     }
     assert!(Host::try_from(var::<DType>("unknown")).is_err());
     let root = let_("alternatives", DType::F32());
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, union(&root, DType::Int64())))?;
     let frozen = live.freeze()?;
     let values = frozen
@@ -65,11 +64,11 @@ fn dtype_native_conversion_requires_a_concrete_constructor() -> Result<(), Typed
 fn frozen_fields_are_exact_values_not_display_strings() {
     let label = "Input \"quoted\" \\backslash\nline";
     let capture = let_("input", Ir::Input(i64::MAX, label, DType::F32()));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register(&capture).unwrap();
     let frozen = live.freeze().unwrap();
     let root = frozen.lookup(&capture).unwrap();
-    assert!(live.freeze().unwrap().as_view(&root).is_err());
+    assert!(live.freeze().unwrap().class_of(&root).is_err());
     let space = SearchSpace::from_frozen(frozen, &[capture.clone(), capture]).unwrap();
     drop(live);
     assert_eq!(space.roots[0], space.roots[1]);
@@ -88,7 +87,7 @@ fn frozen_fields_are_exact_values_not_display_strings() {
 fn frozen_cycles_and_ordered_roots_keep_snapshot_identity() {
     let root = let_("root", Ir::Input(7i64, "root", DType::F32()));
     let other = let_("other", Ir::Input(8i64, "other", DType::F32()));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, &other, union(&root, Ir::Output(&root, 0i64))))
         .unwrap();
     let frozen = live.freeze().unwrap();
@@ -98,9 +97,7 @@ fn frozen_cycles_and_ordered_roots_keep_snapshot_identity() {
         b.roots,
         [a.roots[1].clone(), a.roots[0].clone(), a.roots[0].clone()]
     );
-    let FrozenValueView::EClass(class) = a.frozen.as_view(&a.roots[0]).unwrap().view() else {
-        unreachable!()
-    };
+    let class = a.frozen.class_of(&a.roots[0]).unwrap();
     assert_eq!(class.nodes().len(), 2);
     assert!(
         class
@@ -135,8 +132,8 @@ fn reference_constants_decode_stored_float_bits() {
             )
         })
         .collect();
-    let mut live = EGraph::new(EGraphOptions::default());
-    live.register(&captures).unwrap();
+    let mut live = EGraph::default();
+    live.register(captures.as_slice()).unwrap();
     let space = SearchSpace::from_frozen(live.freeze().unwrap(), &captures).unwrap();
     let forest = space
         .reconstruct_reference(&mut StdRng::seed_from_u64(7), &[])
@@ -157,7 +154,7 @@ fn reference_constants_decode_stored_float_bits() {
 fn selection_pruning_does_not_erase_producer_free_frozen_classes() {
     let missing = let_("missing", Ir::Input(1i64, "missing", DType::F32()));
     let root = let_("root", Ir::Input(2i64, "root", DType::F32()));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((
         &missing,
         &root,
@@ -177,9 +174,7 @@ fn selection_pruning_does_not_erase_producer_free_frozen_classes() {
     assert_eq!(frozen.nodes(&observed_root).unwrap().len(), 2);
     let space = SearchSpace::from_frozen(frozen.clone(), std::slice::from_ref(&root)).unwrap();
     let alternatives = space.alternatives().unwrap();
-    let FrozenValueView::EClass(class) = frozen.as_view(&observed_root).unwrap().view() else {
-        unreachable!()
-    };
+    let class = frozen.class_of(&observed_root).unwrap();
     assert_eq!(alternatives[&class].len(), 1);
     let invalid = SearchSpace::from_frozen(frozen.clone(), &[root, missing]).unwrap();
     assert!(matches!(
@@ -193,7 +188,7 @@ fn selection_pruning_does_not_erase_producer_free_frozen_classes() {
 fn dimension_selection_handles_cycles_and_repeated_children() {
     let root = let_("dim", DimExpr::from(3i64));
     let list = let_("list", EList::from([root.clone(), root.clone()]));
-    let mut live = EGraph::new(EGraphOptions::default());
+    let mut live = EGraph::default();
     live.register((&root, &list, union(&root, &root + 0i64)))
         .unwrap();
     let frozen = live.freeze().unwrap();
@@ -236,17 +231,17 @@ fn cleanup_expression_facts_delete_every_existing_row() {
     let replace_nth = EList::ReplaceNthFromEnd(&list, &two, 0);
     let remove_nth = EList::RemoveNthFromEnd(&list, 0);
     let row_major = EList::RowMajor(&list);
-    let queries = [
-        Fact::from(&replace),
-        Fact::from(&replace_list),
-        Fact::from(&replace_nth),
-        Fact::from(&remove_nth),
-        Fact::from(&row_major),
-        Fact::from(list.len()),
-        Fact::from(list.nth_from_end(0)),
-        Fact::from(list.n_elements()),
-    ];
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let queries = (
+        replace.clone(),
+        replace_list.clone(),
+        replace_nth.clone(),
+        remove_nth.clone(),
+        row_major.clone(),
+        list.len(),
+        list.nth_from_end(0),
+        list.n_elements(),
+    );
+    let mut egraph = EGraph::default();
     egraph
         .register((
             &replace,
@@ -259,12 +254,15 @@ fn cleanup_expression_facts_delete_every_existing_row() {
             set(list.n_elements(), &x),
         ))
         .unwrap();
-    assert!(egraph.check(&queries).unwrap());
+    assert!(egraph.check(queries.clone()).unwrap());
     egraph.run(static_rules::cleanup.saturate()).unwrap();
-    for query in &queries {
-        assert!(!egraph.check(query).unwrap(), "cleanup left {query:?}");
+    macro_rules! check_absent {
+        ($($index:tt),*) => { $(
+            assert!(!egraph.check(&queries.$index).unwrap(), "cleanup left {:?}", queries.$index);
+        )* };
     }
+    check_absent!(0, 1, 2, 3, 4, 5, 6, 7);
     let count = egraph.num_tuples().unwrap();
-    assert!(!egraph.run(&static_rules::cleanup).unwrap().updated);
+    assert!(!egraph.run(&*static_rules::cleanup).unwrap().detail.updated);
     assert_eq!(egraph.num_tuples().unwrap(), count);
 }

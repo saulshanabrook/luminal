@@ -1,6 +1,6 @@
 use anyhow::Result;
-use egglog_experimental::typed::{FrozenScalar, FrozenValue, FrozenValueView};
-use egglog_experimental::{EGraph, SerializeConfig};
+use egglog_experimental::typed::{Snapshot, ValueRef, builtins as egg};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::{Debug, Display};
 use std::string::String;
 
@@ -29,34 +29,204 @@ const EGRAPH_VIS_TEMPLATE: &str = r#"
 </script>"#;
 
 /// A display label, not a value codec or an executable expression.
-pub fn display_frozen_value(value: FrozenValue<'_>) -> String {
-    match value.view() {
-        FrozenValueView::Scalar(value) => match value {
-            FrozenScalar::Unit => "()".into(),
-            FrozenScalar::Bool(value) => value.to_string(),
-            FrozenScalar::I64(value) => value.to_string(),
-            FrozenScalar::F64(bits) => format!("{:?}", f64::from_bits(*bits)),
-            FrozenScalar::String(value) => format!("{value:?}"),
-            FrozenScalar::BigInt(value) => value.to_string(),
-            FrozenScalar::BigRat(value) => value.to_string(),
-            FrozenScalar::Rational(value) => value.to_string(),
-        },
-        _ => value.sort().name().to_owned(),
+pub fn display_frozen_value(value: ValueRef<'_>) -> String {
+    if value.class().is_some() {
+        value.sort().to_string()
+    } else {
+        value.to_string()
     }
 }
 
-impl ToHtml for EGraph {
+/// Presentation data for the egraph visualizer. IDs are local to this rendering;
+/// class references are never unfolded or selected for extraction.
+#[derive(serde::Serialize)]
+struct Visualization {
+    nodes: BTreeMap<String, VisualizationNode>,
+    root_eclasses: Vec<String>,
+    class_data: BTreeMap<String, VisualizationClass>,
+}
+
+#[derive(serde::Serialize)]
+struct VisualizationNode {
+    op: String,
+    children: Vec<String>,
+    eclass: String,
+    cost: f64,
+    subsumed: bool,
+}
+
+#[derive(serde::Serialize)]
+struct VisualizationClass {
+    #[serde(rename = "type")]
+    typ: Option<String>,
+}
+
+fn visualization(snapshot: &Snapshot) -> Result<Visualization> {
+    let mut data = Visualization {
+        nodes: BTreeMap::new(),
+        root_eclasses: Vec::new(),
+        class_data: BTreeMap::new(),
+    };
+    let mut producers = Vec::new();
+    let mut class_ids = HashMap::new();
+    let mut representatives = HashMap::new();
+    for (index, class) in snapshot.eclasses().enumerate() {
+        let class_id = format!("c{index}");
+        class_ids.insert(class, class_id.clone());
+        data.class_data.insert(
+            class_id.clone(),
+            VisualizationClass {
+                typ: Some(class.sort().to_string()),
+            },
+        );
+        for node in class.nodes() {
+            let node_id = format!("n{}", producers.len());
+            representatives
+                .entry(class)
+                .or_insert_with(|| node_id.clone());
+            producers.push((class_id.clone(), node_id, node));
+        }
+    }
+
+    // Intern exact primitive/container values before adding edges. Equality
+    // fields stop at their existing class, so cycles never require recursion.
+    let mut values = Vec::new();
+    let mut value_ids = HashMap::new();
+    let rows: Vec<_> = snapshot.rows().collect();
+    let mut pending: VecDeque<_> = producers
+        .iter()
+        .flat_map(|(_, _, node)| node.args())
+        .chain(rows.iter().flat_map(|row| row.args().chain(row.value())))
+        .collect();
+    while let Some(value) = pending.pop_front() {
+        if value.class().is_some() || value_ids.contains_key(&value) {
+            continue;
+        }
+        value_ids.insert(value, values.len());
+        values.push(value);
+        pending.extend(value.children());
+    }
+
+    let child_id = |value: ValueRef<'_>| match value.class() {
+        Some(class) => representatives.get(&class).cloned().ok_or_else(|| {
+            anyhow::anyhow!("cannot render a reference to an equality class without producers")
+        }),
+        None => Ok(format!("v{}", value_ids[&value])),
+    };
+    for (class_id, node_id, node) in producers {
+        let children = node.args().map(&child_id).collect::<Result<Vec<_>>>()?;
+        // As in the visualizer's existing model, an absent declared cost and
+        // primitive/container values use the display cost 1.
+        let cost = node
+            .declared_cost()
+            .map(|value| i64::try_from(&value.try_typed::<egg::I64>()?))
+            .transpose()?
+            .unwrap_or(1) as f64;
+        data.nodes.insert(
+            node_id,
+            VisualizationNode {
+                op: node.name().to_owned(),
+                children,
+                eclass: class_id,
+                cost,
+                subsumed: node.is_subsumed(),
+            },
+        );
+    }
+    for (index, value) in values.into_iter().enumerate() {
+        let id = format!("v{index}");
+        let children = value
+            .children()
+            .map(&child_id)
+            .collect::<Result<Vec<_>>>()?;
+        data.class_data.insert(
+            id.clone(),
+            VisualizationClass {
+                typ: Some(value.sort().to_string()),
+            },
+        );
+        data.nodes.insert(
+            id.clone(),
+            VisualizationNode {
+                op: display_frozen_value(value),
+                children,
+                eclass: id,
+                cost: 1.0,
+                subsumed: false,
+            },
+        );
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        let id = format!("r{index}");
+        let children = row.args().map(&child_id).collect::<Result<Vec<_>>>()?;
+        let eclass = match row.value() {
+            Some(value) => match value.class() {
+                Some(class) => class_ids[&class].clone(),
+                None => format!("v{}", value_ids[&value]),
+            },
+            // Relations have no output value. This is only a display group for
+            // the stored fact, not a fabricated equality class or Unit value.
+            None => {
+                data.class_data
+                    .insert(id.clone(), VisualizationClass { typ: None });
+                id.clone()
+            }
+        };
+        data.nodes.insert(
+            id,
+            VisualizationNode {
+                op: row.name().to_owned(),
+                children,
+                eclass,
+                cost: 1.0,
+                subsumed: false,
+            },
+        );
+    }
+    Ok(data)
+}
+
+impl ToHtml for Snapshot {
     fn to_html(&self) -> Result<String> {
         let egraph_as_json =
-            serde_json::to_string_pretty(&self.serialize(SerializeConfig::default()).egraph)?
-                .replace('<', "\\u003c");
+            serde_json::to_string_pretty(&visualization(self)?)?.replace('<', "\\u003c");
         Ok(EGRAPH_VIS_TEMPLATE.replace("{{JSON_TEMPLATE}}", &egraph_as_json))
     }
 }
 
-impl ToDot for EGraph {
+impl ToDot for Snapshot {
     fn to_dot(&self) -> Result<String> {
-        Ok(self.serialize(SerializeConfig::default()).egraph.to_dot())
+        let data = visualization(self)?;
+        let mut classes: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (node_id, node) in &data.nodes {
+            classes
+                .entry(node.eclass.as_str())
+                .or_default()
+                .push((node_id, node));
+        }
+        let mut dot = String::from("digraph egraph {\n    compound=true;\n");
+        for (class_id, class) in &data.class_data {
+            dot.push_str(&format!(
+                "    subgraph cluster_{class_id} {{\n        label=\"{}\";\n",
+                escape_dot_string(class.typ.as_deref().unwrap_or_default())
+            ));
+            for (node_id, node) in classes.get(class_id.as_str()).into_iter().flatten() {
+                dot.push_str(&format!(
+                    "        {node_id} [label=\"{}\", tooltip=\"cost {}\", style=\"{}\"];\n",
+                    escape_dot_string(&node.op),
+                    node.cost,
+                    if node.subsumed { "dashed" } else { "solid" },
+                ));
+            }
+            dot.push_str("    }\n");
+        }
+        for (node_id, node) in &data.nodes {
+            for (index, child) in node.children.iter().enumerate() {
+                dot.push_str(&format!("    {node_id} -> {child} [label=\"{index}\"];\n"));
+            }
+        }
+        dot.push_str("}\n");
+        Ok(dot)
     }
 }
 
@@ -161,7 +331,7 @@ fn graph_to_dot<E>(
 }
 
 #[cfg(test)]
-mod native_tests {
+mod snapshot_tests {
     use super::*;
     use crate::typed_reference::schema::DimExpr;
     use egglog_experimental::typed::{EGraph as TypedEGraph, builtins as egg, prelude::*};
@@ -176,12 +346,137 @@ mod native_tests {
         fn free(value: DisplayFixture) -> Self;
         #[constructor(cost = 37)]
         fn expensive(value: DisplayFixture) -> Self;
+        #[function(no_merge)]
+        fn length(&self) -> egg::I64;
+        #[function(no_merge)]
+        fn mirror(&self) -> Self;
+        #[relation]
+        fn present(&self);
+    }
+
+    const VALUES: &str = concat!(module_path!(), "::DisplayFixture::values");
+    const FREE: &str = concat!(module_path!(), "::DisplayFixture::free");
+    const EXPENSIVE: &str = concat!(module_path!(), "::DisplayFixture::expensive");
+    const LENGTH: &str = concat!(module_path!(), "::DisplayFixture::length");
+    const MIRROR: &str = concat!(module_path!(), "::DisplayFixture::mirror");
+    const PRESENT: &str = concat!(module_path!(), "::DisplayFixture::present");
+
+    #[test]
+    fn rendering_preserves_function_and_relation_rows_without_constructor_producers() {
+        let root = let_(
+            "table_root",
+            DisplayFixture::values(egg::Vec::of([DimExpr::from(9)])),
+        );
+        let mut egraph = TypedEGraph::new().unwrap();
+        egraph
+            .register((
+                &root,
+                set(root.length(), 3_i64),
+                set(root.mirror(), &root),
+                root.present(),
+            ))
+            .unwrap();
+        let snapshot = egraph.freeze().unwrap();
+        let class = snapshot.class_of(&snapshot.lookup(&root).unwrap()).unwrap();
+        assert!(
+            class
+                .nodes()
+                .all(|node| ![LENGTH, MIRROR, PRESENT].contains(&node.name()))
+        );
+        assert_eq!(
+            snapshot
+                .rows()
+                .filter(|row| [LENGTH, MIRROR, PRESENT].contains(&row.name()))
+                .count(),
+            3
+        );
+        let data = visualization(&snapshot).unwrap();
+        let nodes = &data.nodes;
+        let base = nodes.values().find(|node| node.op == VALUES).unwrap();
+        let length = nodes.values().find(|node| node.op == LENGTH).unwrap();
+        let scalar = nodes.values().find(|node| node.op == "3").unwrap();
+        assert_eq!(length.eclass, scalar.eclass);
+        let mirror = nodes.values().find(|node| node.op == MIRROR).unwrap();
+        assert_eq!(mirror.eclass, base.eclass);
+        let present = nodes.values().find(|node| node.op == PRESENT).unwrap();
+        assert!(data.class_data[&present.eclass].typ.is_none());
+        for row in [length, mirror, present] {
+            assert_eq!(row.children.len(), 1);
+            assert_eq!(nodes[&row.children[0]].eclass, base.eclass);
+            assert_eq!(row.cost, 1.0);
+            assert!(!row.subsumed);
+        }
+        let html = snapshot.to_html().unwrap();
+        let dot = snapshot.to_dot().unwrap();
+        for name in [LENGTH, MIRROR, PRESENT] {
+            assert!(html.contains(name));
+            assert!(dot.contains(name));
+        }
+    }
+
+    #[test]
+    fn rendering_rejects_direct_references_to_empty_classes() {
+        let base = DisplayFixture::values(egg::Vec::of([DimExpr::from(9)]));
+        let empty = let_("empty_direct", &base);
+        let mut egraph = TypedEGraph::new().unwrap();
+        egraph
+            .register((&empty, DisplayFixture::free(&empty)))
+            .unwrap();
+        egraph.register(delete(&base)).unwrap();
+        let snapshot = egraph.freeze().unwrap();
+        assert_eq!(
+            snapshot
+                .class_of(&snapshot.lookup(&empty).unwrap())
+                .unwrap()
+                .nodes()
+                .len(),
+            0
+        );
+        for rendered in [snapshot.to_html(), snapshot.to_dot()] {
+            assert!(
+                rendered
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot render a reference to an equality class without producers")
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_rejects_container_references_to_empty_classes() {
+        let number = DimExpr::from(9);
+        let empty = let_("empty_container", &number);
+        let mut egraph = TypedEGraph::new().unwrap();
+        egraph
+            .register((
+                &empty,
+                DisplayFixture::values(egg::Vec::of([empty.clone()])),
+            ))
+            .unwrap();
+        egraph.register(delete(&number)).unwrap();
+        let snapshot = egraph.freeze().unwrap();
+        assert_eq!(
+            snapshot
+                .class_of(&snapshot.lookup(&empty).unwrap())
+                .unwrap()
+                .nodes()
+                .len(),
+            0
+        );
+        for rendered in [snapshot.to_html(), snapshot.to_dot()] {
+            assert!(
+                rendered
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot render a reference to an equality class without producers")
+            );
+        }
     }
 
     #[test]
     fn rendering_preserves_declared_costs_and_subsumption_across_cycles() {
-        let mut egraph = TypedEGraph::new(EGraphOptions::default());
-        let base = DisplayFixture::values([DimExpr::from(9)]);
+        let mut egraph = TypedEGraph::new().unwrap();
+        let base = DisplayFixture::values(egg::Vec::of([DimExpr::from(9)]));
         let free = DisplayFixture::free(&base);
         let expensive = DisplayFixture::expensive(&base);
         egraph
@@ -191,17 +486,20 @@ mod native_tests {
                 subsume(&free),
             ))
             .unwrap();
-        let egraph = egraph.into_raw();
-        let data = egraph.serialize(SerializeConfig::default()).egraph;
+        let egraph = egraph.freeze().unwrap();
+        let data = visualization(&egraph).unwrap();
         let nodes = &data.nodes;
-        for (expression, cost) in [(&base, 1.0), (&free, 0.0), (&expensive, 37.0)] {
-            let name = expression.call_name().unwrap();
+        for (expression, name, cost) in [
+            (&base, VALUES, 1.0),
+            (&free, FREE, 0.0),
+            (&expensive, EXPENSIVE, 37.0),
+        ] {
             let node = nodes.values().find(|node| node.op == name).unwrap();
-            assert_eq!(node.cost.into_inner(), cost);
+            assert_eq!(node.cost, cost);
             assert_eq!(node.subsumed, expression == &free);
             assert_eq!(
                 data.class_data[&node.eclass].typ.as_deref(),
-                Some(DisplayFixture::sort_ref().name())
+                Some(DisplayFixture::sort_ref().to_string().as_str())
             );
             if expression != &base {
                 let child = &node.children[0];
@@ -209,31 +507,29 @@ mod native_tests {
             }
         }
         for node in nodes.values() {
-            if node.op != free.call_name().unwrap() && node.op != expensive.call_name().unwrap() {
-                assert_eq!(node.cost.into_inner(), 1.0);
+            if node.op != FREE && node.op != EXPENSIVE {
+                assert_eq!(node.cost, 1.0);
             }
         }
         let html = egraph.to_html().unwrap();
         assert!(html.contains("\"cost\": 0.0"));
         assert!(html.contains("\"cost\": 37.0"));
-        assert!(
-            egraph
-                .to_dot()
-                .unwrap()
-                .contains(expensive.call_name().unwrap())
-        );
+        assert!(egraph.to_dot().unwrap().contains(EXPENSIVE));
     }
 
     #[test]
     fn rendering_preserves_cycles_literals_containers_and_escaping() {
-        let mut egraph = TypedEGraph::new(EGraphOptions::default());
+        let mut egraph = TypedEGraph::new().unwrap();
         let x = DimExpr::MVar("</script>\"\\\n");
         let sum = x.clone() + 1;
         egraph
-            .register((union(&x, &sum), DisplayFixture::values([x.clone(), x])))
+            .register((
+                union(&x, &sum),
+                DisplayFixture::values(egg::Vec::of([x.clone(), x])),
+            ))
             .unwrap();
-        let egraph = egraph.into_raw();
-        let data = egraph.serialize(SerializeConfig::default()).egraph;
+        let egraph = egraph.freeze().unwrap();
+        let data = visualization(&egraph).unwrap();
         let nodes = &data.nodes;
         assert!(nodes.values().any(|node| node.op == "MAdd"));
         assert!(nodes.values().any(|node| node.op == "1"));

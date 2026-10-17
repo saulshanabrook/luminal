@@ -14,7 +14,7 @@ fn inherited_dtype(
     let mut inputs = IList::ICons(source, tail);
     for index in 0..source_index {
         inputs = IList::ICons(
-            var::<Ir>(format!("inherited_dtype::ignored_{index}")),
+            var::<Ir>(&format!("inherited_dtype::ignored_{index}")),
             inputs,
         );
     }
@@ -176,7 +176,7 @@ pub fn binary_unroll_rules(
     sources
         .try_reserve_exact(max_trips)
         .map_err(|error| TypedError::Invalid(error.to_string()))?;
-    sources.extend((0..max_trips).map(|index| var::<Ir>(format!("s{index}"))));
+    sources.extend((0..max_trips).map(|index| var::<Ir>(&format!("s{index}"))));
     Ok(ruleset(
         |initial: &Ir,
          loop_id: &egg::I64,
@@ -195,10 +195,8 @@ pub fn binary_unroll_rules(
             for trips in 2..=max_trips {
                 for state_position in 0..2 {
                     let op_kind = kind(shape, a_strides, b_strides, out_strides);
-                    let label = format!(
-                        "unroll {} body trips={trips} state={state_position}",
-                        op_kind.call_name().expect("binary constructor")
-                    );
+                    let label =
+                        format!("unroll {op_kind:?} body trips={trips} state={state_position}",);
                     let ordered_inputs = |state: &Ir, per_iter: &Ir| {
                         let (a, b) = if state_position == 0 {
                             (state, per_iter)
@@ -240,6 +238,31 @@ pub fn binary_unroll_rules(
 mod tests {
     use super::*;
 
+    type Kind = fn(&EList, &EList, &EList, &EList) -> OpKind;
+
+    fn unroll_fixture(kind: Kind, trips: usize, state_position: usize) -> (Ir, Ir) {
+        let dt = DType::F32();
+        let initial = Ir::Input(0i64, "initial", &dt);
+        let sources: Vec<_> = (0..trips)
+            .map(|index| Ir::Input(100i64 + index as i64, "stream", &dt))
+            .collect();
+        let inputs = IList::from(&sources);
+        let nil = EList::ENil();
+        let kind = kind(&nil, &nil, &nil, &nil);
+        let apply = |state: Ir, source: Ir| {
+            let (a, b) = if state_position == 0 {
+                (state, source)
+            } else {
+                (source, state)
+            };
+            Ir::Op(&kind, [a, b])
+        };
+        let start = Ir::LoopStart(&initial, 7i64, 0i64, trips as i64, &dt);
+        let per_iter = Ir::Op(OpKind::LoopInput(7i64, 0i64, &dt), inputs);
+        let end = Ir::LoopEnd(apply(start, per_iter), 7i64, 0i64, dt);
+        (end, sources.into_iter().fold(initial, apply))
+    }
+
     #[test]
     fn dtype_patterns_keep_omitted_fields_independent() {
         let f32 = DType::F32();
@@ -262,7 +285,7 @@ mod tests {
             inputs,
         );
 
-        let mut egraph = EGraph::new(EGraphOptions::default());
+        let mut egraph = EGraph::default();
         egraph
             .register((&start, &end, &selected, &scatter))
             .unwrap();
@@ -293,8 +316,23 @@ mod tests {
                 max_trips,
             )
             .unwrap();
-            assert_eq!(group.len(), 2 * max_trips.saturating_sub(1));
-            assert_eq!(calls.get(), group.len());
+            let mut graph = EGraph::default();
+            for trips in 2..=max_trips {
+                for position in 0..2 {
+                    let (end, _) =
+                        unroll_fixture(|s, a, b, o| OpKind::Add(s, a, b, o), trips, position);
+                    graph.register(end).unwrap();
+                }
+            }
+            let report = graph.run(&group).unwrap();
+            let installed = report
+                .rules
+                .iter()
+                .map(|rule| rule.rule)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert_eq!(installed, 2 * max_trips.saturating_sub(1));
+            assert_eq!(calls.get(), installed);
         }
 
         let calls = Cell::new(0);
@@ -311,7 +349,6 @@ mod tests {
 
     #[test]
     fn generated_binary_unroll_rules_cover_both_positions_and_all_trip_counts() {
-        type Kind = fn(&EList, &EList, &EList, &EList) -> OpKind;
         let kinds: [Kind; 4] = [
             |s, a, b, o| OpKind::Add(s, a, b, o),
             |s, a, b, o| OpKind::Mul(s, a, b, o),
@@ -322,27 +359,9 @@ mod tests {
             let rules = binary_unroll_rules(kind, 6).unwrap();
             for trips in 2..=6 {
                 for state_position in 0..2 {
-                    let dt = DType::F32();
-                    let initial = Ir::Input(0i64, "initial", &dt);
-                    let sources: Vec<_> = (0..trips)
-                        .map(|index| Ir::Input(100i64 + index as i64, "stream", &dt))
-                        .collect();
-                    let inputs = IList::from(&sources);
-                    let nil = EList::ENil();
-                    let kind = kind(&nil, &nil, &nil, &nil);
-                    let apply = |state: Ir, source: Ir| {
-                        let (a, b) = if state_position == 0 {
-                            (state, source)
-                        } else {
-                            (source, state)
-                        };
-                        Ir::Op(&kind, [a, b])
-                    };
-                    let start = Ir::LoopStart(&initial, 7i64, 0i64, trips as i64, &dt);
-                    let per_iter = Ir::Op(OpKind::LoopInput(7i64, 0i64, &dt), inputs);
-                    let end = let_("end", Ir::LoopEnd(apply(start, per_iter), 7i64, 0i64, dt));
-                    let unrolled = sources.into_iter().fold(initial, apply);
-                    let mut egraph = EGraph::new(EGraphOptions::default());
+                    let (end, unrolled) = unroll_fixture(kind, trips, state_position);
+                    let end = let_("end", end);
+                    let mut egraph = EGraph::default();
                     egraph.register(&end).unwrap();
                     egraph.run(&rules).unwrap();
                     assert!(

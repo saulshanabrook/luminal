@@ -101,9 +101,7 @@ mod tests {
         op::{DecodeFn, HLIROp},
         shape::ShapeTracker,
     };
-    use egglog_experimental::typed::{
-        EGraph, EGraphOptions, FrozenValueView, builtins as egg, eq, get_args,
-    };
+    use egglog_experimental::typed::{EGraph, builtins as egg, eq, get_args};
 
     #[test]
     fn host_decoders_preserve_metadata_rank_acceptance() -> Result<(), TypedError> {
@@ -194,13 +192,11 @@ mod tests {
         for (decoder, kind, arity) in cases {
             let kind = let_("kind", kind);
             let input = let_("input", Ir::Input(0, "input", DType::F32()));
-            let mut live = EGraph::new(EGraphOptions::default());
+            let mut live = EGraph::default();
             live.register((&kind, &input))?;
             let frozen = live.freeze()?;
             let observed = frozen.lookup(&kind)?;
-            let FrozenValueView::EClass(class) = frozen.as_view(&observed)?.view() else {
-                panic!("expected an OpKind class");
-            };
+            let class = frozen.class_of(&observed)?;
             let selected = frozen.typed_node(class.nodes().next().unwrap())?;
             let choices = FxHashMap::default();
             let mut context = DecodeContext::new(&frozen, &choices);
@@ -247,7 +243,7 @@ mod tests {
             (0.000000123, 0.0),
         ] {
             let value = let_("constant", hlir::Constant(host).to_ir(&[]));
-            let mut egraph = EGraph::new(EGraphOptions::default());
+            let mut egraph = EGraph::default();
             egraph.register(&value).unwrap();
             assert!(
                 egraph
@@ -306,7 +302,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                f64::try_from(value).unwrap().to_bits(),
+                f64::try_from(&value).unwrap().to_bits(),
                 expected.to_bits(),
                 "f32 bits: {bits:#010x}"
             );

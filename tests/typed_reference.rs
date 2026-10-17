@@ -1,5 +1,5 @@
 use egglog_experimental::typed::{
-    EGraph, EGraphOptions, builtins as egg, get_args, let_, set, union,
+    EGraph, builtins as egg, get_args, let_, set, union,
 };
 use luminal::{
     egglog_utils::SearchSpace,
@@ -54,12 +54,12 @@ fn singleton_loop_trip_count_is_numeric_in_both_producer_orders() {
                 let (value,) = get_args(producer, |n: &egg::I64| DimExpr::MNum(n))
                     .unwrap()
                     .expect("expected the existing MNum producer");
-                assert_eq!(i64::try_from(value).unwrap(), 3);
+                assert_eq!(i64::try_from(&value).unwrap(), 3);
             } else {
                 let (name,) = get_args(producer, |name: &egg::String| DimExpr::MVar(name))
                     .unwrap()
                     .expect("expected the existing MVar producer");
-                assert_eq!(String::try_from(name).unwrap(), "s");
+                assert_eq!(String::try_from(&name).unwrap(), "s");
             }
         }
         let mut forest = space
@@ -142,8 +142,8 @@ fn retained_outputs_share_one_frozen_forest() {
         by_id[&p_out.id].clone(),
         by_id[&p_out.id].clone(),
     ];
-    let mut egraph = EGraph::new(EGraphOptions::default());
-    egraph.register(&outputs).unwrap();
+    let mut egraph = EGraph::default();
+    egraph.register(outputs.as_slice()).unwrap();
     typed_reference::optimize(&mut egraph, &FxHashMap::default(), false).unwrap();
     let count = egraph.num_tuples().unwrap();
     let frozen = egraph.freeze().unwrap();
@@ -249,7 +249,7 @@ fn frozen_root_errors_retain_the_callers_index() {
 
     let known = let_("known", Ir::Input(0i64, "known", DType::F32()));
     let missing = let_("missing", Ir::Input(1i64, "missing", DType::F32()));
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let mut egraph = EGraph::default();
     egraph.register(&known).unwrap();
     let frozen = egraph.freeze().unwrap();
     assert!(matches!(
@@ -272,15 +272,16 @@ fn repeated_optimization_reuses_rules_and_activates_intervals() {
 
     let input = let_("first", Ir::Input(0i64, "first", DType::F32()));
     let dimension = let_("dimension", DimExpr::from("s") + 1i64);
-    let mut egraph = EGraph::new(EGraphOptions::default());
+    let mut egraph = EGraph::default();
     egraph.register((&input, &dimension)).unwrap();
     typed_reference::optimize(&mut egraph, &FxHashMap::default(), false).unwrap();
     assert!(egraph.check(eq(input.dtype(), DType::F32())).unwrap());
     let rules: HashSet<_> = egraph
         .stats()
         .unwrap()
+        .detail
         .search_and_apply_time_per_rule
-        .into_keys()
+        .into_iter().map(|entry| entry.native_name)
         .collect();
     assert!(
         !rules.is_empty(),
@@ -296,8 +297,9 @@ fn repeated_optimization_reuses_rules_and_activates_intervals() {
         egraph
             .stats()
             .unwrap()
+            .detail
             .search_and_apply_time_per_rule
-            .into_keys()
+            .into_iter().map(|entry| entry.native_name)
             .collect::<HashSet<_>>(),
         rules
     );
@@ -320,8 +322,9 @@ fn repeated_optimization_reuses_rules_and_activates_intervals() {
     let interval_rules: HashSet<_> = egraph
         .stats()
         .unwrap()
+        .detail
         .search_and_apply_time_per_rule
-        .into_keys()
+        .into_iter().map(|entry| entry.native_name)
         .collect();
     assert!(interval_rules.is_superset(&rules));
     assert!(interval_rules.len() > rules.len());
@@ -330,8 +333,9 @@ fn repeated_optimization_reuses_rules_and_activates_intervals() {
         egraph
             .stats()
             .unwrap()
+            .detail
             .search_and_apply_time_per_rule
-            .into_keys()
+            .into_iter().map(|entry| entry.native_name)
             .collect::<HashSet<_>>(),
         interval_rules
     );
