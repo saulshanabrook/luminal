@@ -64,28 +64,33 @@ pub(crate) mod kernel_gemv {
         let variants = [
             (
                 "static",
-                vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
+                (
+                    vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
+                    vec![],
+                ),
             ),
             (
                 "dyn",
-                vec![
-                    eq(&generic_args.out_shape, [m, n]),
-                    eq(m_lower, m.lower()),
-                    eq(m_upper, m.upper()),
-                    m_lower.gt(0_i64),
-                    m_upper.lt(2_i64),
-                ],
+                (
+                    vec![
+                        eq(&generic_args.out_shape, [m, n]),
+                        eq(m_lower, m.lower()),
+                        eq(m_upper, m.upper()),
+                    ],
+                    vec![m_lower.gt(0_i64), m_upper.lt(2_i64)],
+                ),
             ),
         ];
         let mut rules = Vec::new();
-        for (variant, shape_conditions) in variants {
+        for (variant, (shape_conditions, bounds)) in variants {
             for (name, dtype) in [("Bf16", DType::Bf16()), ("F16", DType::F16())] {
                 let gemv = &Ir::Op(kernel_gemv(n, &generic_args.k, &dtype), [a, b]);
                 rules.push(
                     rule(
                         (
                             eq(sum, Ir::Op(generic_args.clone(), [a, b])),
-                            &shape_conditions,
+                            shape_conditions.as_slice(),
+                            bounds.as_slice(),
                             ne(n, 0),
                             ne(&generic_args.k, 1),
                             eq(
@@ -352,21 +357,25 @@ pub(crate) mod kernel_gemv_f8 {
         let variants = [
             (
                 "static",
-                vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
+                (
+                    vec![eq(&generic_args.out_shape, [&DimExpr::MNum(1), n])],
+                    vec![],
+                ),
             ),
             (
                 "dyn",
-                vec![
-                    eq(&generic_args.out_shape, [m, n]),
-                    eq(m_lower, m.lower()),
-                    eq(m_upper, m.upper()),
-                    m_lower.gt(0_i64),
-                    m_upper.lt(2_i64),
-                ],
+                (
+                    vec![
+                        eq(&generic_args.out_shape, [m, n]),
+                        eq(m_lower, m.lower()),
+                        eq(m_upper, m.upper()),
+                    ],
+                    vec![m_lower.gt(0_i64), m_upper.lt(2_i64)],
+                ),
             ),
         ];
         let mut rules = Vec::new();
-        for (variant, shape_conditions) in variants {
+        for (variant, (shape_conditions, bounds)) in variants {
             for (producer, source) in [
                 ("quant", Ir::Op(kernel_quant_f8(q_size), [x, in_scale])),
                 (
@@ -386,7 +395,8 @@ pub(crate) mod kernel_gemv_f8 {
                         (
                             eq(a, source),
                             eq(sum, Ir::Op(generic_args.clone(), [a, b])),
-                            &shape_conditions,
+                            shape_conditions.as_slice(),
+                            bounds.as_slice(),
                             ne(n, 0),
                             ne(&generic_args.k, 1),
                             eq(
