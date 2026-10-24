@@ -483,7 +483,7 @@ fn schedule_reports_preserve_outer_cycles_and_optional_late_phase() -> Result<()
     );
     assert!(report.phases[0].updated);
     assert!(!report.phases[1].updated);
-    assert!(!report.full.num_matches_per_rule.is_empty());
+    assert!(live.check(eq(root.clone(), 1i64))?);
     phases.insert(
         RewritePhase::LateAnalysis,
         ruleset(rewrite(DimExpr::MVar("late"), 2i64)),

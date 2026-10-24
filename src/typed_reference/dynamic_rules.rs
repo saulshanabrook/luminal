@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn unroll_groups_keep_factory_calls_and_catalog_bounds() {
+    fn unroll_groups_keep_factory_calls_and_trip_bounds() {
         use std::cell::Cell;
 
         for max_trips in 0usize..=6 {
@@ -324,15 +324,8 @@ mod tests {
                     graph.register(end).unwrap();
                 }
             }
-            let report = graph.run(&group).unwrap();
-            let installed = report
-                .rules
-                .iter()
-                .map(|rule| rule.rule)
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            assert_eq!(installed, 2 * max_trips.saturating_sub(1));
-            assert_eq!(calls.get(), installed);
+            graph.run(&group).unwrap();
+            assert_eq!(calls.get(), 2 * max_trips.saturating_sub(1));
         }
 
         let calls = Cell::new(0);

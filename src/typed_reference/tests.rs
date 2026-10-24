@@ -263,6 +263,6 @@ fn cleanup_expression_facts_delete_every_existing_row() {
     }
     check_absent!(0, 1, 2, 3, 4, 5, 6, 7);
     let count = egraph.num_tuples().unwrap();
-    assert!(!egraph.run(&*static_rules::cleanup).unwrap().detail.updated);
+    assert!(!egraph.run(&*static_rules::cleanup).unwrap().updated);
     assert_eq!(egraph.num_tuples().unwrap(), count);
 }

@@ -1,8 +1,8 @@
 use super::*;
 use crate::typed_reference;
 use colored::Colorize;
-use egglog_experimental::typed::report::{ReportDuration, ReportStageKind};
 use itertools::Itertools;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tracing::trace;
@@ -134,6 +134,7 @@ struct EgglogSchedulePhase {
     schedule: String,
 }
 
+/// Metrics collected for this call's timed phases; empty when diagnostics are off.
 #[derive(Debug, Clone, Default)]
 pub struct EgglogStageReport {
     pub num_matches_per_rule: FxHashMap<String, usize>,
@@ -153,7 +154,8 @@ pub struct EgglogPhaseReport {
     pub name: String,
     pub schedule: String,
     pub updated: bool,
-    pub iterations: usize,
+    /// Available only when detailed collection was enabled before this phase.
+    pub iterations: Option<usize>,
     pub tuples_before: usize,
     pub tuples_after: usize,
     pub total_time: Duration,
@@ -200,6 +202,8 @@ fn egglog_main_schedule(use_interval_analysis: bool) -> String {
 }
 
 /// Preserve the original report-driven outer cycle and final/late phase policy.
+/// Rule and plan diagnostics require `EGGLOG_DEBUG` with logging, or TRACE logging.
+/// Ordinary phase logs retain wall time and table counts; iterations display `n/a`.
 pub fn run_schedule(
     egraph: &mut EGraph,
     full_start: Instant,
@@ -243,6 +247,7 @@ pub fn run_schedule(
         );
     }
     let mut reports = Vec::new();
+    let mut full = EgglogStageReport::default();
     let mut reached_fixed_point = false;
     for cycle in 1..=MAIN_SCHEDULE_MAX_CYCLES {
         let phase = EgglogSchedulePhase {
@@ -252,6 +257,7 @@ pub fn run_schedule(
         let updated = run_schedule_phase(
             egraph,
             &mut reports,
+            &mut full,
             &phase,
             main_schedule(phases, intervals),
             log,
@@ -287,6 +293,7 @@ pub fn run_schedule(
         run_schedule_phase(
             egraph,
             &mut reports,
+            &mut full,
             &EgglogSchedulePhase {
                 name: name.into(),
                 schedule: description.into(),
@@ -299,6 +306,7 @@ pub fn run_schedule(
         run_schedule_phase(
             egraph,
             &mut reports,
+            &mut full,
             &EgglogSchedulePhase {
                 name: "late pass 01".into(),
                 schedule: "(saturate metal_memory_analysis)".into(),
@@ -307,7 +315,7 @@ pub fn run_schedule(
             log,
         )?;
     }
-    let full = stage_report(egraph, full_start.elapsed())?;
+    full.total_time = full_start.elapsed();
     trace_stage_report("---- Egglog Rule Matches ----", &full);
     let report = EgglogRunReport {
         full,
@@ -324,38 +332,6 @@ pub fn run_schedule(
         .green()
     );
     Ok(report)
-}
-
-fn stage_report(
-    egraph: &mut EGraph,
-    total_time: Duration,
-) -> Result<EgglogStageReport, TypedError> {
-    let run_report = egraph.stats()?;
-    Ok(EgglogStageReport {
-        num_matches_per_rule: run_report
-            .detail
-            .num_matches_per_rule
-            .iter()
-            .map(|entry| {
-                (
-                    entry.native_name.clone(),
-                    usize::try_from(entry.value).expect("native match count fits usize"),
-                )
-            })
-            .collect(),
-        search_and_apply_time_per_rule: run_report
-            .detail
-            .search_and_apply_time_per_rule
-            .iter()
-            .map(|entry| {
-                (
-                    entry.native_name.clone(),
-                    report_duration(entry.value.as_ref()),
-                )
-            })
-            .collect(),
-        total_time,
-    })
 }
 
 fn trace_stage_report(header: &str, report: &EgglogStageReport) {
@@ -388,9 +364,16 @@ fn metric_duration(duration: Duration) -> String {
     pretty_duration::pretty_duration(&duration, None)
 }
 
-fn report_duration(duration: Option<&ReportDuration>) -> Duration {
-    let duration = duration.expect("typed reports contain required metric durations");
-    Duration::new(duration.seconds, duration.nanos)
+fn report_duration(value: &Value) -> Duration {
+    let seconds = value["secs"]
+        .as_u64()
+        .expect("backend diagnostic duration has seconds");
+    let nanos = value["nanos"]
+        .as_u64()
+        .and_then(|nanos| u32::try_from(nanos).ok())
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .expect("backend diagnostic duration has valid nanoseconds");
+    Duration::new(seconds, nanos)
 }
 
 /// Extra per-rule / per-ruleset printing. Requires the normal egglog log
@@ -408,30 +391,21 @@ fn metric_name(name: &str) -> String {
     name
 }
 
-fn sorted_rule_metrics(
-    report: &egglog_experimental::typed::RunReport,
-) -> Vec<(String, Duration, usize)> {
-    let matches: FxHashMap<_, _> = report
-        .detail
-        .num_matches_per_rule
-        .iter()
-        .map(|entry| (entry.native_name.as_str(), entry.value))
-        .collect();
-    let mut rules = report
-        .detail
-        .search_and_apply_time_per_rule
-        .iter()
-        .map(|entry| {
+fn sorted_rule_metrics(report: &Value) -> Vec<(String, Duration, usize)> {
+    let mut rules = report["search_and_apply_time_per_rule"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(rule, elapsed)| {
             (
-                entry.native_name.clone(),
-                report_duration(entry.value.as_ref()),
+                rule.clone(),
+                report_duration(elapsed),
                 usize::try_from(
-                    matches
-                        .get(entry.native_name.as_str())
-                        .copied()
+                    report["num_matches_per_rule"][rule]
+                        .as_u64()
                         .unwrap_or_default(),
                 )
-                .expect("native match count fits usize"),
+                .expect("backend match count fits usize"),
             )
         })
         .collect_vec();
@@ -439,60 +413,39 @@ fn sorted_rule_metrics(
     rules
 }
 
-fn print_rule_plan_hotspots(
-    report: &egglog_experimental::typed::RunReport,
-    rules: &[(String, Duration, usize)],
-) {
+fn print_rule_plan_hotspots(report: &Value, rules: &[(String, Duration, usize)]) {
     for (rule, _, _) in rules.iter().take(3) {
         let mut max_stage = None;
         let mut max_shape = None;
-        for iteration in &report.detail.iterations {
-            let ruleset = iteration
-                .rule_set_report
-                .as_ref()
-                .expect("typed iteration reports contain their ruleset report");
-            for rule_reports in ruleset
-                .rule_reports
-                .iter()
-                .filter(|entry| entry.native_name == *rule)
+        for iteration in report["iterations"].as_array().into_iter().flatten() {
+            for rule_report in iteration["rule_set_report"]["rule_reports"][rule]
+                .as_array()
+                .into_iter()
+                .flatten()
             {
-                for rule_report in &rule_reports.reports {
-                    if let Some(plan) = &rule_report.plan {
-                        let scans = plan
-                            .stages
-                            .iter()
-                            .map(|stage| {
-                                match stage
-                                    .kind
-                                    .as_ref()
-                                    .expect("typed plan stages contain their kind")
-                                {
-                                    ReportStageKind::Intersect(stage) => stage.scans.len(),
-                                    ReportStageKind::FusedIntersect(stage) => {
-                                        stage.to_intersect.len() + 1
-                                    }
-                                }
-                            })
-                            .sum::<usize>();
-                        max_shape = Some(
-                            max_shape
-                                .map(|(stages, shape_scans)| {
-                                    if plan.stages.len() > stages {
-                                        (plan.stages.len(), scans)
-                                    } else {
-                                        (stages, shape_scans)
-                                    }
-                                })
-                                .unwrap_or((plan.stages.len(), scans)),
-                        );
-                        for stage in &plan.stages {
-                            if let Some(stats) = &stage.stats {
-                                if max_stage
-                                    .map(|(candidates, _)| stats.num_candidates > candidates)
-                                    .unwrap_or(true)
-                                {
-                                    max_stage = Some((stats.num_candidates, stats.num_succeeded));
-                                }
+                if let Some(stages) = rule_report["plan"]["stages"].as_array() {
+                    let scans = stages
+                        .iter()
+                        .map(|stage| {
+                            if let Some(scans) = stage[0]["Intersect"]["scans"].as_array() {
+                                scans.len()
+                            } else {
+                                stage[0]["FusedIntersect"]["to_intersect"]
+                                    .as_array()
+                                    .map_or(0, |scans| scans.len() + 1)
+                            }
+                        })
+                        .sum::<usize>();
+                    if max_shape.is_none_or(|(count, _)| stages.len() > count) {
+                        max_shape = Some((stages.len(), scans));
+                    }
+                    for stage in stages {
+                        if let (Some(candidates), Some(succeeded)) = (
+                            stage[1]["num_candidates"].as_u64(),
+                            stage[1]["num_succeeded"].as_u64(),
+                        ) {
+                            if max_stage.is_none_or(|(old, _)| candidates > old) {
+                                max_stage = Some((candidates, succeeded));
                             }
                         }
                     }
@@ -515,7 +468,7 @@ fn print_rule_plan_hotspots(
 
 fn print_slow_phase_detail(
     phase: &EgglogSchedulePhase,
-    report: &egglog_experimental::typed::RunReport,
+    report: &Value,
     tuple_delta: isize,
     elapsed: Duration,
     rules: &[(String, Duration, usize)],
@@ -561,35 +514,39 @@ fn print_slow_phase_detail(
     }
     print_rule_plan_hotspots(report, rules);
 
-    let iteration_count = report.detail.iterations.len();
-    for (index, iteration) in report.detail.iterations.iter().enumerate() {
+    let iterations = report["iterations"]
+        .as_array()
+        .expect("backend diagnostics contain iteration observations");
+    let iteration_count = iterations.len();
+    for (index, iteration) in iterations.iter().enumerate() {
         if iteration_count > 12 && (8..iteration_count.saturating_sub(3)).contains(&index) {
             if index == 8 {
                 eprintln!("      iter   ...");
             }
             continue;
         }
-        let ruleset = iteration
-            .rule_set_report
-            .as_ref()
-            .expect("typed iteration reports contain their ruleset report");
-        let (rule, elapsed, matches) = ruleset
-            .rule_reports
-            .iter()
-            .map(|entry| {
+        let ruleset = &iteration["rule_set_report"];
+        let (rule, elapsed, matches) = ruleset["rule_reports"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(rule, reports)| {
+                let reports = reports
+                    .as_array()
+                    .expect("backend rule reports are observations");
                 (
-                    entry.native_name.clone(),
-                    entry
-                        .reports
+                    rule.clone(),
+                    reports
                         .iter()
-                        .map(|report| report_duration(report.search_and_apply_time.as_ref()))
+                        .map(|report| report_duration(&report["search_and_apply_time"]))
                         .sum::<Duration>(),
-                    entry
-                        .reports
+                    reports
                         .iter()
                         .map(|report| {
-                            usize::try_from(report.num_matches)
-                                .expect("native match count fits usize")
+                            usize::try_from(
+                                report["num_matches"].as_u64().expect("backend match count"),
+                            )
+                            .expect("backend match count fits usize")
                         })
                         .sum::<usize>(),
                 )
@@ -599,10 +556,10 @@ fn print_slow_phase_detail(
         eprintln!(
             "      iter   {:>2} changed={} | search {:>10} | merge {:>10} | rebuild {:>10} | top {:<64} {:>10} matches {}",
             index + 1,
-            ruleset.changed,
-            metric_duration(report_duration(ruleset.search_and_apply_time.as_ref())),
-            metric_duration(report_duration(ruleset.merge_time.as_ref())),
-            metric_duration(report_duration(iteration.rebuild_time.as_ref())),
+            ruleset["changed"],
+            metric_duration(report_duration(&ruleset["search_and_apply_time"])),
+            metric_duration(report_duration(&ruleset["merge_time"])),
+            metric_duration(report_duration(&iteration["rebuild_time"])),
             metric_name(&rule),
             metric_duration(elapsed),
             matches
@@ -634,7 +591,9 @@ fn print_run_summary_with_log(run_report: &EgglogRunReport, log: bool) {
             metric_name(&phase.name),
             metric_duration(phase.total_time),
             phase.tuples_after as isize - phase.tuples_before as isize,
-            phase.iterations
+            phase
+                .iterations
+                .map_or_else(|| "n/a".into(), |count| count.to_string())
         );
     }
     let mut growth = run_report
@@ -730,18 +689,61 @@ pub fn trace_frozen_shape(space: &SearchSpace, log: bool) {
 fn run_schedule_phase(
     egraph: &mut EGraph,
     phases: &mut Vec<EgglogPhaseReport>,
+    full: &mut EgglogStageReport,
     phase: &EgglogSchedulePhase,
     schedule: Schedule,
     log: bool,
 ) -> Result<bool, TypedError> {
+    // Select collection before execution; a slow phase cannot recover past counters.
+    let diagnostics = (log && egglog_debug()) || tracing::enabled!(tracing::Level::TRACE);
     let tuples_before = egraph.num_tuples()?;
     let start = Instant::now();
-    let report = egraph.run(schedule)?;
+    let (report, diagnostic) = if diagnostics {
+        let (report, diagnostic) = egraph.run_with_diagnostics(schedule)?;
+        (report, Some(diagnostic))
+    } else {
+        (egraph.run(schedule)?, None)
+    };
     let elapsed = start.elapsed();
     let tuples_after = egraph.num_tuples()?;
-
-    let updated = report.detail.updated;
-    let iterations = report.detail.iterations.len();
+    let diagnostic: Option<Value> = diagnostic
+        .map(|diagnostic| {
+            if diagnostic.format != "application/vnd.egglog.run-report+json" {
+                return Err(TypedError::Decode(format!(
+                    "unsupported Egglog diagnostic format: {}",
+                    diagnostic.format
+                )));
+            }
+            serde_json::from_str(&diagnostic.content)
+                .map_err(|error| TypedError::Decode(format!("invalid Egglog diagnostics: {error}")))
+        })
+        .transpose()?;
+    if let Some(diagnostic) = &diagnostic {
+        for (rule, count) in diagnostic["num_matches_per_rule"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            *full.num_matches_per_rule.entry(rule.clone()).or_default() +=
+                usize::try_from(count.as_u64().expect("backend match count"))
+                    .expect("backend match count fits usize");
+        }
+        for (rule, elapsed) in diagnostic["search_and_apply_time_per_rule"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            *full
+                .search_and_apply_time_per_rule
+                .entry(rule.clone())
+                .or_default() += report_duration(elapsed);
+        }
+    }
+    let updated = report.updated;
+    let iterations = diagnostic
+        .as_ref()
+        .and_then(|diagnostic| diagnostic["iterations"].as_array())
+        .map(Vec::len);
     let tuple_delta = tuples_after as isize - tuples_before as isize;
     if log {
         eprintln!(
@@ -754,25 +756,24 @@ fn run_schedule_phase(
                 tuples_after,
                 tuple_delta,
                 updated,
-                iterations,
+                iterations.map_or_else(|| "n/a".into(), |count| count.to_string()),
             )
             .cyan()
         );
     }
 
-    if log && egglog_debug() {
+    if let Some(report) = diagnostic.as_ref().filter(|_| log && egglog_debug()) {
         let mut rulesets: FxHashMap<_, [Duration; 3]> = FxHashMap::default();
         for (index, entries) in [
-            &report.detail.search_and_apply_time_per_ruleset,
-            &report.detail.merge_time_per_ruleset,
-            &report.detail.rebuild_time_per_ruleset,
+            &report["search_and_apply_time_per_ruleset"],
+            &report["merge_time_per_ruleset"],
+            &report["rebuild_time_per_ruleset"],
         ]
         .into_iter()
         .enumerate()
         {
-            for entry in entries {
-                rulesets.entry(entry.native_name.as_str()).or_default()[index] =
-                    report_duration(entry.value.as_ref());
+            for (name, elapsed) in entries.as_object().into_iter().flatten() {
+                rulesets.entry(name.as_str()).or_default()[index] = report_duration(elapsed);
             }
         }
         let mut rulesets = rulesets.into_iter().collect_vec();
@@ -789,7 +790,7 @@ fn run_schedule_phase(
             );
         }
 
-        let rules = sorted_rule_metrics(&report);
+        let rules = sorted_rule_metrics(report);
         for (rule, elapsed, matches) in rules
             .iter()
             .filter(|(_, elapsed, matches)| *elapsed > Duration::ZERO || *matches > 0)
@@ -803,7 +804,7 @@ fn run_schedule_phase(
             );
         }
         if elapsed >= SLOW_PHASE_TIME || tuple_delta.abs() >= BIG_TUPLE_DELTA {
-            print_slow_phase_detail(phase, &report, tuple_delta, elapsed, &rules);
+            print_slow_phase_detail(phase, report, tuple_delta, elapsed, &rules);
         }
     }
 
@@ -818,4 +819,43 @@ fn run_schedule_phase(
     });
 
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typed_reference::schema::DimExpr;
+
+    #[test]
+    fn phase_collection_preserves_control_and_tables() -> Result<(), TypedError> {
+        let mut outcomes = Vec::new();
+        for log in [false, true] {
+            let root = let_("dimension", DimExpr::MVar("diagnostic"));
+            let mut egraph = EGraph::default();
+            egraph.register(&root)?;
+            let mut phases = Vec::new();
+            let mut full = EgglogStageReport::default();
+            let updated = run_schedule_phase(
+                &mut egraph,
+                &mut phases,
+                &mut full,
+                &EgglogSchedulePhase {
+                    name: "diagnostic parity".into(),
+                    schedule: "(saturate diagnostic)".into(),
+                },
+                ruleset(rewrite(DimExpr::MVar("diagnostic"), 1i64)).saturate(),
+                log,
+            )?;
+            assert!(updated);
+            assert!(egraph.check(eq(root, 1i64))?);
+            outcomes.push((updated, egraph.num_tuples()?));
+            if log && egglog_debug() {
+                assert!(phases[0].iterations.is_some());
+                assert!(full.num_matches_per_rule.values().sum::<usize>() > 0);
+                assert!(!full.search_and_apply_time_per_rule.is_empty());
+            }
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        Ok(())
+    }
 }

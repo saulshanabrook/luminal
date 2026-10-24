@@ -371,7 +371,7 @@ fn flashinfer_compact_indices_follow_real_gather_rows_through_fusion() {
                 .run(ruleset((&fusion_end::fusion_grow, &fusion_end::fusion_merge)).saturate())
                 .unwrap();
             assert!(
-                report.detail.updated,
+                report.updated,
                 "the fixture must exercise actual fusion rules"
             );
         }

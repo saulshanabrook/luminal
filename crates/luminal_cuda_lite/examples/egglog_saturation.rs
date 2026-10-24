@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use egglog_experimental::typed::{
     EGraph, Rule, Schedule, Snapshot, builtins as egg, delete, rule, ruleset, sequence,
@@ -392,52 +389,20 @@ fn split_cycle(phases: &luminal::egglog_utils::PhaseRules) -> [(&'static str, Sc
 fn phase(egraph: &mut EGraph, name: &str, schedule: impl Into<Schedule>) -> bool {
     let before = egraph.num_tuples().expect("table census");
     let start = Instant::now();
-    let report = egraph
-        .run(schedule)
-        .unwrap_or_else(|error| panic!("failed phase {name}: {error}"))
-        .detail;
+    let (report, diagnostic) = egraph
+        .run_with_diagnostics(schedule)
+        .unwrap_or_else(|error| panic!("failed phase {name}: {error}"));
     let elapsed = start.elapsed();
     let after = egraph.num_tuples().expect("table census");
-    let mut rules = report
-        .search_and_apply_time_per_rule
-        .iter()
-        .map(|entry| {
-            let time = entry.value.as_ref().expect("typed report duration");
-            (
-                entry.native_name.clone(),
-                Duration::new(time.seconds, time.nanos),
-                report
-                    .num_matches_per_rule
-                    .iter()
-                    .find(|matches| matches.native_name == entry.native_name)
-                    .map(|matches| matches.value)
-                    .unwrap_or_default(),
-            )
-        })
-        .collect_vec();
-    rules.sort_by_key(|(_, time, matches)| (std::cmp::Reverse(*time), std::cmp::Reverse(*matches)));
-    let matches = report
-        .num_matches_per_rule
-        .iter()
-        .map(|entry| entry.value)
-        .sum::<u64>();
     println!(
-        "phase {name:<18} {elapsed_ms:>8.2} ms | tuples {before} -> {after} ({delta:+}) | updated={updated} | iters={iters} | matches={matches}",
+        "phase {name:<18} {elapsed_ms:>8.2} ms | tuples {before} -> {after} ({delta:+}) | updated={updated}",
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
         delta = after as isize - before as isize,
         updated = report.updated,
-        iters = report.iterations.len(),
     );
-    for (rule, time, matches) in rules
-        .into_iter()
-        .filter(|(_, time, matches)| !time.is_zero() || *matches > 0)
-        .take(8)
-    {
-        println!(
-            "  rule {rule:<82} {ms:>8.2} ms | matches {matches}",
-            ms = time.as_secs_f64() * 1000.0,
-        );
-    }
+    // This diagnostic experiment prints the backend document, including its
+    // rule metrics and available plans, without a second report model.
+    println!("  diagnostic {}\n{}", diagnostic.format, diagnostic.content);
     report.updated
 }
 
