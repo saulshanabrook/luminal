@@ -714,7 +714,7 @@ fn run_schedule_phase(
                     diagnostic.format
                 )));
             }
-            serde_json::from_str(&diagnostic.content)
+            serde_json::from_slice(&diagnostic.content)
                 .map_err(|error| TypedError::Decode(format!("invalid Egglog diagnostics: {error}")))
         })
         .transpose()?;

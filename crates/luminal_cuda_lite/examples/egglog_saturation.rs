@@ -402,7 +402,11 @@ fn phase(egraph: &mut EGraph, name: &str, schedule: impl Into<Schedule>) -> bool
     );
     // This diagnostic experiment prints the backend document, including its
     // rule metrics and available plans, without a second report model.
-    println!("  diagnostic {}\n{}", diagnostic.format, diagnostic.content);
+    println!(
+        "  diagnostic {}\n{}",
+        diagnostic.format,
+        std::str::from_utf8(&diagnostic.content).expect("backend JSON diagnostic is UTF-8")
+    );
     report.updated
 }
 
