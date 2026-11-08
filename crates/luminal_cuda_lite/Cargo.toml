@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental", rev = "ab9915c1cbf0bbcf013c9548d9ba413f831e7001", default-features = false, features = ["typed"] }
+egglog-experimental = { git = "https://github.com/egraphs-good/egglog-experimental", rev = "ef70d3a6c8c5af2fd3eaac01fa81e64a23aa32e1", default-features = false, features = ["typed"] }
 luminal = { path = "../.." }
 luminal_tracing = { path = "../luminal_tracing" }
 cudarc = {version="0.19.4", features=["cuda-version-from-build-system", "fallback-latest"]}
